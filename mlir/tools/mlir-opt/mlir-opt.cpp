@@ -123,6 +123,7 @@ void registerTestMatchReductionPass();
 void registerTestMathAlgebraicSimplificationPass();
 void registerTestMathPolynomialApproximationPass();
 void registerTestMathToVCIXPass();
+void registerTestMemRefToGemminiPass();
 void registerTestMemRefDependenceCheck();
 void registerTestMemRefStrideCalculation();
 void registerTestMeshReshardingSpmdizationPass();
@@ -256,6 +257,7 @@ void registerTestPasses() {
   mlir::test::registerTestMathAlgebraicSimplificationPass();
   mlir::test::registerTestMathPolynomialApproximationPass();
   mlir::test::registerTestMathToVCIXPass();
+  mlir::test::registerTestMemRefToGemminiPass();
   mlir::test::registerTestMemRefDependenceCheck();
   mlir::test::registerTestMemRefStrideCalculation();
   mlir::test::registerTestMeshReshardingSpmdizationPass();

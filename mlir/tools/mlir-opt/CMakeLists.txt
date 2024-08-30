@@ -28,6 +28,7 @@ if(MLIR_INCLUDE_TESTS)
     MLIRLoopLikeInterfaceTestPasses
     MLIRMathTestPasses
     MLIRTestMathToVCIX
+    MLIRTestMemRefToGemmini
     MLIRMemRefTestPasses
     MLIRMeshTest
     MLIRNVGPUTestPasses
