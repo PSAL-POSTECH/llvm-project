@@ -17,15 +17,24 @@
 #include "mlir/Pass/Pass.h"
 #include "mlir/Pass/PassManager.h"
 
+#define MVIN 0
+#define MVOUT 1
+
 namespace mlir {
 namespace {
 
+int VECTOR_LANE_STRIDE = 4;
+
 char* getAsmString(unsigned func7) {
   switch (func7) {
+  case 0x0:
+    return ".insn r CUSTOM_1, 0x3, 0, x0, $0, $1"; // config_mvin
+  case 0x1:
+    return ".insn r CUSTOM_1, 0x3, 1, x0, $0, $1"; // config_mvout
   case 0x2:
-    return ".insn r CUSTOM_1, 0x3, 2, x0, $0, $1";
+    return ".insn r CUSTOM_1, 0x3, 2, x0, $0, $1"; // mvin
   case 0x3:
-    return ".insn r CUSTOM_1, 0x3, 3, x0, $0, $1";
+    return ".insn r CUSTOM_1, 0x3, 3, x0, $0, $1"; // mvout
   default:
     return "";
   }
@@ -68,14 +77,21 @@ struct DmaStartOpLowering : public ConvertOpToLLVMPattern<memref::DmaStartOp> {
         *getTypeConverter()->getMemRefAddressSpace(dstMemRefType);
     Value rs1;
     Value spad_addr;
-    if (SrcAddressSpace == 0 && DstAddressSpace == 1) { // MVIN
+    llvm::ArrayRef<int64_t> shape;
+    int64_t main_mem_stride;
+    bool dmaType = SrcAddressSpace == 0 && DstAddressSpace == 1 ? MVIN : (SrcAddressSpace == 1 && DstAddressSpace == 0 ? MVOUT : -1);
+    if (dmaType == MVIN) { // MVIN
       rs1 = rewriter.create<LLVM::PtrToIntOp>(loc, rewriter.getI64Type(), SrcPtr);
       spad_addr = rewriter.create<LLVM::PtrToIntOp>(loc, rewriter.getI64Type(), DstPtr);
       func7 = 0x2;
-    } else if (SrcAddressSpace == 1 && DstAddressSpace == 0) { // MVOUT
+      shape = srcMemRefType.getShape();
+      main_mem_stride = shape[srcMemRefType.getRank() - 1];
+    } else if (dmaType == MVOUT) { // MVOUT
       rs1 = rewriter.create<LLVM::PtrToIntOp>(loc, rewriter.getI64Type(), DstPtr);
       spad_addr = rewriter.create<LLVM::PtrToIntOp>(loc, rewriter.getI64Type(), SrcPtr);
       func7 = 0x3;
+      shape = dstMemRefType.getShape();
+      main_mem_stride = shape[dstMemRefType.getRank() - 1];
     } else {
       return rewriter.notifyMatchFailure(op, "Unsupported DMA operation");
     }
@@ -89,12 +105,39 @@ struct DmaStartOpLowering : public ConvertOpToLLVMPattern<memref::DmaStartOp> {
     rs2 = rewriter.create<LLVM::OrOp>(loc, rs2, rewriter.create<LLVM::ShlOp>(loc, rewriter.getI64Type(), cols, shift32));
     rs2 = rewriter.create<LLVM::OrOp>(loc, rs2, spad_addr);
 
-    SmallVector<Value> asmVals;
-    asmVals.push_back(rs1);
-    asmVals.push_back(rs2);
+    // config_mvin, config_mvout instructions
+    func7 = dmaType == MVIN ? 0x0 : 0x1;
+    char* configAsmStr = getAsmString(func7);
+    auto InnerRegion = op->getParentRegion();
+    auto OuterRegion = InnerRegion->getParentRegion();
+    if (OuterRegion && !OuterRegion->empty()) {
+      auto &outerBlock = OuterRegion->front();
+      if (!outerBlock.empty()) {
+        OpBuilder::InsertionGuard guard(rewriter);
+        rewriter.setInsertionPointToStart(&outerBlock);
+        // config_rs1 = main memory stride
+        // config_rs2 = vector-lane stride << 32 | spad_stride
+        Value config_rs1 = rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(main_mem_stride));
+        Value config_shift32 = rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(32));
+        Value config_rs2 = rewriter.create<LLVM::ShlOp>(loc, rewriter.getI64Type(), rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(VECTOR_LANE_STRIDE)), config_shift32);
+        config_rs2 = rewriter.create<LLVM::OrOp>(loc, config_rs2, rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(0))); // TODO: add spad_stride
+        rewriter.create<LLVM::InlineAsmOp>(
+            loc,
+            /*resultTypes=*/TypeRange(),
+            /*operands=*/ValueRange({config_rs1, config_rs2}),
+            /*asm_string=*/configAsmStr,
+            /*constraints=*/constraintStr,
+            /*has_side_effects=*/true,
+            /*is_align_stack=*/false,
+            /*asm_dialect=*/asmDialectAttr,
+            /*operand_attrs=*/ArrayAttr());
+      }
+    }
+
+    rewriter.setInsertionPoint(op);
     rewriter.replaceOpWithNewOp<LLVM::InlineAsmOp>(op,
         /*resultTypes=*/TypeRange(),
-        /*operands=*/asmVals,
+        /*operands=*/ValueRange({rs1, rs2}),
         /*asm_string=*/asmStr,
         /*constraints=*/constraintStr,
         /*has_side_effects=*/true,
@@ -116,6 +159,15 @@ struct TestMemRefToGemmini
            "with custom gemmini instructions.";
   }
 
+  Option<int> vectorlaneStride{
+      *this, "vectorlane-stride",
+      llvm::cl::desc("Vector lane stride for the custom gemmini instructions"),
+      llvm::cl::init(4)};
+
+  TestMemRefToGemmini() = default;
+  TestMemRefToGemmini(const TestMemRefToGemmini &) {}
+
+
   void getDependentDialects(DialectRegistry &registry) const override {
     registry.insert<arith::ArithDialect, func::FuncDialect,
                     memref::MemRefDialect, LLVM::LLVMDialect>();
@@ -126,6 +178,7 @@ struct TestMemRefToGemmini
     LowerToLLVMOptions options(ctx);
     LLVMTypeConverter typeConverter(ctx, options);
 
+    VECTOR_LANE_STRIDE = vectorlaneStride;
     RewritePatternSet patterns(ctx);
     patterns.add<DmaStartOpLowering>(typeConverter);
     LLVMConversionTarget target(getContext());
