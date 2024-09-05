@@ -25,6 +25,17 @@ namespace {
 
 int VECTOR_LANE_STRIDE = 4;
 
+int extractConstantIntValue(Value val) {
+  int val_int;
+  if (auto constOp = val.getDefiningOp<arith::ConstantOp>()) {
+    Attribute constantAttr = constOp.getValue();
+    if (auto intAttr = constantAttr.dyn_cast<IntegerAttr>()) {
+      val_int = intAttr.getInt();
+    }
+  }
+  return val_int;
+}
+
 char* getAsmString(unsigned func7) {
   switch (func7) {
   case 0x0:
@@ -73,33 +84,36 @@ struct DmaStartOpLowering : public ConvertOpToLLVMPattern<memref::DmaStartOp> {
                                          op.getDstMemRefRank()});
 
     Value DstPtr = getStridedElementPtr(loc, dstMemRefType, DstMemref, dst_indices, rewriter);
-    Value cols = operands[op.getNumOperands() - 1];
-    Value num_elt = operands[1 + op.getSrcMemRefRank() + 1 + op.getDstMemRefRank()];
-    Value rows = rewriter.create<LLVM::UDivOp>(loc, rewriter.getI64Type(), num_elt, cols); // rows = num_elements / cols
+    Value main_mem_stride = op.getStride();
+    int main_mem_stride_val = extractConstantIntValue(main_mem_stride);
+    Value num_elt = op.getNumElementsPerStride();
+    int num_elt_val = extractConstantIntValue(num_elt);
+    int is_transpose = 0;
+    if (num_elt_val == 1) // num_elt = 1 means transposed
+      is_transpose = 1;
     unsigned SrcAddressSpace =
         *getTypeConverter()->getMemRefAddressSpace(srcMemRefType);
     unsigned DstAddressSpace =
         *getTypeConverter()->getMemRefAddressSpace(dstMemRefType);
     Value rs1;
     Value spad_addr;
-    llvm::ArrayRef<int64_t> shape;
-    int64_t main_mem_stride;
+    llvm::ArrayRef<int64_t> tile_shape;
     bool dmaType = SrcAddressSpace == 0 && DstAddressSpace == 1 ? MVIN : (SrcAddressSpace == 1 && DstAddressSpace == 0 ? MVOUT : -1);
     if (dmaType == MVIN) { // MVIN
       rs1 = rewriter.create<LLVM::PtrToIntOp>(loc, rewriter.getI64Type(), SrcPtr);
       spad_addr = rewriter.create<LLVM::PtrToIntOp>(loc, rewriter.getI64Type(), DstPtr);
       func7 = 0x2;
-      shape = srcMemRefType.getShape();
-      main_mem_stride = shape[srcMemRefType.getRank() - 1];
+      tile_shape = dstMemRefType.getShape();
     } else if (dmaType == MVOUT) { // MVOUT
       rs1 = rewriter.create<LLVM::PtrToIntOp>(loc, rewriter.getI64Type(), DstPtr);
       spad_addr = rewriter.create<LLVM::PtrToIntOp>(loc, rewriter.getI64Type(), SrcPtr);
       func7 = 0x3;
-      shape = dstMemRefType.getShape();
-      main_mem_stride = shape[dstMemRefType.getRank() - 1];
+      tile_shape = srcMemRefType.getShape();
     } else {
       return rewriter.notifyMatchFailure(op, "Unsupported DMA operation");
     }
+    Value rows = rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(tile_shape[0]));
+    Value cols = rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(tile_shape[1]));
     char* asmStr = getAsmString(func7);
 
     // encoding rs2
@@ -121,11 +135,20 @@ struct DmaStartOpLowering : public ConvertOpToLLVMPattern<memref::DmaStartOp> {
         OpBuilder::InsertionGuard guard(rewriter);
         rewriter.setInsertionPointToStart(&outerBlock);
         // config_rs1 = main memory stride
-        // config_rs2 = vector-lane stride << 32 | spad_stride
-        Value config_rs1 = rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(main_mem_stride));
+        // config_rs2 = is_transpose << 32 | element size
+        int elen = 0;
+        auto elementTypeA = srcMemRefType.getElementType();
+        if (auto intType = mlir::dyn_cast<mlir::IntegerType>(elementTypeA)) {
+          elen = intType.getWidth();
+        } else if (auto floatType = mlir::dyn_cast<mlir::FloatType>(elementTypeA)) {
+          elen = floatType.getWidth();
+        } else {
+          return failure();
+        }
+        Value config_rs1 = rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(main_mem_stride_val));
         Value config_shift32 = rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(32));
-        Value config_rs2 = rewriter.create<LLVM::ShlOp>(loc, rewriter.getI64Type(), rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(VECTOR_LANE_STRIDE)), config_shift32);
-        config_rs2 = rewriter.create<LLVM::OrOp>(loc, config_rs2, rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(0))); // TODO: add spad_stride
+        Value config_rs2 = rewriter.create<LLVM::ShlOp>(loc, rewriter.getI64Type(), rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(is_transpose)), config_shift32);
+        config_rs2 = rewriter.create<LLVM::OrOp>(loc, config_rs2, rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(int(elen/8)))); // element size [bytes]
         rewriter.create<LLVM::InlineAsmOp>(
             loc,
             /*resultTypes=*/TypeRange(),
