@@ -134,7 +134,7 @@ struct MatmulOpLowering : public OpRewritePattern<linalg::MatmulOp> {
     Attribute zeroImmAttr = rewriter.getI64IntegerAttr(0);
     Attribute vipush_opcode =  rewriter.getI64IntegerAttr(0b000000);
     Attribute vwpush_opcode =  rewriter.getI64IntegerAttr(0b000001);
-    Attribute compute_opcode = rewriter.getI64IntegerAttr(0b000010);
+    Attribute compute_opcode = rewriter.getI64IntegerAttr(0b000001);
     Value rvl = nullptr;
 
     // For loop part
