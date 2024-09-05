@@ -56,10 +56,51 @@ class VCIX_Op<string mnemonic, list<Trait> traits = []>
     : LLVM_OpBase<VCIX_Dialect, mnemonic, traits> {
 }
 
+def VCIX_BinaryScalarOp : VCIX_Op<"x">,
+    Arguments<(ins VCIX_OpcodeAttr: $opcode,
+                   VCIX_ImmAttr: $rs2,
+                   VCIX_Register: $rs1,
+                   VCIX_ImmAttr: $rd,
+                   VCIX_ImmAttr: $sew,
+                   VCIX_ImmAttr: $lmul,
+                   Optional<VCIX_VL>: $vl)> {
+  let summary = "Binary VCIX operation with an immediate second operand";
+  let description = [{
+    Binary VCIX operation with an immediate second operand.
+
+    Correponds to:
+    |Mnemonic|funct6|vm|rs2|rs1|funct3|rd|Destination|Sources|
+    |--|--|--|--|--|--|--|--|--|
+    |sf.vc.x|0000--|1|-----|xs1|100|-----|none| scalar xs1|
+  }];
+
+  string llvmBuilder = [{
+      llvm::Type *xlen =getXlenType($opcode, moduleTranslation);
+      llvm::Value *opcodeConst = mlir::LLVM::detail::getLLVMConstant(
+          xlen, $opcode, $_location, moduleTranslation);
+      llvm::Value *p24_20 = mlir::LLVM::detail::getLLVMConstant(
+          xlen, $rs2, $_location, moduleTranslation);
+      llvm::Value *p11_7 = mlir::LLVM::detail::getLLVMConstant(
+          xlen, $rd, $_location, moduleTranslation);
+      llvm::Value *sewConst = mlir::LLVM::detail::getLLVMConstant(
+          xlen, $sew, $_location, moduleTranslation);
+      llvm::Value *lmulConst = mlir::LLVM::detail::getLLVMConstant(
+          xlen, $lmul, $_location, moduleTranslation);
+      createIntrinsicCall(
+          builder, llvm::Intrinsic::riscv_sf_vc_x_se,
+          {opcodeConst, p24_20, p11_7, $rs1, sewConst, lmulConst, $vl},
+          {xlen, xlen, xlen});
+  }];
+}
 
 def VCIX_ImmOp : VCIX_Op<"i">,
     Arguments<(ins VCIX_OpcodeAttr: $opcode,
-                   VCIX_ImmAttr: $imm)> {
+                   VCIX_ImmAttr: $rs2,
+                   VCIX_ImmAttr: $imm,
+                   VCIX_ImmAttr: $rd,
+                   VCIX_ImmAttr: $sew,
+                   VCIX_ImmAttr: $lmul,
+                   Optional<VCIX_VL>: $vl)> {
   let summary = "Binary with destniation VCIX operation with an immediate second operand";
   let description = [{
     Binary with destination VCIX operation with an immediate second operand.
@@ -76,16 +117,27 @@ def VCIX_ImmOp : VCIX_Op<"i">,
           xlen, $opcode, $_location, moduleTranslation);
       llvm::Value *immConst = mlir::LLVM::detail::getLLVMConstant(
           xlen, $imm, $_location, moduleTranslation);
+      llvm::Value *p24_20 = mlir::LLVM::detail::getLLVMConstant(
+          xlen, $rs2, $_location, moduleTranslation);
+      llvm::Value *p11_7 = mlir::LLVM::detail::getLLVMConstant(
+          xlen, $rd, $_location, moduleTranslation);
+      llvm::Value *sewConst = mlir::LLVM::detail::getLLVMConstant(
+          xlen, $sew, $_location, moduleTranslation);
+      llvm::Value *lmulConst = mlir::LLVM::detail::getLLVMConstant(
+          xlen, $lmul, $_location, moduleTranslation);
       createIntrinsicCall(
           builder, llvm::Intrinsic::riscv_sf_vc_i_se,
-          {opcodeConst, immConst});
+          {opcodeConst, p24_20, p11_7, immConst, sewConst, lmulConst, $vl},
+          {xlen, xlen, xlen});
   }];
 }
 
 def VCIX_BinaryNoDestImmOp : VCIX_Op<"iv">,
     Arguments<(ins VCIX_OpcodeAttr: $opcode,
                    LLVM_AnyVector: $vs2,
-                   VCIX_ImmAttr: $imm)> {
+                   VCIX_ImmAttr: $imm,
+                   VCIX_ImmAttr: $rd,
+                   Optional<VCIX_VL>: $vl)> {
   let summary = "Binary VCIX operation with an immediate second operand";
   let description = [{
     Binary VCIX operation with an immediate second operand.
@@ -93,18 +145,21 @@ def VCIX_BinaryNoDestImmOp : VCIX_Op<"iv">,
     Correponds to:
     |Mnemonic|funct6|vm|rs2|rs1|funct3|rd|Destination|Sources|
     |--|--|--|--|--|--|--|--|--|
-    |sf.vc.v.iv|0010--|1|vs2|simm|011|vd|vector vd| simm[4:0]  vector vs2|
+    |sf.vc.iv|0010--|1|vs2|simm|011|--|none| simm[4:0]  vector vs2|
   }];
 
   string llvmBuilder = [{
-      llvm::Type *xlen =getXlenType($opcode, moduleTranslation);
+      llvm::Type *xlen = getXlenType($opcode, moduleTranslation);
       llvm::Value *opcodeConst = mlir::LLVM::detail::getLLVMConstant(
           xlen, $opcode, $_location, moduleTranslation);
       llvm::Value *immConst = mlir::LLVM::detail::getLLVMConstant(
           xlen, $imm, $_location, moduleTranslation);
+      llvm::Value *p11_7 = mlir::LLVM::detail::getLLVMConstant(
+          xlen, $rd, $_location, moduleTranslation);
       createIntrinsicCall(
           builder, llvm::Intrinsic::riscv_sf_vc_iv_se,
-          {opcodeConst, $vs2, immConst});
+          {opcodeConst, p11_7, $vs2, immConst, $vl},
+          {xlen, $vs2->getType(), xlen, xlen});
   }];
 }
 
@@ -126,7 +181,7 @@ def VCIX_BinaryImmOp : VCIX_Op<"v.iv">,
   }];
 
   string llvmBuilder = [{
-      llvm::Type *xlen =getXlenType($opcode, moduleTranslation);
+      llvm::Type *xlen = getXlenType($opcode, moduleTranslation);
       llvm::Value *opcodeConst = mlir::LLVM::detail::getLLVMConstant(
           xlen, $opcode, $_location, moduleTranslation);
       llvm::Value *immConst = mlir::LLVM::detail::getLLVMConstant(

@@ -106,7 +106,7 @@ struct MatmulOpLowering : public OpRewritePattern<linalg::MatmulOp> {
       return failure(true);
     }
     if (B_K != SYSTOLIC_SIZE || B_M != SYSTOLIC_SIZE) {
-      op.emitError () << "B_K, B_M dimension (" << B_K << ", " << B_M << 
+      op.emitError () << "B_K, B_M dimension (" << B_K << ", " << B_M <<
         ") is not same to systolic array size (" << SYSTOLIC_SIZE << ")";
       return failure(true);
     }
@@ -126,15 +126,15 @@ struct MatmulOpLowering : public OpRewritePattern<linalg::MatmulOp> {
 
     // Constants
     Value c0 = rewriter.create<arith::ConstantOp>(loc, rewriter.getIndexAttr(0));
-    Value compute_cycle = rewriter.create<arith::ConstantOp>(loc, rewriter.getIntegerAttr(rewriter.getI32Type(), 16));
+    Attribute compute_cycle = rewriter.getI64IntegerAttr(4); // FIXME: 5 bits bound & hardcoded
 
     auto vectorType = VectorType::get({nr_element}, rewriter.getF32Type());
 
     // Opcode attribute
-    Attribute zeroImmAttr = rewriter.getI32IntegerAttr(0);
-    Attribute vipush_opcode =  rewriter.getI64IntegerAttr(0b010000);
-    Attribute vwpush_opcode =  rewriter.getI64IntegerAttr(0b010001);
-    Attribute compute_opcode = rewriter.getI64IntegerAttr(0b000011);
+    Attribute zeroImmAttr = rewriter.getI64IntegerAttr(0);
+    Attribute vipush_opcode =  rewriter.getI64IntegerAttr(0b000000);
+    Attribute vwpush_opcode =  rewriter.getI64IntegerAttr(0b000001);
+    Attribute compute_opcode = rewriter.getI64IntegerAttr(0b000010);
     Value rvl = nullptr;
 
     // For loop part
@@ -146,9 +146,12 @@ struct MatmulOpLowering : public OpRewritePattern<linalg::MatmulOp> {
                                         loc, vectorType, A, ValueRange{c0, index});
     auto weight_vector = rewriter.create<vector::TransferReadOp>(
                                         loc, vectorType, B, ValueRange{c0, index});
-    rewriter.create<vcix::BinaryNoDestImmOp>(loc, vipush_opcode, input_vector, zeroImmAttr);
-    rewriter.create<vcix::BinaryNoDestImmOp>(loc, vwpush_opcode, weight_vector, zeroImmAttr);
-    rewriter.create<vcix::ImmOp>(loc, compute_opcode, zeroImmAttr);
+    rvl = rewriter.create<arith::ConstantOp>(loc, rewriter.getI64IntegerAttr(nr_element));
+    rewriter.create<vcix::BinaryNoDestImmOp>(loc, vipush_opcode, input_vector, zeroImmAttr, zeroImmAttr, rvl);
+    rewriter.create<vcix::BinaryNoDestImmOp>(loc, vwpush_opcode, weight_vector, zeroImmAttr, zeroImmAttr, rvl);
+    Attribute sew = rewriter.getI64IntegerAttr(elen);
+    Attribute lmul = rewriter.getI64IntegerAttr(0); // 0: m1, 1: m2, 2: m4, 3: m8, 5: mf8, 6: mf4, 7: mf2
+    rewriter.create<vcix::ImmOp>(loc, compute_opcode, zeroImmAttr, compute_cycle, zeroImmAttr, sew, lmul, rvl);
     Value vpop = rewriter.create<vcix::BinaryImmOp>(loc, input_vector.getVectorType(), vwpush_opcode, weight_vector, zeroImmAttr, rvl);
     auto output_vector = rewriter.create<vector::TransferWriteOp>(
                                         loc, vpop, C, ValueRange{c0, index});

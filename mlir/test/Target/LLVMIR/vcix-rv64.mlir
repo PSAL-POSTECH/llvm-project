@@ -1,5 +1,13 @@
 // RUN: mlir-translate --mlir-to-llvmir %s | FileCheck %s
 
+// CHECK-LABEL: define void @binary_x(i64 %0, i64 %1) {
+// CHECK-NEXT:   call void @llvm.riscv.sf.vc.x.se.i64.i64.i64(i64 3, i64 31, i64 31, i64 %0, i64 64, i64 0, i64 %1)
+// CHECK-NEXT:   ret void
+// CHECK-NEXT: }
+llvm.func @binary_x(%arg0: i64, %vl: i64) {
+  "vcix.x"(%arg0, %vl) <{opcode = 3 : i64, rs2 = 31 : i64, rd = 31 : i64, sew = 64, lmul = 0}> : (i64, i64) -> ()
+  llvm.return
+}
 
 // CHECK-LABEL: define <vscale x 4 x float> @binary_fv(<vscale x 4 x float> %0, float %1, i64 %2) {
 // CHECK-NEXT:   %4 = call <vscale x 4 x float> @llvm.riscv.sf.vc.v.fv.se.nxv4f32.i64.nxv4f32.f32.i64(i64 1, <vscale x 4 x float> %0, float %1, i64 %2)

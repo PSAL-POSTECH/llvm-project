@@ -1,5 +1,14 @@
 // RUN: mlir-translate --split-input-file --mlir-to-llvmir %s | FileCheck %s
 
+// CHECK-LABEL: define void @binary_x(i32 %0, i32 %1) {
+// CHECK-NEXT:   call void @llvm.riscv.sf.vc.x.se.i32.i32.i32(i32 3, i32 31, i32 31, i32 %0, i32 32, i32 0, i32 %1)
+// CHECK-NEXT:   ret void
+// CHECK-NEXT: }
+llvm.func @binary_x(%arg0: i32, %vl: i32) {
+  "vcix.x"(%arg0, %vl) <{opcode = 3 : i32, rs2 = 31 : i32, rd = 31 : i32, sew = 32, lmul = 0}> : (i32, i32) -> ()
+  llvm.return
+}
+
 // CHECK-LABEL: define <vscale x 4 x float> @binary_fv(<vscale x 4 x float> %0, float %1, i32 %2) {
 // CHECK-NEXT:   %4 = call <vscale x 4 x float> @llvm.riscv.sf.vc.v.fv.se.nxv4f32.i32.nxv4f32.f32.i32(i32 1, <vscale x 4 x float> %0, float %1, i32 %2)
 // CHECK-NEXT:   ret <vscale x 4 x float> %4
