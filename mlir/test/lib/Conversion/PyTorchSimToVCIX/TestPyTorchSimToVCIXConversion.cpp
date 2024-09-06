@@ -154,9 +154,21 @@ struct MatmulOpLowering : public OpRewritePattern<linalg::MatmulOp> {
     Attribute lmul = rewriter.getI64IntegerAttr(0); // 0: m1, 1: m2, 2: m4, 3: m8, 5: mf8, 6: mf4, 7: mf2
     rewriter.create<vcix::ImmOp>(loc, compute_opcode, zeroImmAttr, compute_cycle, zeroImmAttr, sew, lmul, rvl);
     Value vpop = rewriter.create<vcix::BinaryImmOp>(loc, input_vector.getVectorType(), vpop_opcode, weight_vector, zeroImmAttr, rvl);
-    auto output_vector = rewriter.create<vector::TransferWriteOp>(
-                                        loc, vpop, C, ValueRange{c0, index});
 
+    auto prev_output = rewriter.create<vector::TransferReadOp>(
+                                        loc, vectorType, C, ValueRange{c0, index});
+    VectorType vt = cast<VectorType>(prev_output.getType());
+    if (vt.getElementType().isInteger()) {
+      auto output_vector = rewriter.create<arith::AddIOp>(loc, prev_output, vpop);
+      rewriter.create<vector::TransferWriteOp>(loc, output_vector, C, ValueRange{c0, index});
+    }
+    else if (vt.getElementType().isIntOrFloat())  {
+      auto output_vector = rewriter.create<arith::AddFOp>(loc, prev_output, vpop);
+      rewriter.create<vector::TransferWriteOp>(loc, output_vector, C, ValueRange{c0, index});
+    } else {
+      op.emitError () << "expected same type";
+      return failure();
+    }
     rewriter.eraseOp(op);
     return success();
   }
