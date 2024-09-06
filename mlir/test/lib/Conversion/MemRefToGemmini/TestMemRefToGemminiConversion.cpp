@@ -112,10 +112,17 @@ struct DmaStartOpLowering : public ConvertOpToLLVMPattern<memref::DmaStartOp> {
     } else {
       return rewriter.notifyMatchFailure(op, "Unsupported DMA operation");
     }
-    Value rows = rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(tile_shape[0]));
-    Value cols = rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(tile_shape[1]));
-    char* asmStr = getAsmString(func7);
+    Value rows;
+    Value cols;
+    if (tile_shape.size() == 2) {
+      rows = rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(tile_shape[0]));
+      cols = rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(tile_shape[1]));
+    } else if (tile_shape.size() == 1) {
+      rows = rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(1));
+      cols = rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(tile_shape[0]));
+    }
 
+    char* asmStr = getAsmString(func7);
     // encoding rs2
     // rs2 = rows << (ADDR_LEN + 16) | (cols << ADDR_LEN) | spad_addr
     Value shift48 = rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(48));
