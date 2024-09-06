@@ -83,9 +83,18 @@ struct DmaStartOpLowering : public ConvertOpToLLVMPattern<memref::DmaStartOp> {
                                          operands.begin() + 1 + op.getSrcMemRefRank() + 1 +
                                          op.getDstMemRefRank()});
 
+    int elen = 0;
+    auto elementTypeA = srcMemRefType.getElementType();
+    if (auto intType = mlir::dyn_cast<mlir::IntegerType>(elementTypeA)) {
+      elen = intType.getWidth();
+    } else if (auto floatType = mlir::dyn_cast<mlir::FloatType>(elementTypeA)) {
+      elen = floatType.getWidth();
+    } else {
+      return failure();
+    }
     Value DstPtr = getStridedElementPtr(loc, dstMemRefType, DstMemref, dst_indices, rewriter);
     Value main_mem_stride = op.getStride();
-    int main_mem_stride_val = extractConstantIntValue(main_mem_stride);
+    int64_t main_mem_stride_val = extractConstantIntValue(main_mem_stride) * elen / 8;
     Value num_elt = op.getNumElementsPerStride();
     int num_elt_val = extractConstantIntValue(num_elt);
     int is_transpose = 0;
@@ -143,15 +152,7 @@ struct DmaStartOpLowering : public ConvertOpToLLVMPattern<memref::DmaStartOp> {
         rewriter.setInsertionPointToStart(&outerBlock);
         // config_rs1 = main memory stride
         // config_rs2 = is_transpose << 32 | element size
-        int elen = 0;
-        auto elementTypeA = srcMemRefType.getElementType();
-        if (auto intType = mlir::dyn_cast<mlir::IntegerType>(elementTypeA)) {
-          elen = intType.getWidth();
-        } else if (auto floatType = mlir::dyn_cast<mlir::FloatType>(elementTypeA)) {
-          elen = floatType.getWidth();
-        } else {
-          return failure();
-        }
+        
         Value config_rs1 = rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(main_mem_stride_val));
         Value config_shift32 = rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(32));
         Value config_rs2 = rewriter.create<LLVM::ShlOp>(loc, rewriter.getI64Type(), rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(is_transpose)), config_shift32);
