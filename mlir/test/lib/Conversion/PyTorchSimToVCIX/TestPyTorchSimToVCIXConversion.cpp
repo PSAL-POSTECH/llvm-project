@@ -138,37 +138,46 @@ struct MatmulOpLowering : public OpRewritePattern<linalg::MatmulOp> {
     Attribute vpop_opcode = rewriter.getI64IntegerAttr(0b000010);
     Value rvl = nullptr;
 
-    // For loop part
-    auto loop = rewriter.create<affine::AffineForOp>(loc, 0, A_N, nr_element);
-    Value index = loop.getInductionVar();
-    rewriter.setInsertionPointToStart(loop.getBody());
+    // For vpush loop part
+    auto vpush_loop = rewriter.create<affine::AffineForOp>(loc, 0, A_N, nr_element);
+    Value vpush_index = vpush_loop.getInductionVar();
+    rewriter.setInsertionPointToStart(vpush_loop.getBody());
 
     auto input_vector = rewriter.create<vector::TransferReadOp>(
-                                        loc, vectorType, A, ValueRange{c0, index});
+                                        loc, vectorType, A, ValueRange{c0, vpush_index});
     auto weight_vector = rewriter.create<vector::TransferReadOp>(
-                                        loc, vectorType, B, ValueRange{c0, index});
+                                        loc, vectorType, B, ValueRange{c0, vpush_index});
     rvl = rewriter.create<arith::ConstantOp>(loc, rewriter.getI64IntegerAttr(nr_element));
-    rewriter.create<vcix::BinaryNoDestImmOp>(loc, vipush_opcode, input_vector, zeroImmAttr, zeroImmAttr, rvl);
     rewriter.create<vcix::BinaryNoDestImmOp>(loc, vwpush_opcode, weight_vector, zeroImmAttr, zeroImmAttr, rvl);
+    rewriter.create<vcix::BinaryNoDestImmOp>(loc, vipush_opcode, input_vector, zeroImmAttr, zeroImmAttr, rvl);
+
+    // Compute instruction
+    rewriter.setInsertionPointAfter(vpush_loop);
     Attribute sew = rewriter.getI64IntegerAttr(elen);
     Attribute lmul = rewriter.getI64IntegerAttr(0); // 0: m1, 1: m2, 2: m4, 3: m8, 5: mf8, 6: mf4, 7: mf2
-    rewriter.create<vcix::ImmOp>(loc, compute_opcode, zeroImmAttr, compute_cycle, zeroImmAttr, sew, lmul, rvl);
-    Value vpop = rewriter.create<vcix::BinaryImmOp>(loc, input_vector.getVectorType(), vpop_opcode, weight_vector, zeroImmAttr, rvl);
+    rewriter.create<vcix::UnaryNoDestImmOp>(loc, compute_opcode, zeroImmAttr, compute_cycle, zeroImmAttr, sew, lmul, rvl);
 
+    // For vpop loop part
+    auto vpop_loop = rewriter.create<affine::AffineForOp>(loc, 0, A_N, nr_element);
+    Value vpop_index = vpop_loop.getInductionVar();
+    rewriter.setInsertionPointToStart(vpop_loop.getBody());
+    Value vpop = rewriter.create<vcix::UnaryImmOp>(loc, vectorType, vpop_opcode, zeroImmAttr, zeroImmAttr, rvl);
     auto prev_output = rewriter.create<vector::TransferReadOp>(
-                                        loc, vectorType, C, ValueRange{c0, index});
+                                        loc, vectorType, C, ValueRange{c0, vpop_index});
+
     VectorType vt = cast<VectorType>(prev_output.getType());
     if (vt.getElementType().isInteger()) {
       auto output_vector = rewriter.create<arith::AddIOp>(loc, prev_output, vpop);
-      rewriter.create<vector::TransferWriteOp>(loc, output_vector, C, ValueRange{c0, index});
+      rewriter.create<vector::TransferWriteOp>(loc, output_vector, C, ValueRange{c0, vpop_index});
     }
     else if (vt.getElementType().isIntOrFloat())  {
       auto output_vector = rewriter.create<arith::AddFOp>(loc, prev_output, vpop);
-      rewriter.create<vector::TransferWriteOp>(loc, output_vector, C, ValueRange{c0, index});
+      rewriter.create<vector::TransferWriteOp>(loc, output_vector, C, ValueRange{c0, vpop_index});
     } else {
       op.emitError () << "expected same type";
       return failure();
     }
+
     rewriter.eraseOp(op);
     return success();
   }

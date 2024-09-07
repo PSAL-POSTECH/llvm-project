@@ -56,7 +56,7 @@ class VCIX_Op<string mnemonic, list<Trait> traits = []>
     : LLVM_OpBase<VCIX_Dialect, mnemonic, traits> {
 }
 
-def VCIX_BinaryScalarOp : VCIX_Op<"x">,
+def VCIX_UnaryNoDestOp: VCIX_Op<"x">,
     Arguments<(ins VCIX_OpcodeAttr: $opcode,
                    VCIX_ImmAttr: $rs2,
                    VCIX_Register: $rs1,
@@ -64,9 +64,9 @@ def VCIX_BinaryScalarOp : VCIX_Op<"x">,
                    VCIX_ImmAttr: $sew,
                    VCIX_ImmAttr: $lmul,
                    Optional<VCIX_VL>: $vl)> {
-  let summary = "Binary VCIX operation with an immediate second operand";
+  let summary = "Unary VCIX operation";
   let description = [{
-    Binary VCIX operation with an immediate second operand.
+    Unary VCIX operationd.
 
     Correponds to:
     |Mnemonic|funct6|vm|rs2|rs1|funct3|rd|Destination|Sources|
@@ -93,7 +93,7 @@ def VCIX_BinaryScalarOp : VCIX_Op<"x">,
   }];
 }
 
-def VCIX_ImmOp : VCIX_Op<"i">,
+def VCIX_UnaryNoDestImmOp : VCIX_Op<"i">,
     Arguments<(ins VCIX_OpcodeAttr: $opcode,
                    VCIX_ImmAttr: $rs2,
                    VCIX_ImmAttr: $imm,
@@ -101,9 +101,9 @@ def VCIX_ImmOp : VCIX_Op<"i">,
                    VCIX_ImmAttr: $sew,
                    VCIX_ImmAttr: $lmul,
                    Optional<VCIX_VL>: $vl)> {
-  let summary = "Binary with destniation VCIX operation with an immediate second operand";
+  let summary = "Unary VCIX operation with an immediate operand";
   let description = [{
-    Binary with destination VCIX operation with an immediate second operand.
+    Unary VCIX operation with an immediate operand.
 
     Correponds to:
     |Mnemonic|funct6|vm|rs2|rs1|funct3|rd|Destination|Sources|
@@ -129,6 +129,37 @@ def VCIX_ImmOp : VCIX_Op<"i">,
           builder, llvm::Intrinsic::riscv_sf_vc_i_se,
           {opcodeConst, p24_20, p11_7, immConst, sewConst, lmulConst, $vl},
           {xlen, xlen, xlen});
+  }];
+}
+
+def VCIX_UnaryImmOp : VCIX_Op<"v.i">,
+    Results<(outs LLVM_AnyVector: $res)>,
+    Arguments<(ins VCIX_OpcodeAttr: $opcode,
+                   VCIX_ImmAttr: $rs2,
+                   VCIX_ImmAttr: $imm,
+                   Optional<VCIX_VL>: $vl)> {
+  let summary = "Unary with destniation VCIX operation with an immediate operand";
+  let description = [{
+    Unary with destniation VCIX operation with an immediate operand.
+
+    Correponds to:
+    |Mnemonic|funct6|vm|rs2|rs1|funct3|rd|Destination|Sources|
+    |--|--|--|--|--|--|--|--|--|
+    |sf.vc.v.i|0000--|0|--|simm|011|--|none|simm[4:0]|
+  }];
+
+  string llvmBuilder = [{
+      llvm::Type *xlen = getXlenType($opcode, moduleTranslation);
+      llvm::Value *opcodeConst = mlir::LLVM::detail::getLLVMConstant(
+          xlen, $opcode, $_location, moduleTranslation);
+      llvm::Value *p24_20 = mlir::LLVM::detail::getLLVMConstant(
+          xlen, $rs2, $_location, moduleTranslation);
+      llvm::Value *immConst = mlir::LLVM::detail::getLLVMConstant(
+          xlen, $imm, $_location, moduleTranslation);
+      $res = createIntrinsicCall(
+          builder, llvm::Intrinsic::riscv_sf_vc_v_i_se,
+          {opcodeConst, p24_20, immConst, $vl},
+          {$_resultType, xlen, xlen, xlen});
   }];
 }
 
