@@ -11,6 +11,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "mlir/Analysis/CFGLoopInfo.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Interfaces/FunctionInterfaces.h"
 #include "mlir/Pass/Pass.h"
 
@@ -20,7 +21,7 @@ namespace {
 /// A testing pass that applies the TileOperationGraph analysis on a region and prints
 /// the information it collected to llvm::errs().
 struct TestTileOperationGraph
-    : public PassWrapper<TestTileOperationGraph, InterfacePass<FunctionOpInterface>> {
+    : public PassWrapper<TestTileOperationGraph, OperationPass<func::FuncOp>> {
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(TestTileOperationGraph)
 
   StringRef getArgument() const final { return "test-tile-operation-graph"; }
@@ -34,38 +35,15 @@ struct TestTileOperationGraph
 
 void TestTileOperationGraph::runOnOperation() {
   auto func = getOperation();
-  DominanceInfo &domInfo = getAnalysis<DominanceInfo>();
-  Region &region = func.getFunctionBody();
 
   // Prints the label of the test.
-  llvm::errs() << "Testing : " << func.getNameAttr() << "\n";
-  if (region.empty()) {
-    llvm::errs() << "empty region\n";
-    return;
-  }
-
-  // Print all the block identifiers first such that the tests can match them.
-  llvm::errs() << "Blocks : ";
-  region.front().printAsOperand(llvm::errs());
-  for (auto &block : region.getBlocks()) {
-    llvm::errs() << ", ";
-    block.printAsOperand(llvm::errs());
-  }
-  llvm::errs() << "\n";
-
-  if (region.getBlocks().size() == 1) {
-    llvm::errs() << "no loops\n";
-    return;
-  }
-
-  llvm::DominatorTreeBase<mlir::Block, false> &domTree =
-      domInfo.getDomTree(&region);
-  mlir::CFGLoopInfo loopInfo(domTree);
-
-  if (loopInfo.getTopLevelLoops().empty())
-    llvm::errs() << "no loops\n";
-  else
-    loopInfo.print(llvm::errs());
+  llvm::errs() << "Testing : " << func->getName() << "\n";
+  func->walk([&](Operation *op) {
+      llvm::errs() << "Testing : " << op->getName() << "\n";
+      if (op->getNumResults() == 0) {
+        return;
+      }
+  });
 }
 
 namespace mlir {
