@@ -17,8 +17,16 @@
 #include "mlir/Pass/Pass.h"
 #include "mlir/Pass/PassManager.h"
 
-#define MVIN 0
-#define MVOUT 1
+#define CONFIG 0
+#define MVIN 2
+#define MVIN2 1
+#define MVIN3 14
+#define MVOUT 3
+
+#define CONFIG_MVIN 0
+#define CONFIG_MVIN2 1
+#define CONFIG_MVIN3 2
+#define CONFIG_MVOUT 3
 
 namespace mlir {
 namespace {
@@ -37,18 +45,16 @@ int extractConstantIntValue(Value val) {
 }
 
 char* getAsmString(unsigned func7) {
-  switch (func7) {
-  case 0x0:
-    return ".insn r CUSTOM_1, 0x3, 0, x0, $0, $1"; // config_mvin
-  case 0x1:
-    return ".insn r CUSTOM_1, 0x3, 1, x0, $0, $1"; // config_mvout
-  case 0x2:
-    return ".insn r CUSTOM_1, 0x3, 2, x0, $0, $1"; // mvin
-  case 0x3:
-    return ".insn r CUSTOM_1, 0x3, 3, x0, $0, $1"; // mvout
-  default:
-    return "";
-  }
+  // return ".insn r CUSTOM_1, 0x3, " + std::to_string(func7) + ", x0, $0, $1";
+  char *asmStr = ".insn r CUSTOM_1, 0x3, ";
+  char *func7Str = (char*) malloc(10);
+  sprintf(func7Str, "%d", func7);
+  char *commaStr = ", x0, $0, $1";
+  char *result = (char*) malloc(strlen(asmStr) + strlen(func7Str) + strlen(commaStr) + 1);
+  strcpy(result, asmStr);
+  strcat(result, func7Str);
+  strcat(result, commaStr);
+  return result;
 }
 
 /// Lowering memref.dma_start operation to Gemmini instructions with LLVM Asm.
@@ -95,11 +101,12 @@ struct DmaStartOpLowering : public ConvertOpToLLVMPattern<memref::DmaStartOp> {
     Value DstPtr = getStridedElementPtr(loc, dstMemRefType, DstMemref, dst_indices, rewriter);
     Value main_mem_stride = op.getStride();
     int64_t main_mem_stride_val = extractConstantIntValue(main_mem_stride) * elen / 8;
-    Value num_elt = op.getNumElementsPerStride();
-    int num_elt_val = extractConstantIntValue(num_elt);
-    int is_transpose = 0;
-    if (num_elt_val == 1) // num_elt = 1 means transposed
-      is_transpose = 1;
+    Value num_elt_per_stride = op.getNumElementsPerStride();
+    int chunk_size = extractConstantIntValue(num_elt_per_stride);
+    bool is_col_major = chunk_size % 2;
+    chunk_size = chunk_size / 2 * elen / 8;
+    Value numElements = op.getNumElements();
+    int dmaType = extractConstantIntValue(numElements);
     unsigned SrcAddressSpace =
         *getTypeConverter()->getMemRefAddressSpace(srcMemRefType);
     unsigned DstAddressSpace =
@@ -107,20 +114,18 @@ struct DmaStartOpLowering : public ConvertOpToLLVMPattern<memref::DmaStartOp> {
     Value rs1;
     Value spad_addr;
     llvm::ArrayRef<int64_t> tile_shape;
-    bool dmaType = SrcAddressSpace == 0 && DstAddressSpace == 1 ? MVIN : (SrcAddressSpace == 1 && DstAddressSpace == 0 ? MVOUT : -1);
-    if (dmaType == MVIN) { // MVIN
+    bool is_mvin = dmaType == MVIN || dmaType == MVIN2 || dmaType == MVIN3;
+      
+    if (is_mvin) { // MVIN
       rs1 = rewriter.create<LLVM::PtrToIntOp>(loc, rewriter.getI64Type(), SrcPtr);
       spad_addr = rewriter.create<LLVM::PtrToIntOp>(loc, rewriter.getI64Type(), DstPtr);
-      func7 = 0x2;
       tile_shape = dstMemRefType.getShape();
-    } else if (dmaType == MVOUT) { // MVOUT
+    } else { // MVOUT
       rs1 = rewriter.create<LLVM::PtrToIntOp>(loc, rewriter.getI64Type(), DstPtr);
       spad_addr = rewriter.create<LLVM::PtrToIntOp>(loc, rewriter.getI64Type(), SrcPtr);
-      func7 = 0x3;
       tile_shape = srcMemRefType.getShape();
-    } else {
-      return rewriter.notifyMatchFailure(op, "Unsupported DMA operation");
     }
+    func7 = dmaType;
     Value rows;
     Value cols;
     if (tile_shape.size() == 2) {
@@ -141,7 +146,21 @@ struct DmaStartOpLowering : public ConvertOpToLLVMPattern<memref::DmaStartOp> {
     rs2 = rewriter.create<LLVM::OrOp>(loc, rs2, spad_addr);
 
     // config_mvin, config_mvout instructions
-    func7 = dmaType == MVIN ? 0x0 : 0x1;
+    func7 = CONFIG;
+    int64_t config_type;
+    if (dmaType == MVIN) {
+      config_type = CONFIG_MVIN;
+    } else if (dmaType == MVIN2) {
+      config_type = CONFIG_MVIN2;
+    } else if (dmaType == MVIN3) {
+      config_type = CONFIG_MVIN3;
+    } else if (dmaType == MVOUT) {
+      config_type = CONFIG_MVOUT;
+    } else{
+      return failure();
+    }
+    printf("config_type: %d\n", config_type);
+    printf("dmaType: %d\n", dmaType);
     char* configAsmStr = getAsmString(func7);
     auto InnerRegion = op->getParentRegion();
     auto OuterRegion = InnerRegion->getParentRegion();
@@ -151,11 +170,15 @@ struct DmaStartOpLowering : public ConvertOpToLLVMPattern<memref::DmaStartOp> {
         OpBuilder::InsertionGuard guard(rewriter);
         rewriter.setInsertionPointToStart(&outerBlock);
         // config_rs1 = main memory stride
-        // config_rs2 = is_transpose << 32 | element size
-        
+        // config_rs2 = chunk-size << 32 | config_type << 17 | is_col_major << 16 | element size
+
         Value config_rs1 = rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(main_mem_stride_val));
+        Value config_shift16 = rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(16));
         Value config_shift32 = rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(32));
-        Value config_rs2 = rewriter.create<LLVM::ShlOp>(loc, rewriter.getI64Type(), rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(is_transpose)), config_shift32);
+        Value config_rs2 = rewriter.create<LLVM::ShlOp>(loc, rewriter.getI64Type(), rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(chunk_size)), config_shift32);
+        Value config_shift17 = rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(17));
+        config_rs2 = rewriter.create<LLVM::OrOp>(loc, config_rs2, rewriter.create<LLVM::ShlOp>(loc, rewriter.getI64Type(), rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(config_type)), config_shift17));
+        config_rs2 = rewriter.create<LLVM::OrOp>(loc, config_rs2, rewriter.create<LLVM::ShlOp>(loc, rewriter.getI64Type(), rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(is_col_major)), config_shift16));
         config_rs2 = rewriter.create<LLVM::OrOp>(loc, config_rs2, rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(int(elen/8)))); // element size [bytes]
         rewriter.create<LLVM::InlineAsmOp>(
             loc,
