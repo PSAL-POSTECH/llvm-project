@@ -83,6 +83,7 @@ void registerTestBuiltinDistinctAttributes();
 void registerTestCallGraphPass();
 void registerTestCfAssertPass();
 void registerTestCFGLoopInfoPass();
+void registerTestTileOperationGraphPass();
 void registerTestComposeSubView();
 void registerTestCompositePass();
 void registerTestConstantFold();
@@ -218,6 +219,7 @@ void registerTestPasses() {
   mlir::test::registerTestCallGraphPass();
   mlir::test::registerTestCfAssertPass();
   mlir::test::registerTestCFGLoopInfoPass();
+  mlir::test::registerTestTileOperationGraphPass();
   mlir::test::registerTestComposeSubView();
   mlir::test::registerTestCompositePass();
   mlir::test::registerTestConstantFold();

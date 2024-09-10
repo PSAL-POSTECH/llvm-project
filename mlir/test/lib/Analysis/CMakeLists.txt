@@ -9,6 +9,7 @@ add_mlir_library(MLIRTestAnalysis
   TestMemRefBoundCheck.cpp
   TestMemRefDependenceCheck.cpp
   TestMemRefStrideCalculation.cpp
+  TestTileOperationGraph.cpp
   TestSlice.cpp
   TestTopologicalSort.cpp
 
