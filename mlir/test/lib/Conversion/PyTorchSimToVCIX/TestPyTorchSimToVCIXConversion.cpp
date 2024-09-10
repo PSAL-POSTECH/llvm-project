@@ -138,21 +138,28 @@ struct MatmulOpLowering : public OpRewritePattern<linalg::MatmulOp> {
     Attribute vpop_opcode = rewriter.getI64IntegerAttr(0b000010);
     Value rvl = nullptr;
 
-    // For vpush loop part
-    auto vpush_loop = rewriter.create<affine::AffineForOp>(loc, 0, A_N, nr_element);
-    Value vpush_index = vpush_loop.getInductionVar();
-    rewriter.setInsertionPointToStart(vpush_loop.getBody());
-
-    auto input_vector = rewriter.create<vector::TransferReadOp>(
-                                        loc, vectorType, A, ValueRange{c0, vpush_index});
+    // For vpush weight loop part
+    auto vwpush_loop = rewriter.create<affine::AffineForOp>(loc, 0, A_K, nr_element);
+    Value vwpush_index = vwpush_loop.getInductionVar();
+    rewriter.setInsertionPointToStart(vwpush_loop.getBody());
     auto weight_vector = rewriter.create<vector::TransferReadOp>(
-                                        loc, vectorType, B, ValueRange{c0, vpush_index});
+                                        loc, vectorType, B, ValueRange{c0, vwpush_index});
     rvl = rewriter.create<arith::ConstantOp>(loc, rewriter.getI64IntegerAttr(nr_element));
     rewriter.create<vcix::BinaryNoDestImmOp>(loc, vwpush_opcode, weight_vector, zeroImmAttr, zeroImmAttr, rvl);
+
+    // For vpush input loop part
+    rewriter.setInsertionPointAfter(vwpush_loop);
+    auto vipush_loop = rewriter.create<affine::AffineForOp>(loc, 0, A_N, nr_element);
+    Value vipush_index = vipush_loop.getInductionVar();
+    rewriter.setInsertionPointToStart(vipush_loop.getBody());
+
+    auto input_vector = rewriter.create<vector::TransferReadOp>(
+                                        loc, vectorType, A, ValueRange{c0, vipush_index});
+    rvl = rewriter.create<arith::ConstantOp>(loc, rewriter.getI64IntegerAttr(nr_element));
     rewriter.create<vcix::BinaryNoDestImmOp>(loc, vipush_opcode, input_vector, zeroImmAttr, zeroImmAttr, rvl);
 
     // Compute instruction
-    rewriter.setInsertionPointAfter(vpush_loop);
+    rewriter.setInsertionPointAfter(vipush_loop);
     Attribute sew = rewriter.getI64IntegerAttr(elen);
     Attribute lmul = rewriter.getI64IntegerAttr(0); // 0: m1, 1: m2, 2: m4, 3: m8, 5: mf8, 6: mf4, 7: mf2
     rewriter.create<vcix::UnaryNoDestImmOp>(loc, compute_opcode, zeroImmAttr, compute_cycle, zeroImmAttr, sew, lmul, rvl);
