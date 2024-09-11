@@ -90,7 +90,7 @@ public:
     std::cout << getId() <<" : {\n";
     std::cout << "\t\"node_id\": " << getId() << ",\n";
     std::cout << "\t\"node_name\": \"" << getName() << "\",\n";
-    std::cout << "\t\"node_type\": \"" << getKind() << "\",\n";
+    std::cout << "\t\"node_type\": " << getKind() << ",\n";
     auto name = std::string("parents");
     printLoopNodeInfo(name, this->parents);
     std::cout << ",\n";
@@ -184,7 +184,7 @@ class TOGDMANode : public TOGNode {
   void display() const override {
     TOGNode::display();
     std::cout << ",\n";
-    std::cout << "\t\"is_write\": \"" << is_write << "\",\n";
+    std::cout << "\t\"is_write\": " << is_write << ",\n";
     std::cout << "\t\"base_address\": \"" << base_addr << "\",\n";
 
     auto name = std::string("stride_list");

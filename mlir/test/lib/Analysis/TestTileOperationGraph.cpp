@@ -222,8 +222,8 @@ void TestTileOperationGraph::runOnOperation() {
   }
 
   /* GEM5 measuring assembly instruction */
-  std::string asmBefore = "insn r CUSTOM_3, 0, 0x40, x0, x0, x0";
-  std::string asmAfter = "insn r CUSTOM_3, 0, 0x41, x0, x0, x0";
+  std::string asmBefore = ".insn r CUSTOM_3, 0, 0x40, x0, x0, x0";
+  std::string asmAfter = ".insn r CUSTOM_3, 0, 0x41, x0, x0, x0";
   auto asmDialectAttr =
     LLVM::AsmDialectAttr::get(builder.getContext(), LLVM::AsmDialect::AD_ATT);
   for (TOGComputeNode *compute_node : compute_nodes) {
