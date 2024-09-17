@@ -159,39 +159,33 @@ struct DmaStartOpLowering : public ConvertOpToLLVMPattern<memref::DmaStartOp> {
     } else{
       return failure();
     }
-    printf("config_type: %d\n", config_type);
-    printf("dmaType: %d\n", dmaType);
     char* configAsmStr = getAsmString(func7);
-    auto InnerRegion = op->getParentRegion();
-    auto OuterRegion = InnerRegion->getParentRegion();
-    if (OuterRegion && !OuterRegion->empty()) {
-      auto &outerBlock = OuterRegion->front();
-      if (!outerBlock.empty()) {
-        OpBuilder::InsertionGuard guard(rewriter);
-        rewriter.setInsertionPointToStart(&outerBlock);
-        // config_rs1 = main memory stride
-        // config_rs2 = chunk-size << 32 | config_type << 17 | is_col_major << 16 | element size
-
-        Value config_rs1 = rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(main_mem_stride_val));
-        Value config_shift16 = rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(16));
-        Value config_shift32 = rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(32));
-        Value config_rs2 = rewriter.create<LLVM::ShlOp>(loc, rewriter.getI64Type(), rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(chunk_size)), config_shift32);
-        Value config_shift17 = rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(17));
-        config_rs2 = rewriter.create<LLVM::OrOp>(loc, config_rs2, rewriter.create<LLVM::ShlOp>(loc, rewriter.getI64Type(), rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(config_type)), config_shift17));
-        config_rs2 = rewriter.create<LLVM::OrOp>(loc, config_rs2, rewriter.create<LLVM::ShlOp>(loc, rewriter.getI64Type(), rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(is_col_major)), config_shift16));
-        config_rs2 = rewriter.create<LLVM::OrOp>(loc, config_rs2, rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(int(elen/8)))); // element size [bytes]
-        rewriter.create<LLVM::InlineAsmOp>(
-            loc,
-            /*resultTypes=*/TypeRange(),
-            /*operands=*/ValueRange({config_rs1, config_rs2}),
-            /*asm_string=*/configAsmStr,
-            /*constraints=*/constraintStr,
-            /*has_side_effects=*/true,
-            /*is_align_stack=*/false,
-            /*asm_dialect=*/asmDialectAttr,
-            /*operand_attrs=*/ArrayAttr());
-      }
-    }
+    // Insert the config instruction at the beginning of the function
+    auto funcOp = op->getParentOfType<func::FuncOp>();
+    auto &entryBlock = funcOp.getRegion().front();
+    auto &firstOp = entryBlock.front();
+    OpBuilder::InsertionGuard guard(rewriter);
+    rewriter.setInsertionPoint(&firstOp);
+    // config_rs1 = main memory stride
+    // config_rs2 = chunk-size << 32 | config_type << 17 | is_col_major << 16 | element size
+    Value config_rs1 = rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(main_mem_stride_val));
+    Value config_shift16 = rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(16));
+    Value config_shift32 = rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(32));
+    Value config_rs2 = rewriter.create<LLVM::ShlOp>(loc, rewriter.getI64Type(), rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(chunk_size)), config_shift32);
+    Value config_shift17 = rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(17));
+    config_rs2 = rewriter.create<LLVM::OrOp>(loc, config_rs2, rewriter.create<LLVM::ShlOp>(loc, rewriter.getI64Type(), rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(config_type)), config_shift17));
+    config_rs2 = rewriter.create<LLVM::OrOp>(loc, config_rs2, rewriter.create<LLVM::ShlOp>(loc, rewriter.getI64Type(), rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(is_col_major)), config_shift16));
+    config_rs2 = rewriter.create<LLVM::OrOp>(loc, config_rs2, rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(int(elen/8)))); // element size [bytes]
+    rewriter.create<LLVM::InlineAsmOp>(
+        loc,
+        /*resultTypes=*/TypeRange(),
+        /*operands=*/ValueRange({config_rs1, config_rs2}),
+        /*asm_string=*/configAsmStr,
+        /*constraints=*/constraintStr,
+        /*has_side_effects=*/true,
+        /*is_align_stack=*/false,
+        /*asm_dialect=*/asmDialectAttr,
+        /*operand_attrs=*/ArrayAttr());
 
     rewriter.setInsertionPoint(op);
     rewriter.replaceOpWithNewOp<LLVM::InlineAsmOp>(op,
