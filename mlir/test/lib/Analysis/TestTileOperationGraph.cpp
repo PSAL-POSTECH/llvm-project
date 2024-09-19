@@ -83,11 +83,13 @@ void TestTileOperationGraph::printOperation(Operation &op, TOGNode *node) {
   if (name == "affine.for") {
     auto for_op = dyn_cast<affine::AffineForOp>(op);
     auto outerLoopAttr = for_op->getAttrOfType<BoolAttr>("outer_loop");
-    if (outerLoopAttr && outerLoopAttr.getValue()) {
+    auto outerLoopAttr2 = for_op->getAttrOfType<BoolAttr>("accumulation_loop");
+    if ((outerLoopAttr && outerLoopAttr.getValue()) || (outerLoopAttr2 && outerLoopAttr2.getValue())) {
       // Get loop information and create loop node
       int start, end, step;
       getAffineForBounds(for_op, start, end, step);
-      TOGLoopNode *tog_loop = new TOGLoopNode("loopNode", "arg", start, end, step);
+      std::string loop_type = outerLoopAttr? "outer_loop" : "accumulation_loop";
+      TOGLoopNode *tog_loop = new TOGLoopNode("loopNode", "arg", start, end, step, loop_type);
       tog_loop->setOp(&op);
 
       /* Link child and parent */

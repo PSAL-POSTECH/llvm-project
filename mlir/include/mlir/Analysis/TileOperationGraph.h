@@ -124,20 +124,23 @@ private:
   int loop_start;
   int loop_end;
   int loop_step;
+  std::string loop_type;
  public:
   // Constructor
-  TOGLoopNode(const std::string &name, const std::string &idx, int start, int end, int step)
-      : TOGNode(name), loop_idx(idx), loop_start(start), loop_end(end), loop_step(step) {}
+  TOGLoopNode(const std::string &name, const std::string &idx, int start, int end, int step, std::string &loop_type)
+      : TOGNode(name), loop_idx(idx), loop_start(start), loop_end(end), loop_step(step), loop_type(loop_type) {}
   std::string getLoopIdx() const { return loop_idx; }
   int getLoopStart() const { return loop_start; }
   int getLoopEnd() const { return loop_end; }
   int getLoopStep() const { return loop_step; }
+  std::string getLoopType() const { return loop_type; }
 
   // Setters
   void setLoopIdx(const std::string &idx) { loop_idx = idx; }
   void setLoopStart(int start) { loop_start = start; }
   void setLoopEnd(int end) { loop_end = end; }
   void setLoopStep(int step) { loop_step = step; }
+  void setLoopType(std::string type) { loop_type = type; }
   // Display node information
   void display() const override {
     TOGNode::display();
@@ -145,7 +148,8 @@ private:
     std::cout << "\t\"loop_index\": \"" << loop_idx << "\",\n";
     std::cout << "\t\"loop_start\": " << loop_start << ",\n";
     std::cout << "\t\"loop_end\": " << loop_end << ",\n";
-    std::cout << "\t\"loop_step\": " << loop_step << "\n";
+    std::cout << "\t\"loop_step\": " << loop_step << ",\n";
+    std::cout << "\t\"loop_type\": \"" << loop_type << "\"\n";
     std::cout << "}\n";
   }
   NodeKind getKind() const override { return LoopNodeKind; }
