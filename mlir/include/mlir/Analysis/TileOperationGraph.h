@@ -75,6 +75,16 @@ public:
     }
     std::cout << "]";
   }
+  void printLoopStringInfo(std::string& name, const std::vector<std::string>& vec) const {
+    std::cout << "\t\"" << name << "\": [";
+    for (size_t i = 0; i < vec.size(); ++i) {
+      std::cout << "\"" << vec[i] << "\"";
+      if (i < vec.size() - 1) {
+        std::cout << ",";
+      }
+    }
+    std::cout << "]";
+  }
   void printLoopNodeInfo(std::string& name, const std::vector<TOGNode*>& vec) const {
     std::cout << "\t\"" << name << "\": [";
     for (size_t i = 0; i < vec.size(); ++i) {
@@ -166,13 +176,16 @@ class TOGDMANode : public TOGNode {
   std::vector<int> tile_stride;
   int element_size;
   bool is_write;
+  std::vector<std::string> loop_idx_list;
 
  public:
   TOGDMANode(const std::string &name, const std::string &addr,
              const std::vector<int> &strides, const std::vector<int> &sizes,
-             const std::vector<int> &tileStrides, int elemSize, bool is_write)
+             const std::vector<int> &tileStrides, int elemSize, bool is_write,
+             std::vector<std::string> &idx_list)
       : TOGNode(name), base_addr(addr), stride_list(strides), tile_size(sizes),
-        tile_stride(tileStrides), element_size(elemSize), is_write(is_write) {}
+        tile_stride(tileStrides), element_size(elemSize), is_write(is_write),
+        loop_idx_list(idx_list) {}
   std::string getBaseAddr() const { return base_addr; }
   std::vector<int> getStrideList() const { return stride_list; }
   std::vector<int> getTileSize() const { return tile_size; }
@@ -201,8 +214,14 @@ class TOGDMANode : public TOGNode {
     name = std::string("tile_size");
     printLoopInfo(name, this->tile_size);
     std::cout << ",\n";
+
+    name = std::string("loop_idx_list");
+    printLoopStringInfo(name, this->loop_idx_list);
+    std::cout << ",\n";
     std::cout << "\t\"element_size\": " << element_size << "\n";
     std::cout << "}\n";
+
+
   }
   NodeKind getKind() const override { return DMANodeKind; }
   static bool classof(const TOGNode *node) {
