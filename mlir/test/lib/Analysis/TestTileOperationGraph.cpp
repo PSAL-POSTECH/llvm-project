@@ -174,15 +174,18 @@ void TestTileOperationGraph::printOperation(Operation &op, TOGNode *node) {
     return;
 
   /* Combine compute node */
+  auto type = name == "linalg.matmul" ? TOGComputeNode::MatmulCompute : TOGComputeNode::VectorCompute;
   if (node->getChildren().size()) {
     TOGComputeNode *last_compute_node = dyn_cast<TOGComputeNode>(node->getLastChild());
     if (last_compute_node) {
       last_compute_node->operations.push_back(&op);
+      if (type == TOGComputeNode::MatmulCompute)
+        last_compute_node->setComputeType(type);
       return;
     }
   }
   /* Create new compute node */
-  TOGComputeNode *tog_compute = new TOGComputeNode("ComputeNode", 0, TOGComputeNode::VectorCompute);
+  TOGComputeNode *tog_compute = new TOGComputeNode("ComputeNode", 0, type);
   tog_compute->setOp(&op);
   tog_compute->operations.push_back(&op);
   /* Link child and parent */
