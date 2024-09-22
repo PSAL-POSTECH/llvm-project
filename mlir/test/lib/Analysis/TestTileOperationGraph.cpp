@@ -39,6 +39,8 @@ struct TestTileOperationGraph
     registry.insert<arith::ArithDialect, func::FuncDialect,
                     memref::MemRefDialect, LLVM::LLVMDialect>();
   }
+  int nr_loop = 0;
+  std::unordered_map<void*, std::string> loop_var_name;
 };
 } // namespace
 
@@ -89,9 +91,11 @@ void TestTileOperationGraph::printOperation(Operation &op, TOGNode *node) {
       int start, end, step;
       getAffineForBounds(for_op, start, end, step);
       std::string loop_type = outerLoopAttr? "outer_loop" : "accumulation_loop";
-      TOGLoopNode *tog_loop = new TOGLoopNode("loopNode", "arg", start, end, step, loop_type);
+      std::string loop_index = "loop_arg" + std::to_string(nr_loop++);
+      mlir::Value iter_var = for_op.getInductionVar();
+      loop_var_name[iter_var.getAsOpaquePointer()] = loop_index;
+      TOGLoopNode *tog_loop = new TOGLoopNode("loopNode", loop_index, start, end, step, loop_type);
       tog_loop->setOp(&op);
-
       /* Link child and parent */
       if (node != NULL) {
         node->addChild(tog_loop);
@@ -115,18 +119,34 @@ void TestTileOperationGraph::printOperation(Operation &op, TOGNode *node) {
     auto dst_space = dma_op.getDstMemorySpace();
     auto src_space = dma_op.getSrcMemorySpace();
     MemRefType tile_memref_type;
+    ValueRange dram_indices;
     Value dram_memref;
+    std::vector<std::string> loop_index_list;
+
     if (dst_space == 0 && src_space == 1) {
       is_write = true;
       tile_memref_type = dma_op.getSrcMemRefType();
       dram_memref = dma_op.getDstMemRef();
+      dram_indices = dma_op.getDstIndices();
     } else if (dst_space == 1 && src_space == 0) {
       is_write = false;
       tile_memref_type = dma_op.getDstMemRefType();
       dram_memref = dma_op.getSrcMemRef();
+      dram_indices = dma_op.getSrcIndices();
     } else {
       op.emitError() << "Unexpected memory space, src: " << src_space << "des: " << dst_space << "\n";
       return;
+    }
+
+    /* Record used loop index names */
+    if (auto applyOp = dram_indices.front().getDefiningOp<affine::AffineApplyOp>()) {
+      // Get the operands of affine.apply, which should be %arg3 and %arg5
+      mlir::OperandRange applyOperands = applyOp.getOperands();
+      for (auto operand : applyOperands) {
+        loop_index_list.push_back(loop_var_name.at(operand.getAsOpaquePointer()));
+      }
+    } else if (auto blockArg = dyn_cast<BlockArgument>(dram_indices.front())) {
+      loop_index_list.push_back(loop_var_name.at(blockArg.getAsOpaquePointer()));
     }
 
     /* Get DRAM argument index */
@@ -161,7 +181,7 @@ void TestTileOperationGraph::printOperation(Operation &op, TOGNode *node) {
     }
 
     TOGDMANode *tog_dma = new TOGDMANode("DMANode", address, stride_list, tile_size, tile_stride,
-                                         element_size, is_write);
+                                         element_size, is_write, loop_index_list);
     tog_dma->setOp(&op);
     /* Link child and parent */
     node->addChild(tog_dma);
