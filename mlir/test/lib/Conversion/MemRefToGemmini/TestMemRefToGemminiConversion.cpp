@@ -78,17 +78,12 @@ struct DmaStartOpLowering : public ConvertOpToLLVMPattern<memref::DmaStartOp> {
     SmallVector<Value> operands;
     for (auto val : adaptor.getOperands())
       operands.push_back(val);
-
     Value SrcMemref = operands[0];
     auto srcMemRefType = cast<MemRefType>(op.getSrcMemRef().getType());
     ValueRange src_indices = ValueRange({operands.begin() + 1, operands.begin() + 1 + op.getSrcMemRefRank()});
-    Value SrcPtr = getStridedElementPtr(loc, srcMemRefType, SrcMemref, src_indices, rewriter);
-    Value DstMemref = operands[op.getSrcMemRefRank() + 1];
-    auto dstMemRefType = cast<MemRefType>(op.getDstMemRef().getType());
     ValueRange dst_indices = ValueRange({operands.begin() + 1 + op.getSrcMemRefRank() + 1,
                                          operands.begin() + 1 + op.getSrcMemRefRank() + 1 +
                                          op.getDstMemRefRank()});
-
     int elen = 0;
     auto elementTypeA = srcMemRefType.getElementType();
     if (auto intType = mlir::dyn_cast<mlir::IntegerType>(elementTypeA)) {
@@ -98,6 +93,9 @@ struct DmaStartOpLowering : public ConvertOpToLLVMPattern<memref::DmaStartOp> {
     } else {
       return failure();
     }
+    Value SrcPtr = getStridedElementPtr(loc, srcMemRefType, SrcMemref, src_indices, rewriter);
+    Value DstMemref = operands[op.getSrcMemRefRank() + 1];
+    auto dstMemRefType = cast<MemRefType>(op.getDstMemRef().getType());
     Value DstPtr = getStridedElementPtr(loc, dstMemRefType, DstMemref, dst_indices, rewriter);
     Value main_mem_stride = op.getStride();
     int64_t main_mem_stride_val = extractConstantIntValue(main_mem_stride) * elen / 8;
@@ -107,15 +105,11 @@ struct DmaStartOpLowering : public ConvertOpToLLVMPattern<memref::DmaStartOp> {
     chunk_size = chunk_size / 2 * elen / 8;
     Value numElements = op.getNumElements();
     int dmaType = extractConstantIntValue(numElements);
-    unsigned SrcAddressSpace =
-        *getTypeConverter()->getMemRefAddressSpace(srcMemRefType);
-    unsigned DstAddressSpace =
-        *getTypeConverter()->getMemRefAddressSpace(dstMemRefType);
     Value rs1;
     Value spad_addr;
     llvm::ArrayRef<int64_t> tile_shape;
     bool is_mvin = dmaType == MVIN || dmaType == MVIN2 || dmaType == MVIN3;
-      
+
     if (is_mvin) { // MVIN
       rs1 = rewriter.create<LLVM::PtrToIntOp>(loc, rewriter.getI64Type(), SrcPtr);
       spad_addr = rewriter.create<LLVM::PtrToIntOp>(loc, rewriter.getI64Type(), DstPtr);
@@ -128,12 +122,19 @@ struct DmaStartOpLowering : public ConvertOpToLLVMPattern<memref::DmaStartOp> {
     func7 = dmaType;
     Value rows;
     Value cols;
+    int col_factor = 1;
+    if (elen < 8) {
+      assert(cols >= 8);
+      assert(chunk_size > 0);
+      col_factor = 8 / elen;
+      elen = 8;
+    }
     if (tile_shape.size() == 2) {
       rows = rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(tile_shape[0]));
-      cols = rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(tile_shape[1]));
+      cols = rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(tile_shape[1] / col_factor));
     } else if (tile_shape.size() == 1) {
       rows = rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(1));
-      cols = rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(tile_shape[0]));
+      cols = rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(tile_shape[0] / col_factor));
     }
 
     char* asmStr = getAsmString(func7);
