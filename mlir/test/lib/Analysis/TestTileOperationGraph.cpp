@@ -77,11 +77,6 @@ void TestTileOperationGraph::printOperation(Operation &op, TOGNode *node) {
       name == "affine.vector_load")
     return;
 
-  // Print the operation itself and some of its properties
-  llvm::errs() << "visiting op: '" << op.getName() << "' with "
-                << op.getNumOperands() << " operands and "
-                << op.getNumResults() << " results\n";
-
   if (name == "affine.for") {
     auto for_op = dyn_cast<affine::AffineForOp>(op);
     auto outerLoopAttr = for_op->getAttrOfType<BoolAttr>("outer_loop");
@@ -221,10 +216,8 @@ void TestTileOperationGraph::runOnOperation() {
   func::FuncOp op = getOperation();
   MLIRContext *context = &getContext();
   OpBuilder builder(context);
-  llvm::errs() << "Target function : " << op->getName() << "\n";
 
   // Check kernel function has one region
-  llvm::errs() << " " << op->getNumRegions() << " regions:\n";
   if (op->getNumRegions() != 1) {
     op.emitError() << "Expected one region but has " << op->getNumRegions() << "region(s)";
     return;
