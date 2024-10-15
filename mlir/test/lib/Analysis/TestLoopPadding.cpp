@@ -20,6 +20,65 @@
 using namespace mlir;
 
 namespace {
+
+// Helper function to get the upper bound of an affine.for loop
+int64_t getLoopUpperBound(mlir::affine::AffineForOp forOp) {
+  if (auto constantOp = forOp.getUpperBoundMap().getSingleConstantResult()) {
+    return constantOp;
+  }
+  // Handle other cases if needed
+  return -1;  // This is an example, handle dynamic cases as needed
+}
+
+// Helper function to set the upper bound of an affine.for loop
+void setLoopUpperBound(mlir::affine::AffineForOp forOp, int64_t newUpperBound) {
+  OpBuilder builder(forOp);
+  auto newBoundMap = builder.getConstantAffineMap(newUpperBound);
+  forOp.setUpperBoundMap(newBoundMap);
+}
+
+class MemRefAffineMapForOps {
+private:
+  mlir::Value memRef;                            // Single memref
+  mlir::AffineMap affineMap;                     // Single affine map
+  std::vector<std::tuple<int64_t, int64_t, int64_t>> loopRange;   // Multiple AffineForOp loops
+  bool is_write;
+public:
+  MemRefAffineMapForOps(mlir::Value memRef, affine::AffineApplyOp applyOp, bool is_write) : memRef(memRef), is_write(is_write) {
+    affineMap = applyOp.getAffineMap();
+    addLoopsFromApplyOp(applyOp);
+  }
+  MemRefAffineMapForOps(mlir::Value memRef, affine::AffineForOp affineForOp, bool is_write) : memRef(memRef), is_write(is_write) {
+    mlir::MLIRContext *context = memRef.getContext();
+    mlir::AffineExpr d0 = mlir::getAffineDimExpr(0, context); // Represents d0
+    mlir::AffineMap identityMap = mlir::AffineMap::get(1, 0, d0);
+    affineMap = identityMap;
+    addLoopFromAffineFor(affineForOp);
+  }
+  void addLoopRange(std::tuple<int64_t, int64_t, int64_t>& loop) { loopRange.push_back(loop); }
+  mlir::Value getMemRef() const { return memRef; }
+  mlir::AffineMap getAffineMap() const { return affineMap; }
+  const std::vector<std::tuple<int64_t, int64_t, int64_t>>& getLoopRange() const { return loopRange; }
+  void clearLoopRange() { loopRange.clear(); }
+  void addLoopsFromApplyOp(affine::AffineApplyOp applyOp);
+  void addLoopFromAffineFor(affine::AffineForOp affineForOp);
+  bool getIsWrite() { return is_write; }
+  void printLog() const {
+    llvm::errs() << "Log for MemRefAffineMapForOps:\n";
+    if (memRef)
+      llvm::errs() << "  MemRef: " << memRef << "\n";
+    else
+      llvm::errs() << "  MemRef: Not set\n";
+    llvm::errs() << "  AffineMap: " << affineMap << "\n";
+    llvm::errs() << "  loopRange (" << loopRange.size() << " loops):\n";
+    for (auto &iter : loopRange) {
+      llvm::errs() << "    Loop Lower " << std::get<0>(iter) << "\n";
+      llvm::errs() << "    Loop Upper " << std::get<1>(iter) << "\n";
+      llvm::errs() << "    Loop Step " << std::get<2>(iter) << "\n";
+    }
+  }
+};
+
 /// A testing pass that applies the TileOperationGraph analysis on a region and prints
 /// the information it collected to llvm::errs().
 struct TestLoopPadding
@@ -37,8 +96,6 @@ struct TestLoopPadding
                     memref::MemRefDialect, LLVM::LLVMDialect>();
   }
   int64_t roundUpToMultiple(int64_t value, int64_t multiple);
-  int64_t getLoopUpperBound(affine::AffineForOp forOp);
-  void setLoopUpperBound(affine::AffineForOp forOp, int64_t newUpperBound);
   void modifyMemrefWithPadding(Value memref, int64_t stepSize, int64_t paddedUpperBound);
   int64_t findSecondSmallestCoefficient(AffineExpr expr);
   int findLoopVariableIndex(mlir::Value loopVar);
@@ -62,15 +119,52 @@ struct TestLoopPadding
     }
     return false;  // Map not found, so forOp can't be registered
   }
+  void analysisDMAStartNode(func::FuncOp function, std::vector<MemRefAffineMapForOps>& targetBuffer);
+  void createWrapperFunction(mlir::ModuleOp module, mlir::OpBuilder builder, mlir::FunctionType kernelFuncType);
   std::vector<std::tuple<int64_t, int64_t, Value>> loopInfoMap;
   std::map<const void*, std::set<const void*>> paddedMapInfo;
+  std::vector<MemRefAffineMapForOps> prePaddingInfo;
+  std::vector<MemRefAffineMapForOps> postPaddingInfo;
 };
 
 } // namespace
 
+void MemRefAffineMapForOps::addLoopsFromApplyOp(affine::AffineApplyOp applyOp) {
+  // Extract operands of the affine.apply (which are the loop indices)
+  for (mlir::Value operand : applyOp.getMapOperands()) {
+    // Walk up the block to find the loop defining this operand as an induction variable
+    auto blockArg = mlir::cast<mlir::BlockArgument>(operand);
+    auto owner = blockArg.getOwner();
+    if (owner) {
+      auto operation = owner->getParentOp();
+      if (auto affineForOp = llvm::dyn_cast<affine::AffineForOp>(operation))
+        addLoopFromAffineFor(affineForOp);
+    }
+  }
+}
+
+void MemRefAffineMapForOps::addLoopFromAffineFor(affine::AffineForOp affineForOp) {
+  int64_t lowerBound = 0;
+  int64_t upperBound = getLoopUpperBound(affineForOp);
+  int64_t stepSize = 1; //affineForOp.getStep().getZExtValue();
+  loopRange.push_back(std::make_tuple(lowerBound, upperBound, stepSize));
+}
+
 void TestLoopPadding::runOnOperation() {
   func::FuncOp function = getOperation();
   MLIRContext *context = &getContext();
+  mlir::ModuleOp module = getOperation()->getParentOfType<mlir::ModuleOp>();
+  func::FuncOp prevKernelFunc = module.lookupSymbol<func::FuncOp>("kernel");
+  if (!prevKernelFunc) {
+    module.emitError() << "Function 'kernel' not found!\n";
+    return;
+  }
+  mlir::FunctionType prevkernelFuncType = prevKernelFunc.getFunctionType();
+
+  // Analysis pre-padding info
+  analysisDMAStartNode(function, prePaddingInfo);
+  //for (auto i : prePaddingInfo)
+  //  i.printLog();
 
   // Traverse the function to find affine.for loops
   function.walk([&](mlir::affine::AffineForOp forOp) {
@@ -157,6 +251,15 @@ void TestLoopPadding::runOnOperation() {
       }
     });
   });
+
+  // Analysis post-padding info
+  analysisDMAStartNode(function, postPaddingInfo);
+  //for (auto i : postPaddingInfo)
+  //  i.printLog();
+
+  // Create padding wrapper function
+  mlir::OpBuilder builder(module.getContext());
+  createWrapperFunction(module, builder, prevkernelFuncType);
   return;
 }
 
@@ -165,21 +268,6 @@ int64_t TestLoopPadding::roundUpToMultiple(int64_t value, int64_t multiple) {
   return ((value + multiple - 1) / multiple) * multiple;
 }
 
-// Helper function to get the upper bound of an affine.for loop
-int64_t TestLoopPadding::getLoopUpperBound(mlir::affine::AffineForOp forOp) {
-  if (auto constantOp = forOp.getUpperBoundMap().getSingleConstantResult()) {
-    return constantOp;
-  }
-  // Handle other cases if needed
-  return -1;  // This is an example, handle dynamic cases as needed
-}
-
-// Helper function to set the upper bound of an affine.for loop
-void TestLoopPadding::setLoopUpperBound(mlir::affine::AffineForOp forOp, int64_t newUpperBound) {
-  OpBuilder builder(forOp);
-  auto newBoundMap = builder.getConstantAffineMap(newUpperBound);
-  forOp.setUpperBoundMap(newBoundMap);
-}
 
 // Helper function to modify a memref type with padding
 void TestLoopPadding::modifyMemrefWithPadding(Value memref, int64_t upperBound, int64_t paddedUpperBound) {
@@ -337,7 +425,6 @@ mlir::AffineExpr TestLoopPadding::updateAffineExprWithBounds(mlir::AffineExpr ex
 
 int TestLoopPadding::findLoopVariableIndex(mlir::Value loopVar) {
   int index = 0;
-
   for (const auto& entry : loopInfoMap) {
     const auto& [upperBound, stepSize, storedValue] = entry;
     if (storedValue == loopVar) {
@@ -371,6 +458,164 @@ AffineMap TestLoopPadding::updateAffineMapWithNewExpr(AffineMap& oldMap,
     llvm::errs() << "AffineMap not found in the map.\n";
   }
   return newMap;
+}
+
+void TestLoopPadding::analysisDMAStartNode(
+  func::FuncOp function, std::vector<MemRefAffineMapForOps>& targetBuffer)
+{
+  // Analysis pre-padding info
+  function.walk([&](mlir::affine::AffineDmaStartOp dmaOp) {
+    auto dst_space = dmaOp.getDstMemorySpace();
+    auto src_space = dmaOp.getSrcMemorySpace();
+    bool is_write;
+    ValueRange dram_indices;
+    Value dram_memref;
+    if (dst_space == 0 && src_space == 1) {
+      dram_memref = dmaOp.getDstMemRef();
+      dram_indices = dmaOp.getDstIndices();
+      is_write = true;
+    } else if (dst_space == 1 && src_space == 0) {
+      dram_memref = dmaOp.getSrcMemRef();
+      dram_indices = dmaOp.getSrcIndices();
+      is_write = false;
+    } else {
+      dmaOp.emitError() << "Unexpected memory space, src: " << src_space << "des: " << dst_space << "\n";
+      return;
+    }
+
+    for (auto operand : dmaOp.getOperands()) {
+      if (auto applyOp = operand.getDefiningOp<mlir::affine::AffineApplyOp>()) {
+        auto info = MemRefAffineMapForOps(dram_memref, applyOp, is_write);
+        targetBuffer.push_back(info);
+        break;
+      } else if (auto blockArg = llvm::dyn_cast<mlir::BlockArgument>(operand)) {
+        auto definingOp = blockArg.getOwner()->getParentOp();
+        if (auto affineForOp = llvm::dyn_cast<mlir::affine::AffineForOp>(definingOp)) {
+          auto info = MemRefAffineMapForOps(dram_memref, affineForOp, is_write);
+          targetBuffer.push_back(info);
+          break;
+        }
+      }
+    }
+  });
+}
+
+void TestLoopPadding::createWrapperFunction(mlir::ModuleOp module, mlir::OpBuilder builder, mlir::FunctionType prevKernelFuncType) {
+  func::FuncOp kernelFunc = module.lookupSymbol<func::FuncOp>("kernel");
+  mlir::SmallVector<mlir::memref::GlobalOp, 4> padded_buffer;
+  affine::AffineForOp last;
+
+  // Declare global buffers
+  builder.setInsertionPointToEnd(module.getBody());
+  for (size_t i = 0; i < prePaddingInfo.size() && i < postPaddingInfo.size(); ++i) {
+    auto& postInfo = postPaddingInfo[i];
+    mlir::Value postMemRef = postInfo.getMemRef();
+
+    std::string paddedBufName = std::string("global_buffer") + std::to_string(i);
+    mlir::MemRefType paddedMemRefType = mlir::dyn_cast<mlir::MemRefType>(postMemRef.getType());
+    auto globalMemRefOp = builder.create<mlir::memref::GlobalOp>(
+                            builder.getUnknownLoc(), paddedBufName,
+                            builder.getStringAttr("private"),
+                            paddedMemRefType, mlir::Attribute(), false, builder.getIntegerAttr(builder.getIndexType(), 0));
+    padded_buffer.push_back(globalMemRefOp);
+  }
+
+  // Create wrapper function
+  auto wrapperFunc = builder.create<func::FuncOp>(
+      module.getLoc(), "kernel_wrapper", prevKernelFuncType);
+  mlir::Block *entryBlock = wrapperFunc.addEntryBlock();
+  Location loc = wrapperFunc.getLoc();
+  builder.setInsertionPointToStart(entryBlock);
+
+  // Create read padding phase
+  for (size_t i = 0; i < prePaddingInfo.size() && i < postPaddingInfo.size(); ++i) {
+    auto& preInfo = prePaddingInfo[i];
+    auto& postInfo = postPaddingInfo[i];
+
+    mlir::SmallVector<mlir::Value, 2> mapOperands;
+    AffineMap preAffineMap = preInfo.getAffineMap();
+    AffineMap postAffineMap = postInfo.getAffineMap();
+    builder.setInsertionPointToEnd(entryBlock);
+    mlir::Value preMemRef = preInfo.getMemRef();
+    auto globalMemRefOp = padded_buffer[i];
+
+    for (const auto& loopInfo : preInfo.getLoopRange()) {
+      int64_t lowerBound = std::get<0>(loopInfo);
+      int64_t upperBound = std::get<1>(loopInfo);
+      int64_t stepSize = std::get<2>(loopInfo);
+
+      last = builder.create<affine::AffineForOp>(loc, lowerBound, upperBound, stepSize);
+
+      builder.setInsertionPointToEnd(last.getBody());
+      mapOperands.push_back(last.getInductionVar());
+      loc = last.getLoc();
+    }
+    if (mapOperands.size()) {
+      auto preApplyOp = builder.create<affine::AffineApplyOp>(last.getLoc(), preAffineMap, mapOperands);
+      mlir::Value preResultIndex = preApplyOp.getResult();
+      auto loadedValue = builder.create<affine::AffineLoadOp>(preApplyOp.getLoc(), preMemRef, preResultIndex);
+
+      /* Get Global */
+      auto loadedMemRef = builder.create<mlir::memref::GetGlobalOp>(
+        loadedValue.getLoc(), globalMemRefOp.getType(), globalMemRefOp.getName());
+      auto postApplyOp = builder.create<affine::AffineApplyOp>(loadedValue.getLoc(), postAffineMap, mapOperands);
+      mlir::Value postResultIndex = postApplyOp.getResult();
+      builder.create<affine::AffineStoreOp>(postApplyOp.getLoc(), loadedValue, loadedMemRef, postResultIndex);
+    }
+  }
+
+  // Prepare the arguments of the wrapper to be passed to the 'kernel' function
+  builder.setInsertionPointToEnd(entryBlock);
+  llvm::SmallVector<mlir::Value, 4> callArgs;
+  for (auto globalMemRefOp : padded_buffer) {
+    auto loadedMemRef = builder.create<mlir::memref::GetGlobalOp>(
+          builder.getUnknownLoc(), globalMemRefOp.getType(), globalMemRefOp.getName());
+    callArgs.push_back(loadedMemRef);
+  }
+
+  // Create a call to the 'kernel' function inside the wrapper
+  builder.create<mlir::func::CallOp>(module.getLoc(), kernelFunc, callArgs);
+
+  // Create write padding phase
+  for (size_t i = 0; i < prePaddingInfo.size() && i < postPaddingInfo.size(); ++i) {
+    auto& preInfo = prePaddingInfo[i];
+    auto& postInfo = postPaddingInfo[i];
+
+    mlir::SmallVector<mlir::Value, 2> mapOperands;
+    AffineMap preAffineMap = preInfo.getAffineMap();
+    AffineMap postAffineMap = postInfo.getAffineMap();
+    builder.setInsertionPointToEnd(entryBlock);
+    mlir::Value preMemRef = preInfo.getMemRef();
+    auto globalMemRefOp = padded_buffer[i];
+
+    for (const auto& loopInfo : preInfo.getLoopRange()) {
+      int64_t lowerBound = std::get<0>(loopInfo);
+      int64_t upperBound = std::get<1>(loopInfo);
+      int64_t stepSize = std::get<2>(loopInfo);
+
+      last = builder.create<affine::AffineForOp>(loc, lowerBound, upperBound, stepSize);
+
+      builder.setInsertionPointToEnd(last.getBody());
+      mapOperands.push_back(last.getInductionVar());
+      loc = last.getLoc();
+    }
+    if (mapOperands.size()) {
+      /* Get Global */
+      auto loadedMemRef = builder.create<mlir::memref::GetGlobalOp>(
+        loc, globalMemRefOp.getType(), globalMemRefOp.getName());
+      auto postApplyOp = builder.create<affine::AffineApplyOp>(loadedMemRef.getLoc(), postAffineMap, mapOperands);
+      mlir::Value postResultIndex = postApplyOp.getResult();
+      auto loadedValue = builder.create<affine::AffineLoadOp>(postApplyOp.getLoc(), loadedMemRef, postResultIndex);
+
+      auto preApplyOp = builder.create<affine::AffineApplyOp>(loadedValue.getLoc(), preAffineMap, mapOperands);
+      mlir::Value preResultIndex = preApplyOp.getResult();
+      builder.create<affine::AffineStoreOp>(preApplyOp.getLoc(), loadedValue, preMemRef, preResultIndex);
+   }
+  }
+
+  // Add a return operation to the wrapper function
+  builder.setInsertionPointToEnd(entryBlock);
+  builder.create<mlir::func::ReturnOp>(module.getLoc());
 }
 
 namespace mlir {
