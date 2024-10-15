@@ -121,43 +121,40 @@ void TestLoopPadding::runOnOperation() {
         auto newFuncType = FunctionType::get(function.getContext(), newArgTypes, funcType.getResults());
         function.setType(newFuncType);  // Set the new function type
 
-        int64_t mm_stride = -1;
-        int64_t new_mm_stride;
         for (auto operand : dmaOp.getOperands()) {
           if (auto applyOp = operand.getDefiningOp<mlir::affine::AffineApplyOp>()) {
+            int64_t mm_stride = -1;
+            Value fifthOperand = dmaOp.getStride();
+            auto strideVal = fifthOperand.getDefiningOp<arith::ConstantIndexOp>();
             auto index_pos = findLoopVariableIndex(forOp.getInductionVar());
             AffineMap map = applyOp.getAffineMap();
             for (unsigned i = 0; i < map.getNumResults(); ++i) {
               AffineExpr expr = map.getResult(i);
 
-              // Find old mm_stride
               if (!isLoopRegistered(map, forOp)) {
                 expr = updateAffineExprWithBounds(expr, index_pos, upperBound, paddedUpperBound, context);
                 map = updateAffineMapWithNewExpr(map, expr, i, context, forOp);
                 applyOp.setMap(map);
               }
 
-              auto strideVal = dmaOp.getStride().getDefiningOp<arith::ConstantIndexOp>();
               if (strideVal && strideVal.value() != 1) {
-                new_mm_stride = findSecondSmallestCoefficient(expr);
-                mm_stride = mm_stride !=1 ? new_mm_stride : stepSize;
+                mm_stride = mm_stride !=1 ? findSecondSmallestCoefficient(expr) : stepSize;
               }
               //llvm::errs() << "old_expr: " << expr << " new_expr: " << new_expr << "\n";
               //llvm::errs() << "index_pos: " << index_pos << " upper: " << upperBound << " paddUpper: " << paddedUpperBound << "\n";
             }
+            if (strideVal && mm_stride != -1) {
+              //llvm::errs() << "update mm_stride: " << strideVal.value() << "  " << mm_stride <<"\n";
+              OpBuilder builder(strideVal);
+              Value newStrideConstant = builder.create<arith::ConstantIndexOp>(strideVal.getLoc(), mm_stride);
+              dmaOp.setOperand(dmaOp.getNumOperands() - 2, newStrideConstant);
+              if (strideVal.use_empty()) {
+                strideVal.erase();
+              }
+            }
           }
         }
-
-        Value fifthOperand = dmaOp.getStride();
-        auto constantOp = llvm::dyn_cast<arith::ConstantIndexOp>(fifthOperand.getDefiningOp());
-        if (constantOp && mm_stride != -1) {
-          //llvm::errs() << constantOp << "  " << mm_stride <<"\n";
-          OpBuilder builder(constantOp);
-          Value newStrideConstant = builder.create<arith::ConstantIndexOp>(constantOp.getLoc(), mm_stride);
-          constantOp.replaceAllUsesWith(newStrideConstant);
-          constantOp.erase();
-        }
-     }
+      }
     });
   });
   return;
