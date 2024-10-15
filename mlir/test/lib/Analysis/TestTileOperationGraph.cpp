@@ -216,6 +216,10 @@ void TestTileOperationGraph::runOnOperation() {
   func::FuncOp op = getOperation();
   MLIRContext *context = &getContext();
   OpBuilder builder(context);
+  llvm::StringRef funcName = op.getSymName();
+  if (funcName.compare(llvm::StringRef("kernel"))) {
+    return;
+  }
 
   // Check kernel function has one region
   if (op->getNumRegions() != 1) {
