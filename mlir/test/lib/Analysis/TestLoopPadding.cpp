@@ -97,7 +97,7 @@ struct TestLoopPadding
   }
   int64_t roundUpToMultiple(int64_t value, int64_t multiple);
   void modifyMemrefWithPadding(Value memref, int64_t stepSize, int64_t paddedUpperBound);
-  int64_t findSecondSmallestCoefficient(AffineExpr expr);
+  SmallVector<int64_t, 4> findCoefficient(AffineExpr expr);
   int findLoopVariableIndex(mlir::Value loopVar);
   mlir::AffineExpr updateAffineExprWithBounds(mlir::AffineExpr expr,
                                             int updated_position_index,
@@ -216,6 +216,7 @@ void TestLoopPadding::runOnOperation() {
         function.setType(newFuncType);  // Set the new function type
 
         for (auto operand : dmaOp.getOperands()) {
+          /* check that padding will affect this op */
           if (auto applyOp = operand.getDefiningOp<mlir::affine::AffineApplyOp>()) {
             int64_t mm_stride = -1;
             Value fifthOperand = dmaOp.getStride();
@@ -226,13 +227,18 @@ void TestLoopPadding::runOnOperation() {
               AffineExpr expr = map.getResult(i);
 
               if (!isLoopRegistered(map, forOp)) {
-                expr = updateAffineExprWithBounds(expr, index_pos, upperBound, paddedUpperBound, context);
-                map = updateAffineMapWithNewExpr(map, expr, i, context, forOp);
+                AffineExpr newExpr = updateAffineExprWithBounds(expr, index_pos, upperBound, paddedUpperBound, context);
+                map = updateAffineMapWithNewExpr(map, newExpr, i, context, forOp);
                 applyOp.setMap(map);
-              }
-
-              if (strideVal && strideVal.value() != 1) {
-                mm_stride = mm_stride !=1 ? findSecondSmallestCoefficient(expr) : stepSize;
+                if (strideVal) {
+                  /* Update stride info by finding updated coeff */
+                  auto oldCoeff = findCoefficient(expr);
+                  auto newCoeff = findCoefficient(newExpr);
+                  for (size_t i=0; i<oldCoeff.size();i++) {
+                    if (oldCoeff[i] == strideVal.value())
+                      mm_stride = newCoeff[i];
+                  }
+                }
               }
               //llvm::errs() << "old_expr: " << expr << " new_expr: " << new_expr << "\n";
               //llvm::errs() << "index_pos: " << index_pos << " upper: " << upperBound << " paddUpper: " << paddedUpperBound << "\n";
@@ -294,7 +300,7 @@ void TestLoopPadding::modifyMemrefWithPadding(Value memref, int64_t upperBound, 
   memref.setType(paddedMemrefType);
 }
 
-int64_t TestLoopPadding::findSecondSmallestCoefficient(AffineExpr expr) {
+SmallVector<int64_t, 4> TestLoopPadding::findCoefficient(AffineExpr expr) {
   SmallVector<int64_t, 4> coefficients;
 
   // Lambda to traverse affine expressions
@@ -319,20 +325,7 @@ int64_t TestLoopPadding::findSecondSmallestCoefficient(AffineExpr expr) {
       coefficients.push_back(1);
     }
   };
-
-  // Traverse the expression and extract coefficients
-  extractCoefficients(expr);
-
-  if (coefficients.size() < 2) {
-    return -1;
-  }
-
-  std::sort(coefficients.begin(), coefficients.end(), std::less<int64_t>());
-
-  //for (auto coe:coefficients)
-  //  llvm::errs() << coe << " ";
-
-  return coefficients[1];
+  return coefficients;
 }
 
 mlir::AffineExpr TestLoopPadding::updateAffineExprWithBounds(mlir::AffineExpr expr,
