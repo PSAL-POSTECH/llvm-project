@@ -127,6 +127,7 @@ void registerTestMathPolynomialApproximationPass();
 void registerTestMathToVCIXPass();
 void registerTestMemRefToGemminiPass();
 void registerTestPyTorchSimToVCIXPass();
+void registerTestPyTorchSimLinalgTilingPass();
 void registerTestMemRefDependenceCheck();
 void registerTestMemRefStrideCalculation();
 void registerTestMeshReshardingSpmdizationPass();
@@ -262,6 +263,7 @@ void registerTestPasses() {
   mlir::test::registerTestMathAlgebraicSimplificationPass();
   mlir::test::registerTestMathPolynomialApproximationPass();
   mlir::test::registerTestMathToVCIXPass();
+  mlir::test::registerTestPyTorchSimLinalgTilingPass();
   mlir::test::registerTestMemRefToGemminiPass();
   mlir::test::registerTestPyTorchSimToVCIXPass();
   mlir::test::registerTestMemRefDependenceCheck();
