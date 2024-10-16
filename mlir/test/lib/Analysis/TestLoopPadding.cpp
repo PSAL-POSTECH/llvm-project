@@ -495,7 +495,12 @@ void TestLoopPadding::analysisDMAStartNode(
 
 void TestLoopPadding::createWrapperFunction(mlir::ModuleOp module, mlir::OpBuilder builder, mlir::FunctionType prevKernelFuncType) {
   func::FuncOp kernelFunc = module.lookupSymbol<func::FuncOp>("kernel");
+  if (!kernelFunc) {
+    module.emitError() << "Function 'kernel' not found!\n";
+    return;
+  }
   mlir::SmallVector<mlir::memref::GlobalOp, 4> padded_buffer;
+  std::set<void*> usedMemRefs;
   padded_buffer.resize(kernelFunc.getNumArguments());
   affine::AffineForOp last;
 
@@ -507,15 +512,18 @@ void TestLoopPadding::createWrapperFunction(mlir::ModuleOp module, mlir::OpBuild
     auto blockArg = mlir::cast<mlir::BlockArgument>(postMemRef);
     unsigned int argIdx = blockArg.getArgNumber();
 
-    std::string paddedBufName = std::string("global_buffer") + std::to_string(i);
-    mlir::MemRefType paddedMemRefType = mlir::dyn_cast<mlir::MemRefType>(postMemRef.getType());
-    auto globalMemRefOp = builder.create<mlir::memref::GlobalOp>(
-                            builder.getUnknownLoc(), paddedBufName,
-                            builder.getStringAttr("private"),
-                            paddedMemRefType, mlir::Attribute(), false,
-                            builder.getIntegerAttr(builder.getIntegerType(64), 0x1000));
-    padded_buffer[argIdx] = globalMemRefOp;
-  }
+    if (usedMemRefs.find(postMemRef.getAsOpaquePointer()) == usedMemRefs.end()) {
+      std::string paddedBufName = std::string("global_buffer") + std::to_string(i);
+      mlir::MemRefType paddedMemRefType = mlir::dyn_cast<mlir::MemRefType>(postMemRef.getType());
+      auto globalMemRefOp = builder.create<mlir::memref::GlobalOp>(
+                              builder.getUnknownLoc(), paddedBufName,
+                              builder.getStringAttr("private"),
+                              paddedMemRefType, mlir::Attribute(), false,
+                              builder.getIntegerAttr(builder.getIntegerType(64), 0x1000));
+      padded_buffer[argIdx] = globalMemRefOp;
+      usedMemRefs.insert(postMemRef.getAsOpaquePointer());
+    }
+ }
 
   // Create wrapper function
   auto wrapperFunc = builder.create<func::FuncOp>(
@@ -538,7 +546,7 @@ void TestLoopPadding::createWrapperFunction(mlir::ModuleOp module, mlir::OpBuild
     unsigned int argIdx = blockArg.getArgNumber();
     mlir::Value argValue = wrapperFunc.getArgument(argIdx);
 
-    auto globalMemRefOp = padded_buffer[i];
+    auto globalMemRefOp = padded_buffer[argIdx];
 
     for (const auto& loopInfo : preInfo.getLoopRange()) {
       int64_t lowerBound = std::get<0>(loopInfo);
@@ -591,7 +599,7 @@ void TestLoopPadding::createWrapperFunction(mlir::ModuleOp module, mlir::OpBuild
     unsigned int argIdx = blockArg.getArgNumber();
     mlir::Value argValue = wrapperFunc.getArgument(argIdx);
 
-    auto globalMemRefOp = padded_buffer[i];
+    auto globalMemRefOp = padded_buffer[argIdx];
 
     for (const auto& loopInfo : preInfo.getLoopRange()) {
       int64_t lowerBound = std::get<0>(loopInfo);
