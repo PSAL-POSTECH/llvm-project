@@ -178,6 +178,8 @@ void TestLoopPadding::runOnOperation() {
     // Step 2: Modify the loop bounds to make upperBound a multiple of stepSize
     int64_t paddedUpperBound = roundUpToMultiple(upperBound, stepSize);
     setLoopUpperBound(forOp, paddedUpperBound);
+    if (paddedUpperBound == upperBound)
+      return;
 
     // Step 3: Find dma_start operations inside the loop
     forOp.getBody()->walk([&](Operation *op) {
@@ -474,6 +476,12 @@ void TestLoopPadding::analysisDMAStartNode(
     } else {
       dmaOp.emitError() << "Unexpected memory space, src: " << src_space << "des: " << dst_space << "\n";
       return;
+    }
+
+    for (const auto &existingInfo : targetBuffer) {
+      if (existingInfo.getMemRef() == dram_memref) {
+        return;
+      }
     }
 
     for (auto operand : dmaOp.getOperands()) {
