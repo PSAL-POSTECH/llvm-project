@@ -37,6 +37,24 @@ void setLoopUpperBound(mlir::affine::AffineForOp forOp, int64_t newUpperBound) {
   forOp.setUpperBoundMap(newBoundMap);
 }
 
+std::pair<Value, bool> getDramMemRefAndIndices(mlir::affine::AffineDmaStartOp dmaOp) {
+  auto dst_space = dmaOp.getDstMemorySpace();
+  auto src_space = dmaOp.getSrcMemorySpace();
+  Value dram_memref;
+  bool is_write;
+
+  if (dst_space == 0 && src_space == 1) {
+    dram_memref = dmaOp.getDstMemRef();
+    is_write = true;
+  } else if (dst_space == 1 && src_space == 0) {
+    dram_memref = dmaOp.getSrcMemRef();
+    is_write = false;
+  } else {
+    dmaOp.emitError() << "Unexpected memory space, src: " << src_space << ", dst: " << dst_space << "\n";
+  }
+  return std::make_pair(dram_memref, is_write);
+}
+
 class MemRefAffineMapForOps {
 private:
   mlir::Value memRef;                            // Single memref
@@ -89,6 +107,7 @@ struct TestLoopPadding
     return "Test loop padding";
   }
 
+  void updateFunctionSignatureWithMemRef(func::FuncOp function, Value dramMemRef);
   void runOnOperation() override;
   void getAffineForBounds(affine::AffineForOp &op, int &start, int &end, int &step);
   void getDependentDialects(DialectRegistry &registry) const override {
@@ -97,8 +116,8 @@ struct TestLoopPadding
   }
   int64_t roundUpToMultiple(int64_t value, int64_t multiple);
   void modifyMemrefWithPadding(Value memref, int64_t stepSize, int64_t paddedUpperBound);
-  SmallVector<int64_t, 4> findCoefficient(AffineExpr expr);
   int findLoopVariableIndex(mlir::Value loopVar);
+  SmallVector<std::pair<int64_t, unsigned>, 4> collectCoefficientsFromAffineExpr(mlir::AffineExpr expr);
   mlir::AffineExpr updateAffineExprWithBounds(mlir::AffineExpr expr,
                                             int updated_position_index,
                                             int64_t upperBound,
@@ -110,19 +129,9 @@ struct TestLoopPadding
                                        mlir::MLIRContext *context,
                                        affine::AffineForOp& forOp);
                                        // Function to check if a loop is already registered
-  bool isLoopRegistered(AffineMap& map, affine::AffineForOp& forOp) {
-    // Check if the map exists in the loopMap
-    auto it = paddedMapInfo.find(map.getAsOpaquePointer());
-    if (it != paddedMapInfo.end()) {
-      // Check if the forOp is already in the set of loops for this map
-      return it->second.find(forOp.getAsOpaquePointer()) != it->second.end();
-    }
-    return false;  // Map not found, so forOp can't be registered
-  }
   void analysisDMAStartNode(func::FuncOp function, std::vector<MemRefAffineMapForOps>& targetBuffer);
   void createWrapperFunction(mlir::ModuleOp module, mlir::OpBuilder builder, mlir::FunctionType kernelFuncType);
   std::vector<std::tuple<int64_t, int64_t, Value>> loopInfoMap;
-  std::map<const void*, std::set<const void*>> paddedMapInfo;
   std::vector<MemRefAffineMapForOps> prePaddingInfo;
   std::vector<MemRefAffineMapForOps> postPaddingInfo;
 };
@@ -150,6 +159,21 @@ void MemRefAffineMapForOps::addLoopFromAffineFor(affine::AffineForOp affineForOp
   loopRange.push_back(std::make_tuple(lowerBound, upperBound, stepSize));
 }
 
+void TestLoopPadding::updateFunctionSignatureWithMemRef(func::FuncOp function, Value dramMemRef) {
+  // Get the current function type
+  auto funcType = function.getFunctionType();
+  SmallVector<Type, 4> newArgTypes(funcType.getInputs().begin(), funcType.getInputs().end());
+
+  for (auto &arg : function.getBody().getArguments()) {
+    if (arg.getType() == dramMemRef.getType()) {
+      arg.setType(dramMemRef.getType());
+      newArgTypes[arg.getArgNumber()] = dramMemRef.getType();
+    }
+  }
+  auto newFuncType = FunctionType::get(function.getContext(), newArgTypes, funcType.getResults());
+  function.setType(newFuncType);
+}
+
 void TestLoopPadding::runOnOperation() {
   func::FuncOp function = getOperation();
   MLIRContext *context = &getContext();
@@ -171,8 +195,10 @@ void TestLoopPadding::runOnOperation() {
     // Step 1: Get loop step size and end condition
     int64_t stepSize = forOp.getStep().getZExtValue();
     int64_t upperBound = getLoopUpperBound(forOp);
-    if (upperBound == -1)
-        forOp.emitError() << "Unexpected loop upper size\n";
+    if (upperBound == -1) {
+      forOp.emitError() << "Unexpected loop upper size\n";
+      return;
+    }
     loopInfoMap.push_back(std::make_tuple(upperBound, stepSize, forOp.getInductionVar()));
 
     // Step 2: Modify the loop bounds to make upperBound a multiple of stepSize
@@ -181,79 +207,57 @@ void TestLoopPadding::runOnOperation() {
     if (paddedUpperBound == upperBound)
       return;
 
-    // Step 3: Find dma_start operations inside the loop
-    forOp.getBody()->walk([&](Operation *op) {
-      if (auto dmaOp = dyn_cast<mlir::affine::AffineDmaStartOp>(op)) {
-        // Step 4: Get the memref being accessed and modify its size
-        auto dst_space = dmaOp.getDstMemorySpace();
-        auto src_space = dmaOp.getSrcMemorySpace();
-        ValueRange dram_indices;
-        Value dram_memref;
-        if (dst_space == 0 && src_space == 1) {
-          dram_memref = dmaOp.getDstMemRef();
-          dram_indices = dmaOp.getDstIndices();
-        } else if (dst_space == 1 && src_space == 0) {
-          dram_memref = dmaOp.getSrcMemRef();
-          dram_indices = dmaOp.getSrcIndices();
-        } else {
-          dmaOp.emitError() << "Unexpected memory space, src: " << src_space << "des: " << dst_space << "\n";
-          return;
+    //llvm::errs() << "=============updated axis===========\n";
+    function.walk([&](mlir::affine::AffineDmaStartOp dmaOp) {
+      auto result = getDramMemRefAndIndices(dmaOp);
+      Value dram_memref = result.first;
+      Value fifthOperand = dmaOp.getStride();
+      auto strideVal = fifthOperand.getDefiningOp<arith::ConstantIndexOp>();
+      auto index_pos = findLoopVariableIndex(forOp.getInductionVar());
+      int64_t mm_stride = -1;
+
+      if (!strideVal) {
+        dmaOp.emitError() << "Can't found stride value from dmaOp\n";
+        dmaOp.dump();
+        return;
+      }
+
+      // Padding memref and update the function signature to match the new padded memref types
+      modifyMemrefWithPadding(dram_memref, upperBound, paddedUpperBound);
+      updateFunctionSignatureWithMemRef(function, dram_memref);
+
+      for (auto operand : dmaOp.getOperands()) {
+       int expr_idx = 0;
+        auto applyOp = operand.getDefiningOp<mlir::affine::AffineApplyOp>();
+        if (!applyOp) {
+          continue;
         }
-        // Padding memref
-        modifyMemrefWithPadding(dram_memref, upperBound, paddedUpperBound);
 
-        // Update the function signature to match the new padded memref types
-        auto funcType = function.getFunctionType();
-        SmallVector<Type, 4> newArgTypes(funcType.getInputs().begin(), funcType.getInputs().end());
+        AffineMap map = applyOp.getAffineMap();
+        AffineExpr expr = map.getResult(expr_idx);
 
-        for (auto &arg : function.getBody().getArguments()) {
-          if (arg.getType() == dram_memref.getType()) {
-            arg.setType(dram_memref.getType());
-            newArgTypes[arg.getArgNumber()] = dram_memref.getType();
+        /* Update affine expression */
+        AffineExpr newExpr = updateAffineExprWithBounds(expr, index_pos, upperBound, paddedUpperBound, context);
+        map = updateAffineMapWithNewExpr(map, newExpr, expr_idx, context, forOp);
+        applyOp.setMap(map);
+
+        /* Update stride info by finding updated coeff */
+        auto oldCoeff = collectCoefficientsFromAffineExpr(expr);
+        auto newCoeff = collectCoefficientsFromAffineExpr(newExpr);
+        for (size_t i=0; i<oldCoeff.size();i++) {
+          if (oldCoeff[i].first == strideVal.value()) {
+            mm_stride = newCoeff[i].first;
+            break;
           }
         }
-
-        // Create a new function type with updated argument types
-        auto newFuncType = FunctionType::get(function.getContext(), newArgTypes, funcType.getResults());
-        function.setType(newFuncType);  // Set the new function type
-
-        for (auto operand : dmaOp.getOperands()) {
-          /* check that padding will affect this op */
-          if (auto applyOp = operand.getDefiningOp<mlir::affine::AffineApplyOp>()) {
-            int64_t mm_stride = -1;
-            Value fifthOperand = dmaOp.getStride();
-            auto strideVal = fifthOperand.getDefiningOp<arith::ConstantIndexOp>();
-            auto index_pos = findLoopVariableIndex(forOp.getInductionVar());
-            AffineMap map = applyOp.getAffineMap();
-            for (unsigned i = 0; i < map.getNumResults(); ++i) {
-              AffineExpr expr = map.getResult(i);
-
-              if (!isLoopRegistered(map, forOp)) {
-                AffineExpr newExpr = updateAffineExprWithBounds(expr, index_pos, upperBound, paddedUpperBound, context);
-                map = updateAffineMapWithNewExpr(map, newExpr, i, context, forOp);
-                applyOp.setMap(map);
-                if (strideVal) {
-                  /* Update stride info by finding updated coeff */
-                  auto oldCoeff = findCoefficient(expr);
-                  auto newCoeff = findCoefficient(newExpr);
-                  for (size_t i=0; i<oldCoeff.size();i++) {
-                    if (oldCoeff[i] == strideVal.value())
-                      mm_stride = newCoeff[i];
-                  }
-                }
-              }
-              //llvm::errs() << "old_expr: " << expr << " new_expr: " << new_expr << "\n";
-              //llvm::errs() << "index_pos: " << index_pos << " upper: " << upperBound << " paddUpper: " << paddedUpperBound << "\n";
-            }
-            if (strideVal && mm_stride != -1) {
-              //llvm::errs() << "update mm_stride: " << strideVal.value() << "  " << mm_stride <<"\n";
-              OpBuilder builder(strideVal);
-              Value newStrideConstant = builder.create<arith::ConstantIndexOp>(strideVal.getLoc(), mm_stride);
-              dmaOp.setOperand(dmaOp.getNumOperands() - 2, newStrideConstant);
-              if (strideVal.use_empty()) {
-                strideVal.erase();
-              }
-            }
+        //llvm::errs() << "old_expr: " << expr << " new_expr: " << newExpr << " " << mm_stride << " " << strideVal.value() <<"\n";
+        //llvm::errs() << "index_pos: " << index_pos << " upper: " << upperBound << " paddUpper: " << paddedUpperBound << "\n";
+        if (strideVal && mm_stride != -1) {
+          OpBuilder builder(strideVal);
+          Value newStrideConstant = builder.create<arith::ConstantIndexOp>(strideVal.getLoc(), mm_stride);
+          dmaOp.setOperand(dmaOp.getNumOperands() - 2, newStrideConstant);
+          if (strideVal.use_empty()) {
+            strideVal.erase();
           }
         }
       }
@@ -302,52 +306,19 @@ void TestLoopPadding::modifyMemrefWithPadding(Value memref, int64_t upperBound, 
   memref.setType(paddedMemrefType);
 }
 
-SmallVector<int64_t, 4> TestLoopPadding::findCoefficient(AffineExpr expr) {
-  SmallVector<int64_t, 4> coefficients;
+SmallVector<std::pair<int64_t, unsigned>, 4> TestLoopPadding::collectCoefficientsFromAffineExpr(mlir::AffineExpr expr) {
+  SmallVector<std::pair<int64_t, unsigned>, 4> coefficients;
 
-  // Lambda to traverse affine expressions
-  std::function<void(AffineExpr)> extractCoefficients = [&](AffineExpr expr) {
-    if (auto binExpr = llvm::dyn_cast<AffineBinaryOpExpr>(expr)) {
-      // For mul expressions, extract the coefficient
-      if (binExpr.getKind() == AffineExprKind::Mul) {
-        if (auto constExpr = llvm::dyn_cast<AffineConstantExpr>(binExpr.getRHS())) {
-          coefficients.push_back(constExpr.getValue());
-          return;
-        } else if (auto constExpr = llvm::dyn_cast<AffineConstantExpr>(binExpr.getLHS())) {
-          coefficients.push_back(constExpr.getValue());
-          return;
-        }
-      }
-      extractCoefficients(binExpr.getLHS());
-      extractCoefficients(binExpr.getRHS());
-    } else if (auto constExpr = llvm::dyn_cast<AffineConstantExpr>(expr)) {
-      coefficients.push_back(constExpr.getValue());
-    } else {
-      // If it's not a binary operation, assume the coefficient is 1 (like d1)
-      coefficients.push_back(1);
-    }
-  };
-  return coefficients;
-}
-
-mlir::AffineExpr TestLoopPadding::updateAffineExprWithBounds(mlir::AffineExpr expr,
-                                            int updated_position_index,
-                                            int64_t upperBound,
-                                            int64_t paddedUpperBound,
-                                            mlir::MLIRContext *context) {
-  // Step 1: Traverse the AffineExpr to collect coefficients for each index
-  SmallVector<std::tuple<int64_t, unsigned>, 4> coefficients;
   std::function<void(mlir::AffineExpr)> collectCoefficients = [&](mlir::AffineExpr expr) {
     if (auto binExpr = llvm::dyn_cast<mlir::AffineBinaryOpExpr>(expr)) {
       if (binExpr.getKind() == mlir::AffineExprKind::Mul) {
-        // Mul: Assume binExpr is in the form of constant * dimension (e.g., 47 * index0)
         if (auto lhs = llvm::dyn_cast<mlir::AffineConstantExpr>(binExpr.getLHS())) {
           if (auto rhs = llvm::dyn_cast<mlir::AffineDimExpr>(binExpr.getRHS())) {
-            coefficients.push_back(std::make_tuple(lhs.getValue(), rhs.getPosition()));
+            coefficients.push_back(std::make_pair(lhs.getValue(), rhs.getPosition()));
           }
         } else if (auto rhs = llvm::dyn_cast<mlir::AffineConstantExpr>(binExpr.getRHS())) {
           if (auto lhs = llvm::dyn_cast<mlir::AffineDimExpr>(binExpr.getLHS())) {
-            coefficients.push_back(std::make_tuple(rhs.getValue(), lhs.getPosition()));
+            coefficients.push_back(std::make_pair(rhs.getValue(), lhs.getPosition()));
           }
         }
       } else if (binExpr.getKind() == mlir::AffineExprKind::Add) {
@@ -356,27 +327,34 @@ mlir::AffineExpr TestLoopPadding::updateAffineExprWithBounds(mlir::AffineExpr ex
         collectCoefficients(binExpr.getRHS());
       }
     } else if (auto dimExpr = llvm::dyn_cast<mlir::AffineDimExpr>(expr)) {
-      coefficients.push_back(std::make_tuple(1, dimExpr.getPosition()));
+      coefficients.push_back(std::make_pair(1, dimExpr.getPosition()));
     }
   };
 
-  // Collect coefficients from the AffineExpr
   collectCoefficients(expr);
-
-  // Prev coeff
   //llvm::dbgs() << "Coeff: ";
   //for (auto coeff : coefficients) {
   //  llvm::dbgs() << std::get<0>(coeff) << ", ";
   //}
   //llvm::dbgs() << "\n";
+  return coefficients;
+}
+
+mlir::AffineExpr TestLoopPadding::updateAffineExprWithBounds(mlir::AffineExpr expr,
+                                            int updated_position_index,
+                                            int64_t upperBound,
+                                            int64_t paddedUpperBound,
+                                            mlir::MLIRContext *context) {
+  // Collect coefficients from the AffineExpr
+  auto coefficients = collectCoefficientsFromAffineExpr(expr);
 
   // Step 2: Modify the coefficients based on the updated_position_index
   SmallVector<std::tuple<int64_t, unsigned>, 4> modifiedCoefficients;
   int64_t targetCoefficient = std::get<0>(coefficients[coefficients.size() -1 - updated_position_index]);
 
   for (int i = 0; i < static_cast<int>(coefficients.size()); ++i) {
-    int64_t coeff = std::get<0>(coefficients[i]);
-    unsigned position = std::get<1>(coefficients[i]);
+    int64_t coeff = coefficients[i].first;
+    unsigned position = coefficients[i].second;
     if (coeff > targetCoefficient)
       coeff = (coeff / upperBound) * paddedUpperBound;
     modifiedCoefficients.push_back(std::make_tuple(coeff, position));
@@ -443,15 +421,7 @@ AffineMap TestLoopPadding::updateAffineMapWithNewExpr(AffineMap& oldMap,
     llvm::errs() << "Failed to update AffineMap\n";
     return oldMap;
   }
-  paddedMapInfo[oldMap.getAsOpaquePointer()].insert(forOp.getAsOpaquePointer());
   AffineMap newMap = AffineMap::get(oldMap.getNumDims(), oldMap.getNumSymbols(), exprs, context);
-  paddedMapInfo[newMap.getAsOpaquePointer()] = paddedMapInfo[oldMap.getAsOpaquePointer()];
-  auto it = paddedMapInfo.find(oldMap.getAsOpaquePointer());
-  if (it != paddedMapInfo.end()) {
-    paddedMapInfo.erase(it);  // Erase the map and its associated loops
-  } else {
-    llvm::errs() << "AffineMap not found in the map.\n";
-  }
   return newMap;
 }
 
@@ -460,23 +430,9 @@ void TestLoopPadding::analysisDMAStartNode(
 {
   // Analysis pre-padding info
   function.walk([&](mlir::affine::AffineDmaStartOp dmaOp) {
-    auto dst_space = dmaOp.getDstMemorySpace();
-    auto src_space = dmaOp.getSrcMemorySpace();
-    bool is_write;
-    ValueRange dram_indices;
-    Value dram_memref;
-    if (dst_space == 0 && src_space == 1) {
-      dram_memref = dmaOp.getDstMemRef();
-      dram_indices = dmaOp.getDstIndices();
-      is_write = true;
-    } else if (dst_space == 1 && src_space == 0) {
-      dram_memref = dmaOp.getSrcMemRef();
-      dram_indices = dmaOp.getSrcIndices();
-      is_write = false;
-    } else {
-      dmaOp.emitError() << "Unexpected memory space, src: " << src_space << "des: " << dst_space << "\n";
-      return;
-    }
+    auto result = getDramMemRefAndIndices(dmaOp);
+    Value dram_memref = result.first;
+    bool is_write = result.second;
 
     for (const auto &existingInfo : targetBuffer) {
       if (existingInfo.getMemRef() == dram_memref) {
