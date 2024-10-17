@@ -256,13 +256,11 @@ void TestLoopPadding::runOnOperation() {
           for (unsigned i = 0; i < map.getNumDims(); i++) {
             Value loopVar = applyOp.getOperand(i);
             if (loopVar == forOp.getInductionVar()) {
-              llvm::errs() << "Affected!\n";
               isAffected = true;
               break;
             }
           }
         } else if (operand.getAsOpaquePointer() == forOp.getInductionVar().getAsOpaquePointer()){
-          llvm::errs() << "Affected!\n";
           isAffected = true;
           break;
         }
