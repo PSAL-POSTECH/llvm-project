@@ -248,6 +248,27 @@ void TestLoopPadding::runOnOperation() {
         dmaOp.dump();
         return;
       }
+      // this axis affecti this dmaOp
+      bool isAffected = false;
+      for (auto operand : dmaOp.getOperands()) {
+        if (auto applyOp = operand.getDefiningOp<mlir::affine::AffineApplyOp>()) {
+          AffineMap map = applyOp.getAffineMap();
+          for (unsigned i = 0; i < map.getNumDims(); i++) {
+            Value loopVar = applyOp.getOperand(i);
+            if (loopVar == forOp.getInductionVar()) {
+              llvm::errs() << "Affected!\n";
+              isAffected = true;
+              break;
+            }
+          }
+        } else if (operand.getAsOpaquePointer() == forOp.getInductionVar().getAsOpaquePointer()){
+          llvm::errs() << "Affected!\n";
+          isAffected = true;
+          break;
+        }
+      }
+      if (!isAffected)
+        return;
 
       // Padding memref and update the function signature to match the new padded memref types
       modifyMemrefWithPadding(dram_memref, upperBound, paddedUpperBound);
@@ -578,20 +599,14 @@ void TestLoopPadding::createWrapperFunction(mlir::ModuleOp module, mlir::OpBuild
   llvm::SmallVector<mlir::Value, 4> callArgs;
   callArgs.resize(kernelFunc.getNumArguments());
   builder.setInsertionPointToEnd(entryBlock);
-  for (size_t i = 0; i < prePaddingInfo.size() && i < postPaddingInfo.size(); ++i) {
-    auto& postInfo = postPaddingInfo[i];
-
-    mlir::Value postMemRef = postInfo.getMemRef();
-    auto blockArg = mlir::cast<mlir::BlockArgument>(postMemRef);
-    unsigned int argIdx = blockArg.getArgNumber();
-
+  for (size_t i=0; i<padded_buffer.size(); i++) {
     if (!padded_buffer[i].has_value()) {
-      callArgs[argIdx] = wrapperFunc.getArgument(argIdx);
+      callArgs[i] = wrapperFunc.getArgument(i);
     } else {
-      mlir::memref::GlobalOp globalMemRefOp = padded_buffer[argIdx].value();
+      mlir::memref::GlobalOp globalMemRefOp = padded_buffer[i].value();
       auto loadedMemRef = builder.create<mlir::memref::GetGlobalOp>(
             builder.getUnknownLoc(), globalMemRefOp.getType(), globalMemRefOp.getName());
-      callArgs[argIdx] = loadedMemRef;
+      callArgs[i] = loadedMemRef;
     }
   }
 
