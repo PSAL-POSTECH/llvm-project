@@ -30,7 +30,6 @@ if(MLIR_INCLUDE_TESTS)
     MLIRTestMathToVCIX
     MLIRTestMemRefToGemmini
     MLIRTestPyTorchSimToVCIX
-    MLIRTestPyTorchSimLinalgTiling
     MLIRMemRefTestPasses
     MLIRMeshTest
     MLIRNVGPUTestPasses
