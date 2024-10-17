@@ -29,6 +29,7 @@ namespace mlir {
 namespace {
 
 int SYSTOLIC_SIZE = 128;
+int VLEN = 128;
 static std::pair<unsigned, VectorType> legalizeVectorType(const Type &type) {
   VectorType vt = cast<VectorType>(type);
   // To simplify test pass, avoid multi-dimensional vectors.
@@ -56,6 +57,12 @@ static std::pair<unsigned, VectorType> legalizeVectorType(const Type &type) {
   return {n, VectorType::get({eltCount >> (n - 1)}, eltTy, {true})};
 }
 
+void createUnrolledIndices(OpBuilder *builder, int64_t lower, int64_t upper, int64_t step, SmallVector<Value> &indices) {
+  for (int64_t i = lower; i < upper; i += step) {
+    Value indexValue = builder->create<arith::ConstantIndexOp>(builder->getUnknownLoc(), i);
+    indices.push_back(indexValue);
+  }
+}
 
 struct MatmulOpLowering : public OpRewritePattern<linalg::MatmulOp> {
   using OpRewritePattern::OpRewritePattern;
@@ -69,7 +76,7 @@ struct MatmulOpLowering : public OpRewritePattern<linalg::MatmulOp> {
 
     Location loc = op.getLoc();
 
-    int vlen = 128; //FIXME
+    int vlen = VLEN; //FIXME
     int elen = 0;
     int nr_element;
 
@@ -137,6 +144,10 @@ struct MatmulOpLowering : public OpRewritePattern<linalg::MatmulOp> {
     auto vectorType = VectorType::get({nr_element}, elementTypeA);
     Value n_idx;
     Value k_idx;
+    SmallVector<Value> indices;
+
+    // Create indexes
+    createUnrolledIndices(&rewriter, 0, M, nr_element, indices);
 
     if (N != SYSTOLIC_SIZE) {
       auto inner_loop = rewriter.create<affine::AffineForOp>(loc, 0, N/SYSTOLIC_SIZE, 1);
@@ -157,45 +168,33 @@ struct MatmulOpLowering : public OpRewritePattern<linalg::MatmulOp> {
       // K Loop
       {
         // For vpush weight loop part
-        auto vwpush_loop = rewriter.create<affine::AffineForOp>(loc, 0, SYSTOLIC_SIZE, nr_element);
-        rewriter.setInsertionPointToStart(vwpush_loop.getBody());
-        {
-          Value vwpush_idx = vwpush_loop.getInductionVar();
+        for (int i=0; i<SYSTOLIC_SIZE; i+=nr_element) {
           auto weight_vector = rewriter.create<vector::TransferReadOp>(
-                                              vwpush_loop.getLoc(), vectorType, B, ValueRange{k_idx, vwpush_idx});
+                                               loc, vectorType, B, ValueRange{k_idx, indices[i/nr_element]});
           rewriter.create<vcix::BinaryNoDestImmOp>(weight_vector.getLoc(), vwpush_opcode, weight_vector, zeroImmAttr, zeroImmAttr, rvl);
         }
-        rewriter.setInsertionPointAfter(vwpush_loop);
 
-        auto middle_loop = rewriter.create<affine::AffineForOp>(vwpush_loop.getLoc(), 0, M, nr_element);
-        rewriter.setInsertionPointToStart(middle_loop.getBody());
-        {
-          auto vipush_idx = middle_loop.getInductionVar();
-          // For vpush input loop part
+        for (int i=0; i<M; i+=nr_element) {
           auto input_vector = rewriter.create<vector::TransferReadOp>(
-                                              middle_loop.getLoc(), vectorType, A, ValueRange{vipush_idx, k_idx});
+                                               loc, vectorType, A, ValueRange{indices[i/nr_element], k_idx});
           rewriter.create<vcix::BinaryNoDestImmOp>(input_vector.getLoc(), vipush_opcode, input_vector, zeroImmAttr, zeroImmAttr, rvl);
         }
-        rewriter.setInsertionPointAfter(middle_loop);
 
         // Compute instruction
-        rewriter.create<vcix::UnaryNoDestImmOp>(middle_loop.getLoc(), compute_opcode, zeroImmAttr, compute_cycle, zeroImmAttr, sew, lmul, rvl);
+        rewriter.create<vcix::UnaryNoDestImmOp>(loc, compute_opcode, zeroImmAttr, compute_cycle, zeroImmAttr, sew, lmul, rvl);
         // For vpop loop part
-        auto vpop_loop = rewriter.create<affine::AffineForOp>(middle_loop.getLoc(), 0, M, nr_element);
-        rewriter.setInsertionPointToStart(vpop_loop.getBody());
-        {
-          auto vpop_idx = vpop_loop.getInductionVar();
-          Value vpop = rewriter.create<vcix::UnaryImmOp>(vpop_loop.getLoc(), vectorType, vpop_opcode, zeroImmAttr, zeroImmAttr, rvl);
+        for (int i=0; i<M; i+=nr_element) {
+          Value vpop = rewriter.create<vcix::UnaryImmOp>(loc, vectorType, vpop_opcode, zeroImmAttr, zeroImmAttr, rvl);
           auto prev_output = rewriter.create<vector::TransferReadOp>(
-                                              vpop.getLoc(), vectorType, C, ValueRange{vpop_idx, n_idx});
+                                              vpop.getLoc(), vectorType, C, ValueRange{indices[i/nr_element], n_idx});
           VectorType vt = cast<VectorType>(prev_output.getType());
           if (vt.getElementType().isInteger()) {
             auto output_vector = rewriter.create<arith::AddIOp>(loc, prev_output, vpop);
-            rewriter.create<vector::TransferWriteOp>(output_vector.getLoc(), output_vector, C, ValueRange{vpop_idx, n_idx});
+            rewriter.create<vector::TransferWriteOp>(output_vector.getLoc(), output_vector, C, ValueRange{indices[i/nr_element], n_idx});
           }
           else if (vt.getElementType().isIntOrFloat())  {
             auto output_vector = rewriter.create<arith::AddFOp>(loc, prev_output, vpop);
-            rewriter.create<vector::TransferWriteOp>(output_vector.getLoc(), output_vector, C, ValueRange{vpop_idx, n_idx});
+            rewriter.create<vector::TransferWriteOp>(output_vector.getLoc(), output_vector, C, ValueRange{indices[i/nr_element], n_idx});
           } else {
             op.emitError () << "expected same type";
             return failure();
@@ -273,8 +272,8 @@ struct TestPyTorchSimToVCIX
     MLIRContext *ctx = &getContext();
     RewritePatternSet patterns(ctx);
 
-    // Set global var from option
     SYSTOLIC_SIZE = systolicSize;
+    VLEN = vlen;
     patterns.add<MatmulOpLowering, MathExpToVCIX>(ctx);
     LLVMConversionTarget target(getContext());
     (void)applyPatternsAndFoldGreedily(getOperation(), std::move(patterns));
@@ -285,6 +284,9 @@ private:
   Option<int> systolicSize{*this, "systolic-array-size",
                           llvm::cl::desc("Systolic array size (KxK)"),
                           llvm::cl::init(128)};
+  Option<int> vlen{*this, "vlen",
+                   llvm::cl::desc("vector register size(bit)"),
+                   llvm::cl::init(128)};
 };
 
 } // namespace
