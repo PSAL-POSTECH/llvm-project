@@ -170,13 +170,13 @@ struct MatmulOpLowering : public OpRewritePattern<linalg::MatmulOp> {
         // For vpush weight loop part
         for (int i=0; i<SYSTOLIC_SIZE; i+=nr_element) {
           auto weight_vector = rewriter.create<vector::TransferReadOp>(
-                                               loc, vectorType, B, ValueRange{k_idx, indices[i/nr_element]});
+                                               loc, vectorType, B, ValueRange{k_idx, indices[i/nr_element]}); //ValueRange{k_idx, indices[i/nr_element]});
           rewriter.create<vcix::BinaryNoDestImmOp>(weight_vector.getLoc(), vwpush_opcode, weight_vector, zeroImmAttr, zeroImmAttr, rvl);
         }
 
         for (int i=0; i<M; i+=nr_element) {
           auto input_vector = rewriter.create<vector::TransferReadOp>(
-                                               loc, vectorType, A, ValueRange{indices[i/nr_element], k_idx});
+                                               loc, vectorType, A, ValueRange{k_idx, indices[i/nr_element]}); //ValueRange{indices[i/nr_element], k_idx});
           rewriter.create<vcix::BinaryNoDestImmOp>(input_vector.getLoc(), vipush_opcode, input_vector, zeroImmAttr, zeroImmAttr, rvl);
         }
 
@@ -186,15 +186,15 @@ struct MatmulOpLowering : public OpRewritePattern<linalg::MatmulOp> {
         for (int i=0; i<M; i+=nr_element) {
           Value vpop = rewriter.create<vcix::UnaryImmOp>(loc, vectorType, vpop_opcode, zeroImmAttr, zeroImmAttr, rvl);
           auto prev_output = rewriter.create<vector::TransferReadOp>(
-                                              vpop.getLoc(), vectorType, C, ValueRange{indices[i/nr_element], n_idx});
+                                              vpop.getLoc(), vectorType, C, ValueRange{n_idx, indices[i/nr_element]});//ValueRange{indices[i/nr_element], n_idx});
           VectorType vt = cast<VectorType>(prev_output.getType());
           if (vt.getElementType().isInteger()) {
             auto output_vector = rewriter.create<arith::AddIOp>(loc, prev_output, vpop);
-            rewriter.create<vector::TransferWriteOp>(output_vector.getLoc(), output_vector, C, ValueRange{indices[i/nr_element], n_idx});
+            rewriter.create<vector::TransferWriteOp>(output_vector.getLoc(), output_vector, C, ValueRange{n_idx, indices[i/nr_element]});//ValueRange{indices[i/nr_element], n_idx});
           }
           else if (vt.getElementType().isIntOrFloat())  {
             auto output_vector = rewriter.create<arith::AddFOp>(loc, prev_output, vpop);
-            rewriter.create<vector::TransferWriteOp>(output_vector.getLoc(), output_vector, C, ValueRange{indices[i/nr_element], n_idx});
+            rewriter.create<vector::TransferWriteOp>(output_vector.getLoc(), output_vector, C, ValueRange{n_idx, indices[i/nr_element]});//ValueRange{indices[i/nr_element], n_idx});
           } else {
             op.emitError () << "expected same type";
             return failure();
