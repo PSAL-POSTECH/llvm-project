@@ -150,7 +150,7 @@ struct MatmulOpLowering : public OpRewritePattern<linalg::MatmulOp> {
     SmallVector<Value> indices;
 
     // Create indexes
-    createUnrolledIndices(&rewriter, 0, M*max_nk, nr_element, indices);
+    createUnrolledIndices(&rewriter, 0, M*(max_nk+1), nr_element, indices);
 
     if (N != SYSTOLIC_SIZE) {
       auto inner_loop = rewriter.create<affine::AffineForOp>(loc, 0, N/SYSTOLIC_SIZE, 1);
@@ -170,37 +170,48 @@ struct MatmulOpLowering : public OpRewritePattern<linalg::MatmulOp> {
       }
       // K Loop
       {
+        Value N_offset = rewriter.create<arith::MulIOp>(loc, indices[(N/nr_element)], k_idx);
+        Value K_offset = rewriter.create<arith::MulIOp>(loc, indices[(K/nr_element)], k_idx);
+        Value M_K_offset = rewriter.create<arith::MulIOp>(loc, indices[(M/nr_element)], k_idx);
+        Value M_N_offset = rewriter.create<arith::MulIOp>(loc, indices[(M/nr_element)], n_idx);
         // For vpush weight loop part
-        for (int i=0; i<SYSTOLIC_SIZE; i+=nr_element) {
-          Value nr_k_plus_k_idx = rewriter.create<arith::AddIOp>(loc, indices[(i/nr_element)*nr_k], k_idx);
+        for (int i=0; i<SYSTOLIC_SIZE; i+=nr_element) { // KxN
+          Value spad_idx = rewriter.create<arith::AddIOp>(loc, N_offset, indices[i/nr_element]);
+          Value new_k_idx = rewriter.create<arith::DivUIOp>(loc, spad_idx, indices[N/nr_element]);
+          Value new_m_idx = rewriter.create<arith::RemUIOp>(loc, spad_idx, indices[N/nr_element]);
           auto weight_vector = rewriter.create<vector::TransferReadOp>(
-                                               loc, vectorType, B, ValueRange{c0, nr_k_plus_k_idx}); //ValueRange{k_idx, indices[i/nr_element]});
+                                               loc, vectorType, B, ValueRange{new_k_idx, new_m_idx});
           rewriter.create<vcix::BinaryNoDestImmOp>(weight_vector.getLoc(), vwpush_opcode, weight_vector, zeroImmAttr, zeroImmAttr, rvl);
         }
 
-        for (int i=0; i<M; i+=nr_element) {
-          Value nr_k_plus_k_idx = rewriter.create<arith::AddIOp>(loc, indices[(i/nr_element)*nr_k], k_idx);
+        // For vpush input loop part
+        for (int i=0; i<M; i+=nr_element) { // MxK
+          Value spad_idx = rewriter.create<arith::AddIOp>(loc, M_K_offset, indices[i/nr_element]);
+          Value new_m_idx = rewriter.create<arith::DivUIOp>(loc, spad_idx, indices[K/nr_element]);
+          Value new_k_idx = rewriter.create<arith::RemUIOp>(loc, spad_idx, indices[K/nr_element]);
           auto input_vector = rewriter.create<vector::TransferReadOp>(
-                                               loc, vectorType, A, ValueRange{c0, nr_k_plus_k_idx}); //ValueRange{indices[i/nr_element], k_idx});
+                                               loc, vectorType, A, ValueRange{new_m_idx, new_k_idx});
           rewriter.create<vcix::BinaryNoDestImmOp>(input_vector.getLoc(), vipush_opcode, input_vector, zeroImmAttr, zeroImmAttr, rvl);
         }
 
         // Compute instruction
         rewriter.create<vcix::UnaryNoDestImmOp>(loc, compute_opcode, zeroImmAttr, compute_cycle, zeroImmAttr, sew, lmul, rvl);
         // For vpop loop part
-        for (int i=0; i<M; i+=nr_element) {
-          Value nr_n_plus_n_idx = rewriter.create<arith::AddIOp>(loc, indices[(i/nr_element)*nr_n], n_idx);
+        for (int i=0; i<M; i+=nr_element) { // MxN
+          Value spad_idx = rewriter.create<arith::AddIOp>(loc, M_N_offset, indices[i/nr_element]);
+          Value new_m_idx = rewriter.create<arith::DivUIOp>(loc, spad_idx, indices[N/nr_element]);
+          Value new_n_idx = rewriter.create<arith::RemUIOp>(loc, spad_idx, indices[N/nr_element]);
           Value vpop = rewriter.create<vcix::UnaryImmOp>(loc, vectorType, vpop_opcode, zeroImmAttr, zeroImmAttr, rvl);
           auto prev_output = rewriter.create<vector::TransferReadOp>(
-                                              vpop.getLoc(), vectorType, C, ValueRange{c0, nr_n_plus_n_idx});//ValueRange{indices[i/nr_element], n_idx});
+                                              vpop.getLoc(), vectorType, C, ValueRange{new_m_idx, new_n_idx});
           VectorType vt = cast<VectorType>(prev_output.getType());
           if (vt.getElementType().isInteger()) {
             auto output_vector = rewriter.create<arith::AddIOp>(loc, prev_output, vpop);
-            rewriter.create<vector::TransferWriteOp>(output_vector.getLoc(), output_vector, C, ValueRange{c0, nr_n_plus_n_idx});//ValueRange{indices[i/nr_element], n_idx});
+            rewriter.create<vector::TransferWriteOp>(output_vector.getLoc(), output_vector, C, ValueRange{new_m_idx, new_n_idx});
           }
           else if (vt.getElementType().isIntOrFloat())  {
             auto output_vector = rewriter.create<arith::AddFOp>(loc, prev_output, vpop);
-            rewriter.create<vector::TransferWriteOp>(output_vector.getLoc(), output_vector, C, ValueRange{c0, nr_n_plus_n_idx});//ValueRange{indices[i/nr_element], n_idx});
+            rewriter.create<vector::TransferWriteOp>(output_vector.getLoc(), output_vector, C, ValueRange{new_m_idx, new_n_idx});
           } else {
             op.emitError () << "expected same type";
             return failure();
