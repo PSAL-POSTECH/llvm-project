@@ -30,6 +30,25 @@ namespace {
 
 int SYSTOLIC_SIZE = 128;
 int VLEN = 128;
+
+std::pair<Value, bool> getDramMemRef(mlir::affine::AffineDmaStartOp dmaOp) {
+  auto dst_space = dmaOp.getDstMemorySpace();
+  auto src_space = dmaOp.getSrcMemorySpace();
+  Value dram_memref;
+  bool is_write;
+
+  if (dst_space == 0 && src_space == 1) {
+    dram_memref = dmaOp.getDstMemRef();
+    is_write = true;
+  } else if (dst_space == 1 && src_space == 0) {
+    dram_memref = dmaOp.getSrcMemRef();
+    is_write = false;
+  } else {
+    dmaOp.emitError() << "Unexpected memory space, src: " << src_space << ", dst: " << dst_space << "\n";
+  }
+  return std::make_pair(dram_memref, is_write);
+}
+
 static std::pair<unsigned, VectorType> legalizeVectorType(const Type &type) {
   VectorType vt = cast<VectorType>(type);
   // To simplify test pass, avoid multi-dimensional vectors.
@@ -193,6 +212,38 @@ struct MatmulOpLowering : public OpRewritePattern<linalg::MatmulOp> {
     } else {
       m_idx = c0;
     }
+
+    // Put dma wait operation
+    mlir::Value ADmaTag;
+    mlir::Value BDmaTag;
+    mlir::Value index = rewriter.create<mlir::arith::ConstantIndexOp>(loc, 0);
+    mlir::Value numElements = rewriter.create<mlir::arith::ConstantIndexOp>(loc, 1);
+    op->getParentRegion()->walk([&](mlir::Operation *nestedOp) {
+      nestedOp->dump();
+      if (auto dmaStartOp = llvm::dyn_cast<affine::AffineDmaStartOp>(nestedOp)) { // Replace DMAStartOp with actual `dma_start` op type
+        auto result = getDramMemRef(dmaStartOp);
+        if (result.second)
+          return WalkResult::advance();
+        auto blockArg = mlir::cast<mlir::BlockArgument>(result.first);
+        if (!blockArg)
+          return WalkResult::advance();
+        if (blockArg.getArgNumber() == 0) {
+          ADmaTag = dmaStartOp.getTagMemRef(); // Assuming `getTag()` retrieves the `tag` from `dma_start`.
+        } else if (blockArg.getArgNumber() == 1) {
+          BDmaTag = dmaStartOp.getTagMemRef(); // Assuming `getTag()` retrieves the `tag` from `dma_start`.
+        }
+      }
+      return WalkResult::advance();
+    });
+
+    if (!ADmaTag || !BDmaTag) {
+      op.emitError () << "Failed to locate dma_start for retrieving tag.";
+      return failure();
+    }
+    auto ATagMap = rewriter.getMultiDimIdentityMap(llvm::dyn_cast<MemRefType>(ADmaTag.getType()).getRank());
+    auto BTagMap = rewriter.getMultiDimIdentityMap(llvm::dyn_cast<MemRefType>(BDmaTag.getType()).getRank());
+    rewriter.create<affine::AffineDmaWaitOp>(loc, ADmaTag, ATagMap, ValueRange{c0, n_idx, k_idx}, numElements);
+    rewriter.create<affine::AffineDmaWaitOp>(loc, BDmaTag, BTagMap, ValueRange{m_idx, c0, k_idx}, numElements);
 
     // For vpush weight loop part
     for (int i=0; i<SYSTOLIC_SIZE; i+=nr_element) { // KxN
