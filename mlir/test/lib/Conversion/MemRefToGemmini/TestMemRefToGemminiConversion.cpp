@@ -58,6 +58,22 @@ char* getAsmString(unsigned func7) {
 }
 
 /// Lowering memref.dma_start operation to Gemmini instructions with LLVM Asm.
+struct DmaWaitOpLowering : public ConvertOpToLLVMPattern<memref::DmaWaitOp> {
+  int vectorlaneStride;
+  DmaWaitOpLowering(LLVMTypeConverter &typeConverter, int vectorlaneStride = 4)
+      : ConvertOpToLLVMPattern<memref::DmaWaitOp>(typeConverter) {
+    this->vectorlaneStride = vectorlaneStride;
+  }
+
+  LogicalResult
+  matchAndRewrite(memref::DmaWaitOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    rewriter.eraseOp(op);
+    return success();
+  }
+};
+
+/// Lowering memref.dma_start operation to Gemmini instructions with LLVM Asm.
 struct DmaStartOpLowering : public ConvertOpToLLVMPattern<memref::DmaStartOp> {
   // using ConvertOpToLLVMPattern<memref::DmaStartOp>::ConvertOpToLLVMPattern;
   int vectorlaneStride;
@@ -235,6 +251,7 @@ struct TestMemRefToGemmini
     RewritePatternSet patterns(ctx);
     // vectorlaneStride is passed to the pattern as an argument
     patterns.add<DmaStartOpLowering>(typeConverter);
+    patterns.add<DmaWaitOpLowering>(typeConverter);
     LLVMConversionTarget target(getContext());
     if (failed(applyPartialConversion(getOperation(), target,
                                       std::move(patterns))))
