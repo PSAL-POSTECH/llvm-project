@@ -219,7 +219,6 @@ struct MatmulOpLowering : public OpRewritePattern<linalg::MatmulOp> {
     mlir::Value index = rewriter.create<mlir::arith::ConstantIndexOp>(loc, 0);
     mlir::Value numElements = rewriter.create<mlir::arith::ConstantIndexOp>(loc, 1);
     op->getParentRegion()->walk([&](mlir::Operation *nestedOp) {
-      nestedOp->dump();
       if (auto dmaStartOp = llvm::dyn_cast<affine::AffineDmaStartOp>(nestedOp)) { // Replace DMAStartOp with actual `dma_start` op type
         auto result = getDramMemRef(dmaStartOp);
         if (result.second)
