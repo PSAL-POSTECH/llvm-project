@@ -31,7 +31,7 @@
 namespace mlir {
 namespace {
 
-int VECTOR_LANE_STRIDE = 4;
+int64_t VECTOR_LANE = 128;
 
 int extractConstantIntValue(Value val) {
   int val_int;
@@ -116,8 +116,9 @@ struct DmaStartOpLowering : public ConvertOpToLLVMPattern<memref::DmaStartOp> {
     Value main_mem_stride = op.getStride();
     int64_t main_mem_stride_val = extractConstantIntValue(main_mem_stride) * elen / 8;
     Value num_elt_per_stride = op.getNumElementsPerStride();
-    int chunk_size = extractConstantIntValue(num_elt_per_stride);
+    uint64_t chunk_size = extractConstantIntValue(num_elt_per_stride);
     bool is_col_major = chunk_size % 2;
+    int is_fine_grained = (chunk_size >> 31) & 1;
     chunk_size = chunk_size / 2 * elen / 8;
     Value numElements = op.getNumElements();
     int dmaType = extractConstantIntValue(numElements);
@@ -145,12 +146,26 @@ struct DmaStartOpLowering : public ConvertOpToLLVMPattern<memref::DmaStartOp> {
       col_factor = 8 / elen;
       elen = 8;
     }
+    uint64_t tile_row;
+    uint64_t tile_col;
     if (tile_shape.size() == 2) {
-      rows = rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(tile_shape[0]));
-      cols = rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(tile_shape[1] / col_factor));
+      if (is_fine_grained) {
+        tile_row = std::min(tile_shape[0], VECTOR_LANE);
+        tile_col = std::min((tile_shape[1] / col_factor), VECTOR_LANE);
+      } else {
+        tile_row = tile_shape[0];
+        tile_col = tile_shape[1];
+      }
+      rows = rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(tile_row));
+      cols = rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(tile_col));
     } else if (tile_shape.size() == 1) {
+      if (is_fine_grained) {
+        tile_col = std::min((tile_shape[0] / col_factor), VECTOR_LANE);
+      } else {
+        tile_col = tile_shape[0];
+      }
       rows = rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(1));
-      cols = rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(tile_shape[0] / col_factor));
+      cols = rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(tile_col));
     }
 
     char* asmStr = getAsmString(func7);
@@ -229,9 +244,9 @@ struct TestMemRefToGemmini
            "with custom gemmini instructions.";
   }
 
-  Option<int> vectorlaneStride{
-      *this, "vectorlane-stride",
-      llvm::cl::desc("Vector lane stride for the custom gemmini instructions"),
+  Option<int> vectorlane{
+      *this, "vectorlane",
+      llvm::cl::desc("Vector lane size for gemmini instructions"),
       llvm::cl::init(4)};
 
   TestMemRefToGemmini() = default;
@@ -247,9 +262,9 @@ struct TestMemRefToGemmini
     LowerToLLVMOptions options(ctx);
     LLVMTypeConverter typeConverter(ctx, options);
 
-    VECTOR_LANE_STRIDE = vectorlaneStride;
+    VECTOR_LANE = vectorlane;
     RewritePatternSet patterns(ctx);
-    // vectorlaneStride is passed to the pattern as an argument
+    // vectorlane is passed to the pattern as an argument
     patterns.add<DmaStartOpLowering>(typeConverter);
     patterns.add<DmaWaitOpLowering>(typeConverter);
     LLVMConversionTarget target(getContext());
