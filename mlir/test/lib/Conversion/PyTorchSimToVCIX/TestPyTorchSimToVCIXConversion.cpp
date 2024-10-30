@@ -57,13 +57,6 @@ static std::pair<unsigned, VectorType> legalizeVectorType(const Type &type) {
   return {n, VectorType::get({eltCount >> (n - 1)}, eltTy, {true})};
 }
 
-void createUnrolledIndices(OpBuilder *builder, int64_t lower, int64_t upper, int64_t step, SmallVector<Value> &indices) {
-  for (int64_t i = lower; i < upper; i += step) {
-    Value indexValue = builder->create<arith::ConstantIndexOp>(builder->getUnknownLoc(), i);
-    indices.push_back(indexValue);
-  }
-}
-
 struct MatmulOpLowering : public OpRewritePattern<linalg::MatmulOp> {
   using OpRewritePattern::OpRewritePattern;
 
@@ -142,9 +135,6 @@ struct MatmulOpLowering : public OpRewritePattern<linalg::MatmulOp> {
 
     // Constants
     Value c0 = rewriter.create<arith::ConstantOp>(loc, rewriter.getIndexAttr(0));
-    int nr_k = (K/SYSTOLIC_SIZE);
-    int nr_n = (N/SYSTOLIC_SIZE);
-    int max_nk = std::max(nr_k, nr_n);
     Value rvl = rewriter.create<arith::ConstantOp>(loc, rewriter.getI64IntegerAttr(nr_element));
     Attribute compute_cycle = rewriter.getI64IntegerAttr(4); // FIXME: 5 bits bound & hardcoded
 
@@ -159,75 +149,97 @@ struct MatmulOpLowering : public OpRewritePattern<linalg::MatmulOp> {
     auto vectorType = VectorType::get({nr_element}, elementTypeA);
     Value n_idx;
     Value k_idx;
-    SmallVector<Value> indices;
+    Value m_idx;
 
-    // Create indexes
-    createUnrolledIndices(&rewriter, 0, M*(max_nk+1), nr_element, indices);
+    Value M_val = rewriter.create<mlir::arith::ConstantIndexOp>(rewriter.getUnknownLoc(), M);
+    Value K_val = rewriter.create<mlir::arith::ConstantIndexOp>(rewriter.getUnknownLoc(), K);
+    Value SYSTOLIC_SIZE_val = rewriter.create<mlir::arith::ConstantIndexOp>(rewriter.getUnknownLoc(), SYSTOLIC_SIZE);
+
+    auto spadIdxMap = AffineMap::get(
+      /*dimCount=*/3, /*symbolCount=*/2,
+      rewriter.getAffineDimExpr(0) * rewriter.getAffineSymbolExpr(0) +
+      rewriter.getAffineDimExpr(1) * rewriter.getAffineSymbolExpr(1) +
+      rewriter.getAffineDimExpr(2), // This represents `n_idx * K + k_idx * SYSTOLIC_SIZE + i`
+      rewriter.getContext()
+    );
+    auto spadIdxMapAttr = mlir::AffineMapAttr::get(spadIdxMap);
 
     if (N != SYSTOLIC_SIZE) {
+      // N Loop
       auto inner_loop = rewriter.create<affine::AffineForOp>(loc, 0, N/SYSTOLIC_SIZE, 1);
+      inner_loop->setAttr("inner_loop", rewriter.getBoolAttr(true));
       rewriter.setInsertionPointToStart(inner_loop.getBody());
       n_idx = inner_loop.getInductionVar();
     } else {
       n_idx = c0;
     }
-    // N Loop
-    {
-      if (K != SYSTOLIC_SIZE) {
-        auto inner_loop = rewriter.create<affine::AffineForOp>(loc, 0, K/SYSTOLIC_SIZE, 1);
-        rewriter.setInsertionPointToStart(inner_loop.getBody());
-        k_idx = inner_loop.getInductionVar();
-      } else {
-        k_idx = c0;
-      }
+
+    if (K != SYSTOLIC_SIZE) {
       // K Loop
-      {
-        Value M_N_offset = rewriter.create<arith::MulIOp>(loc, indices[(M/nr_element)], n_idx);
-        Value K_M_offset = rewriter.create<arith::MulIOp>(loc, indices[(M/nr_element)], k_idx);
-        Value K_S_offset = rewriter.create<arith::MulIOp>(loc, indices[(SYSTOLIC_SIZE/nr_element)], k_idx);
-        Value N_K_offset = rewriter.create<arith::MulIOp>(loc, indices[(K/nr_element)], n_idx);
-        // For vpush weight loop part
-        for (int i=0; i<SYSTOLIC_SIZE; i+=nr_element) { // KxN
-          Value spad_idx = rewriter.create<arith::AddIOp>(loc, K_S_offset, indices[i/nr_element]);
-          Value spad_idx2 = rewriter.create<arith::AddIOp>(loc, spad_idx, N_K_offset);
-          auto weight_vector = rewriter.create<vector::TransferReadOp>(
-                                               loc, vectorType, B1D, ValueRange{spad_idx2});
-          rewriter.create<vcix::BinaryNoDestImmOp>(weight_vector.getLoc(), vwpush_opcode, weight_vector, zeroImmAttr, zeroImmAttr, rvl);
-        }
+      auto inner_loop = rewriter.create<affine::AffineForOp>(loc, 0, K/SYSTOLIC_SIZE, 1);
+      inner_loop->setAttr("inner_loop", rewriter.getBoolAttr(true));
+      rewriter.setInsertionPointToStart(inner_loop.getBody());
+      k_idx = inner_loop.getInductionVar();
+    } else {
+      k_idx = c0;
+    }
 
-        // For vpush input loop part
-        for (int i=0; i<M; i+=nr_element) { // MxK
-          Value spad_idx = rewriter.create<arith::AddIOp>(loc, K_M_offset, indices[i/nr_element]);
-          auto input_vector = rewriter.create<vector::TransferReadOp>(
-                                               loc, vectorType, A1D, ValueRange{spad_idx});
-          rewriter.create<vcix::BinaryNoDestImmOp>(input_vector.getLoc(), vipush_opcode, input_vector, zeroImmAttr, zeroImmAttr, rvl);
-        }
+    if (M != SYSTOLIC_SIZE) {
+      // M Loop
+      auto inner_loop = rewriter.create<affine::AffineForOp>(loc, 0, M/SYSTOLIC_SIZE, 1);
+      inner_loop->setAttr("inner_loop", rewriter.getBoolAttr(true));
+      rewriter.setInsertionPointToStart(inner_loop.getBody());
+      m_idx = inner_loop.getInductionVar();
+    } else {
+      m_idx = c0;
+    }
 
-        // Compute instruction
-        rewriter.create<vcix::UnaryNoDestImmOp>(loc, compute_opcode, zeroImmAttr, compute_cycle, zeroImmAttr, sew, lmul, rvl);
-        // For vpop loop part
-        for (int i=0; i<M; i+=nr_element) { // MxN
-          Value spad_idx = rewriter.create<arith::AddIOp>(loc, M_N_offset, indices[i/nr_element]);
-          Value vpop = rewriter.create<vcix::UnaryImmOp>(loc, vectorType, vpop_opcode, zeroImmAttr, zeroImmAttr, rvl);
-          auto prev_output = rewriter.create<vector::TransferReadOp>(
-                                              vpop.getLoc(), vectorType, C1D, ValueRange{spad_idx});
-          VectorType vt = cast<VectorType>(prev_output.getType());
-          if (vt.getElementType().isInteger()) {
-            auto output_vector = rewriter.create<arith::AddIOp>(loc, prev_output, vpop);
-            rewriter.create<vector::TransferWriteOp>(output_vector.getLoc(), output_vector, C1D, ValueRange{spad_idx});
-          }
-          else if (vt.getElementType().isIntOrFloat())  {
-            auto output_vector = rewriter.create<arith::AddFOp>(loc, prev_output, vpop);
-            rewriter.create<vector::TransferWriteOp>(output_vector.getLoc(), output_vector, C1D, ValueRange{spad_idx});
-          } else {
-            op.emitError () << "expected same type";
-            return failure();
-          }
-        }
-        rewriter.eraseOp(op);
-        return success();
+    // For vpush weight loop part
+    for (int i=0; i<SYSTOLIC_SIZE; i+=nr_element) { // KxN
+      Value i_val = rewriter.create<mlir::arith::ConstantIndexOp>(rewriter.getUnknownLoc(), i);
+      Value spad_idx = rewriter.create<affine::AffineApplyOp>(loc, spadIdxMapAttr,
+                                                      ValueRange{n_idx, k_idx, i_val, K_val, SYSTOLIC_SIZE_val});
+      auto weight_vector = rewriter.create<vector::TransferReadOp>(
+                                          loc, vectorType, B1D, ValueRange{spad_idx});
+      rewriter.create<vcix::BinaryNoDestImmOp>(weight_vector.getLoc(), vwpush_opcode, weight_vector, zeroImmAttr, zeroImmAttr, rvl);
+    }
+
+    // For vpush input loop part
+    for (int i=0; i<SYSTOLIC_SIZE; i+=nr_element) { // MxK
+      Value i_val = rewriter.create<mlir::arith::ConstantIndexOp>(rewriter.getUnknownLoc(), i);
+      Value spad_idx = rewriter.create<affine::AffineApplyOp>(loc, spadIdxMapAttr,
+                                                      ValueRange{k_idx, m_idx, i_val, M_val, SYSTOLIC_SIZE_val});
+      auto input_vector = rewriter.create<vector::TransferReadOp>(
+                                          loc, vectorType, A1D, ValueRange{spad_idx});
+      rewriter.create<vcix::BinaryNoDestImmOp>(input_vector.getLoc(), vipush_opcode, input_vector, zeroImmAttr, zeroImmAttr, rvl);
+    }
+
+    // Compute instruction
+    rewriter.create<vcix::UnaryNoDestImmOp>(loc, compute_opcode, zeroImmAttr, compute_cycle, zeroImmAttr, sew, lmul, rvl);
+    // For vpop loop part
+    for (int i=0; i<SYSTOLIC_SIZE; i+=nr_element) { // MxN
+      Value i_val = rewriter.create<mlir::arith::ConstantIndexOp>(rewriter.getUnknownLoc(), i);
+      Value spad_idx = rewriter.create<affine::AffineApplyOp>(loc, spadIdxMapAttr,
+                                                      ValueRange{n_idx, m_idx, i_val, M_val, SYSTOLIC_SIZE_val});
+      Value vpop = rewriter.create<vcix::UnaryImmOp>(loc, vectorType, vpop_opcode, zeroImmAttr, zeroImmAttr, rvl);
+      auto prev_output = rewriter.create<vector::TransferReadOp>(
+                                          vpop.getLoc(), vectorType, C1D, ValueRange{spad_idx});
+      VectorType vt = cast<VectorType>(prev_output.getType());
+      if (vt.getElementType().isInteger()) {
+        auto output_vector = rewriter.create<arith::AddIOp>(loc, prev_output, vpop);
+        rewriter.create<vector::TransferWriteOp>(output_vector.getLoc(), output_vector, C1D, ValueRange{spad_idx});
+      }
+      else if (vt.getElementType().isIntOrFloat())  {
+        auto output_vector = rewriter.create<arith::AddFOp>(loc, prev_output, vpop);
+        rewriter.create<vector::TransferWriteOp>(output_vector.getLoc(), output_vector, C1D, ValueRange{spad_idx});
+      } else {
+        op.emitError () << "expected same type";
+        return failure();
       }
     }
+
+    rewriter.eraseOp(op);
+    return success();
   }
 };
 
