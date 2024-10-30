@@ -241,8 +241,8 @@ struct MatmulOpLowering : public OpRewritePattern<linalg::MatmulOp> {
     }
     auto ATagMap = rewriter.getMultiDimIdentityMap(llvm::dyn_cast<MemRefType>(ADmaTag.getType()).getRank());
     auto BTagMap = rewriter.getMultiDimIdentityMap(llvm::dyn_cast<MemRefType>(BDmaTag.getType()).getRank());
-    rewriter.create<affine::AffineDmaWaitOp>(loc, ADmaTag, ATagMap, ValueRange{c0, n_idx, k_idx}, numElements);
-    rewriter.create<affine::AffineDmaWaitOp>(loc, BDmaTag, BTagMap, ValueRange{m_idx, c0, k_idx}, numElements);
+    rewriter.create<affine::AffineDmaWaitOp>(loc, ADmaTag, ATagMap, ValueRange{c0, k_idx, m_idx}, numElements);
+    rewriter.create<affine::AffineDmaWaitOp>(loc, BDmaTag, BTagMap, ValueRange{n_idx, k_idx, c0}, numElements);
 
     // For vpush weight loop part
     for (int i=0; i<SYSTOLIC_SIZE; i+=nr_element) { // KxN
