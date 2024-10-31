@@ -63,6 +63,7 @@ public:
       ComputeNodeKind,
       LoopNodeKind,
       DMANodeKind,
+      DMAWaitNodeKind,
   };
   template<typename T>
   void printLoopInfo(std::string& name, const std::vector<T>& vec) const {
@@ -176,16 +177,17 @@ class TOGDMANode : public TOGNode {
   std::vector<int> tile_stride;
   int element_size;
   bool is_write;
+  std::vector<std::string> tag_idx_list;
   std::vector<std::string> loop_idx_list;
 
  public:
   TOGDMANode(const std::string &name, const std::string &addr,
              const std::vector<int> &strides, const std::vector<int> &sizes,
              const std::vector<int> &tileStrides, int elemSize, bool is_write,
-             std::vector<std::string> &idx_list)
+             std::vector<std::string> &tag_idx_list, std::vector<std::string> &idx_list)
       : TOGNode(name), base_addr(addr), stride_list(strides), tile_size(sizes),
         tile_stride(tileStrides), element_size(elemSize), is_write(is_write),
-        loop_idx_list(idx_list) {}
+        tag_idx_list(tag_idx_list), loop_idx_list(idx_list) {}
   std::string getBaseAddr() const { return base_addr; }
   std::vector<int> getStrideList() const { return stride_list; }
   std::vector<int> getTileSize() const { return tile_size; }
@@ -215,6 +217,10 @@ class TOGDMANode : public TOGNode {
     printLoopInfo(name, this->tile_size);
     std::cout << ",\n";
 
+    name = std::string("tag_idx_list");
+    printLoopStringInfo(name, this->tag_idx_list);
+    std::cout << ",\n";
+
     name = std::string("loop_idx_list");
     printLoopStringInfo(name, this->loop_idx_list);
     std::cout << ",\n";
@@ -227,6 +233,27 @@ class TOGDMANode : public TOGNode {
   static bool classof(const TOGNode *node) {
     // Check if the node kind matches this class's kind
     return node->getKind() == DMANodeKind;
+  }
+};
+
+class TOGDMAWaitNode : public TOGNode {
+  std::vector<std::string> tag_idx_list;
+
+ public:
+  TOGDMAWaitNode(const std::string &name, std::vector<std::string> &idx_list)
+      : TOGNode(name), tag_idx_list(idx_list) {}
+  void display() const override {
+    TOGNode::display();
+    std::cout << ",\n";
+
+    auto name = std::string("tag_idx_list");
+    printLoopStringInfo(name, this->tag_idx_list);
+    std::cout << "}\n";
+  }
+  NodeKind getKind() const override { return DMAWaitNodeKind; }
+  static bool classof(const TOGNode *node) {
+    // Check if the node kind matches this class's kind
+    return node->getKind() == DMAWaitNodeKind;
   }
 };
 

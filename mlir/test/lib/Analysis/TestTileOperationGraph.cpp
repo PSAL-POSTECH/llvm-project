@@ -15,7 +15,10 @@
 #include "mlir/Analysis/TileOperationGraph.h"
 #include "mlir/Interfaces/FunctionInterfaces.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
+#include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/Dialect/Vector/IR/VectorOps.h"
+#include "mlir/Dialect/LLVMIR/VCIXDialect.h"
 #include "mlir/Pass/Pass.h"
 
 using namespace mlir;
@@ -36,7 +39,8 @@ struct TestTileOperationGraph
   void printOperation(Operation &op, TOGNode *node);
   void getAffineForBounds(affine::AffineForOp &op, int &start, int &end, int &step);
   void getDependentDialects(DialectRegistry &registry) const override {
-    registry.insert<arith::ArithDialect, func::FuncDialect,
+    registry.insert<arith::ArithDialect, func::FuncDialect, math::MathDialect,
+                    vcix::VCIXDialect, vector::VectorDialect, affine::AffineDialect,
                     memref::MemRefDialect, LLVM::LLVMDialect>();
   }
   int nr_loop = 0;
@@ -81,11 +85,20 @@ void TestTileOperationGraph::printOperation(Operation &op, TOGNode *node) {
     auto for_op = dyn_cast<affine::AffineForOp>(op);
     auto outerLoopAttr = for_op->getAttrOfType<BoolAttr>("outer_loop");
     auto outerLoopAttr2 = for_op->getAttrOfType<BoolAttr>("accumulation_loop");
-    if ((outerLoopAttr && outerLoopAttr.getValue()) || (outerLoopAttr2 && outerLoopAttr2.getValue())) {
+    auto innerLoopAttr = for_op->getAttrOfType<BoolAttr>("inner_loop");
+    std::string loop_type;
+    if (outerLoopAttr && outerLoopAttr.getValue()) {
+      loop_type = "outer_loop";
+    } else if (outerLoopAttr2 && outerLoopAttr2.getValue()) {
+      loop_type = "accumulation_loop";
+    } else if (innerLoopAttr && innerLoopAttr.getValue()) {
+      loop_type = "inner_loop";
+    }
+
+    if ((outerLoopAttr && outerLoopAttr.getValue()) || (outerLoopAttr2 && outerLoopAttr2.getValue()) || (innerLoopAttr && innerLoopAttr.getValue())) {
       // Get loop information and create loop node
       int start, end, step;
       getAffineForBounds(for_op, start, end, step);
-      std::string loop_type = outerLoopAttr? "outer_loop" : "accumulation_loop";
       std::string loop_index = "loop_arg" + std::to_string(nr_loop++);
       mlir::Value iter_var = for_op.getInductionVar();
       loop_var_name[iter_var.getAsOpaquePointer()] = loop_index;
@@ -116,6 +129,7 @@ void TestTileOperationGraph::printOperation(Operation &op, TOGNode *node) {
     MemRefType tile_memref_type;
     ValueRange dram_indices;
     Value dram_memref;
+    std::vector<std::string> tag_index_list;
     std::vector<std::string> loop_index_list;
 
     if (dst_space == 0 && src_space == 1) {
@@ -175,13 +189,50 @@ void TestTileOperationGraph::printOperation(Operation &op, TOGNode *node) {
       return;
     }
 
+    auto tag_range = dma_op.getTagIndices();
+    auto tag = dma_op.getTagMap();
+    tag.dump();
+    for (auto tag_idx : tag_range) {
+      if (auto blockArg = dyn_cast<BlockArgument>(tag_idx)) {
+        tag_index_list.push_back(loop_var_name.at(blockArg.getAsOpaquePointer()));
+      } else if (auto constOp = tag_idx.getDefiningOp<arith::ConstantIndexOp>()) {
+        auto constant = static_cast<int>(constOp.value());
+        tag_index_list.push_back(std::to_string(constant));
+      } else {
+        tag_idx.dump();
+      }
+    }
+
     TOGDMANode *tog_dma = new TOGDMANode("DMANode", address, stride_list, tile_size, tile_stride,
-                                         element_size, is_write, loop_index_list);
+                                         element_size, is_write, tag_index_list, loop_index_list);
     tog_dma->setOp(&op);
     /* Link child and parent */
     node->addChild(tog_dma);
     tog_dma->addParent(node);
     return; // Compute node
+  }
+
+  if (name == "affine.dma_wait") {
+    std::string address = "arg";
+    std::vector<std::string> tag_index_list;
+    auto dma_op = dyn_cast<affine::AffineDmaWaitOp>(op);
+    auto tag_range = dma_op.getTagIndices();
+
+    for (auto tag_idx : tag_range) {
+      if (auto blockArg = dyn_cast<BlockArgument>(tag_idx)) {
+        tag_index_list.push_back(loop_var_name.at(blockArg.getAsOpaquePointer()));
+      } else if (auto constOp = tag_idx.getDefiningOp<arith::ConstantIndexOp>()) {
+        auto constant = static_cast<int>(constOp.value());
+        tag_index_list.push_back(std::to_string(constant));
+      }
+    }
+
+    TOGDMAWaitNode *tog_dma_wait = new TOGDMAWaitNode("DMAWaitNode", tag_index_list);
+    tog_dma_wait->setOp(&op);
+    /* Link child and parent */
+    node->addChild(tog_dma_wait);
+    tog_dma_wait->addParent(node);
+    return;
   }
 
   /* Skip root */
