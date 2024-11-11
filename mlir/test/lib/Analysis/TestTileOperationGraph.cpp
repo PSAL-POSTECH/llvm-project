@@ -23,6 +23,19 @@
 
 using namespace mlir;
 
+int64_t VECTOR_LANE = 128;
+
+int extractConstantIntValue(Value val) {
+  int val_int;
+  if (auto constOp = val.getDefiningOp<arith::ConstantOp>()) {
+    Attribute constantAttr = constOp.getValue();
+    if (auto intAttr = mlir::dyn_cast<IntegerAttr>(constantAttr)) {
+      val_int = intAttr.getInt();
+    }
+  }
+  return val_int;
+}
+
 namespace {
 /// A testing pass that applies the TileOperationGraph analysis on a region and prints
 /// the information it collected to llvm::errs().
@@ -34,6 +47,14 @@ struct TestTileOperationGraph
   StringRef getDescription() const final {
     return "Test tile operation graph analysis";
   }
+
+  Option<int> vectorlane{
+      *this, "vectorlane",
+      llvm::cl::desc("Vector lane size"),
+      llvm::cl::init(4)};
+
+  TestTileOperationGraph() = default;
+  TestTileOperationGraph(const TestTileOperationGraph&) {}
 
   void runOnOperation() override;
   void printOperation(Operation &op, TOGNode *node);
@@ -131,6 +152,9 @@ void TestTileOperationGraph::printOperation(Operation &op, TOGNode *node) {
     Value dram_memref;
     std::vector<std::string> tag_index_list;
     std::vector<std::string> loop_index_list;
+    Value num_elt_per_stride = dma_op.getNumElementsPerStride();
+    uint64_t chunk_size = extractConstantIntValue(num_elt_per_stride);
+    int is_fine_grained = (chunk_size >> 31) & 1;
 
     if (dst_space == 0 && src_space == 1) {
       is_write = true;
@@ -166,8 +190,8 @@ void TestTileOperationGraph::printOperation(Operation &op, TOGNode *node) {
     } else {
       op.emitError() << "Unexpected dram buffer argument: " << dram_memref << "\n";
     }
-
-    auto tile_shape = tile_memref_type.getShape();
+    std::vector<int64_t> vec = {VECTOR_LANE, VECTOR_LANE};
+    auto tile_shape = is_fine_grained? llvm::ArrayRef<int64_t> (vec) : tile_memref_type.getShape();
     int mm_stride = dma_op.getStride().getDefiningOp<arith::ConstantIndexOp>().value();
 
     /* Fill stride info */
@@ -190,7 +214,6 @@ void TestTileOperationGraph::printOperation(Operation &op, TOGNode *node) {
     }
 
     auto tag_range = dma_op.getTagIndices();
-    auto tag = dma_op.getTagMap();
     for (auto tag_idx : tag_range) {
       if (auto blockArg = dyn_cast<BlockArgument>(tag_idx)) {
         tag_index_list.push_back(loop_var_name.at(blockArg.getAsOpaquePointer()));
@@ -213,6 +236,7 @@ void TestTileOperationGraph::printOperation(Operation &op, TOGNode *node) {
     std::string address = "arg";
     std::vector<std::string> tag_index_list;
     auto dma_op = dyn_cast<affine::AffineDmaWaitOp>(op);
+    auto tag_memref = dma_op.getTagMemRef();
     auto tag_range = dma_op.getTagIndices();
 
     for (auto tag_idx : tag_range) {
@@ -224,7 +248,28 @@ void TestTileOperationGraph::printOperation(Operation &op, TOGNode *node) {
       }
     }
 
-    TOGDMAWaitNode *tog_dma_wait = new TOGDMAWaitNode("DMAWaitNode", tag_index_list);
+    for (auto &use : tag_memref.getUses()) {
+      mlir::Operation *userOp = use.getOwner(); // Get the operation that uses tagMemRef
+      if (auto dmaStartOp = llvm::dyn_cast<affine::AffineDmaStartOp>(userOp)) {
+        Value dram_memref;
+        std::vector<std::string> loop_index_list;
+        auto dst_space = dmaStartOp.getDstMemorySpace();
+        auto src_space = dmaStartOp.getSrcMemorySpace();
+
+        if (dst_space == 0 && src_space == 1) {
+          dram_memref = dmaStartOp.getDstMemRef();
+        } else if (dst_space == 1 && src_space == 0) {
+          dram_memref = dmaStartOp.getSrcMemRef();
+        }
+        if (auto blockArg = dyn_cast<BlockArgument>(dram_memref)) {
+          // Get the index of the block argument
+          unsigned index = blockArg.getArgNumber();
+          address = address + std::to_string(index);
+        }
+      }
+    }
+
+    TOGDMAWaitNode *tog_dma_wait = new TOGDMAWaitNode("DMAWaitNode", tag_index_list, address);
     tog_dma_wait->setOp(&op);
     /* Link child and parent */
     node->addChild(tog_dma_wait);
@@ -265,6 +310,7 @@ void TestTileOperationGraph::runOnOperation() {
   MLIRContext *context = &getContext();
   OpBuilder builder(context);
   llvm::StringRef funcName = op.getSymName();
+  VECTOR_LANE = vectorlane;
   if (funcName.compare(llvm::StringRef("kernel"))) {
     return;
   }

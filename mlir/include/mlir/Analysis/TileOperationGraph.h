@@ -238,13 +238,14 @@ class TOGDMANode : public TOGNode {
 
 class TOGDMAWaitNode : public TOGNode {
   std::vector<std::string> tag_idx_list;
-
+  std::string base_addr;
  public:
-  TOGDMAWaitNode(const std::string &name, std::vector<std::string> &idx_list)
-      : TOGNode(name), tag_idx_list(idx_list) {}
+  TOGDMAWaitNode(const std::string &name, std::vector<std::string> &idx_list, std::string &addr)
+      : TOGNode(name), tag_idx_list(idx_list), base_addr(addr) {}
   void display() const override {
     TOGNode::display();
     std::cout << ",\n";
+    std::cout << "\t\"base_address\": \"" << base_addr << "\",\n";
 
     auto name = std::string("tag_idx_list");
     printLoopStringInfo(name, this->tag_idx_list);
