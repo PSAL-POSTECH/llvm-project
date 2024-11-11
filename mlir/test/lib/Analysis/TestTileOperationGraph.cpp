@@ -191,15 +191,12 @@ void TestTileOperationGraph::printOperation(Operation &op, TOGNode *node) {
 
     auto tag_range = dma_op.getTagIndices();
     auto tag = dma_op.getTagMap();
-    tag.dump();
     for (auto tag_idx : tag_range) {
       if (auto blockArg = dyn_cast<BlockArgument>(tag_idx)) {
         tag_index_list.push_back(loop_var_name.at(blockArg.getAsOpaquePointer()));
       } else if (auto constOp = tag_idx.getDefiningOp<arith::ConstantIndexOp>()) {
         auto constant = static_cast<int>(constOp.value());
         tag_index_list.push_back(std::to_string(constant));
-      } else {
-        tag_idx.dump();
       }
     }
 
