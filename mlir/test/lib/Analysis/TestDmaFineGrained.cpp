@@ -63,11 +63,11 @@ void DmaFineGrained::runOnOperation() {
   func.walk([&](affine::AffineForOp loop) {
     // Adjust the step size based on loop depth
     if (loopDepth == 0) {
-      loop.setStep(tileSizeM); // First loop (e.g., %t_m) uses tileSizeM
+      loop.setStep(tileSizeK); // First loop (e.g., %t_m) uses tileSizeM
     } else if (loopDepth == 1) {
       loop.setStep(tileSizeN); // Second loop (e.g., %t_n) uses tileSizeN
     } else if (loopDepth == 2) {
-      loop.setStep(tileSizeK); // Third loop (e.g., %t_k) uses tileSizeK
+      loop.setStep(tileSizeM); // Third loop (e.g., %t_k) uses tileSizeK
     }
     loopDepth++;
   });
@@ -114,19 +114,17 @@ void DmaFineGrained::runOnOperation() {
   new_idx = builder.create<affine::AffineApplyOp>(loc, sum_map, ValueRange{new_idx, srcIndices[0]});
   // update srcIndices
   src_indices.push_back(new_idx);
-  // affine_map<(d0, d1) -> (d0 * (tileSizeM / vectorlane) + d1)>
-  auto spad_map = AffineMap::get(2, 0, builder.getAffineDimExpr(0) * (tileSizeK / vectorlane) + builder.getAffineDimExpr(1));
-  auto dst_idx = builder.create<affine::AffineApplyOp>(loc, spad_map, ValueRange{k, i});
+  // affine_map<(d0, d1) -> (d0 * (tileSizeK / vectorlane) + d1)>
+  auto spad_map_m = AffineMap::get(2, 0, builder.getAffineDimExpr(0) * (tileSizeM / vectorlane) + builder.getAffineDimExpr(1));
+  auto dst_idx = builder.create<affine::AffineApplyOp>(loc, spad_map_m, ValueRange{k, i});
   dst_indices.push_back(zeroIndex);
   dst_indices.push_back(dst_idx);
-
   tag_indices.push_back(zeroIndex);
   tag_indices.push_back(k);
   tag_indices.push_back(i);
   auto src_map = builder.getMultiDimIdentityMap(src_indices.size());
   auto dst_map = builder.getMultiDimIdentityMap(dst_indices.size());
   auto tag_map = builder.getMultiDimIdentityMap(tag_indices.size());
-
 
   // Insert the first dma_start operation
   builder.create<affine::AffineDmaStartOp>(
@@ -146,8 +144,8 @@ void DmaFineGrained::runOnOperation() {
   new_idx = builder.create<affine::AffineApplyOp>(loc, sum_map, ValueRange{new_idx, srcIndices[0]});
   src_indices.clear();
   src_indices.push_back(new_idx);
-  spad_map = AffineMap::get(2, 0, builder.getAffineDimExpr(0) * (tileSizeN / vectorlane) + builder.getAffineDimExpr(1));
-  dst_idx = builder.create<affine::AffineApplyOp>(loc, spad_map, ValueRange{j, k});
+  auto spad_map_k = AffineMap::get(2, 0, builder.getAffineDimExpr(0) * (tileSizeK / vectorlane) + builder.getAffineDimExpr(1));
+  dst_idx = builder.create<affine::AffineApplyOp>(loc, spad_map_k, ValueRange{j, k});
   dst_indices.clear();
   dst_indices.push_back(zeroIndex);
   dst_indices.push_back(dst_idx);
@@ -194,7 +192,7 @@ void DmaFineGrained::runOnOperation() {
   new_idx = builder.create<affine::AffineApplyOp>(loc, sum_map, ValueRange{new_idx, dstIndices[0]});
   dst_indices.clear();
   dst_indices.push_back(new_idx);
-  auto src_idx = builder.create<affine::AffineApplyOp>(loc, spad_map, ValueRange{j, i});
+  auto src_idx = builder.create<affine::AffineApplyOp>(loc, spad_map_m, ValueRange{j, i});
   src_indices.clear();
   src_indices.push_back(zeroIndex);
   src_indices.push_back(src_idx);
