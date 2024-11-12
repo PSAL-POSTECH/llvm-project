@@ -13,6 +13,17 @@
 
 using namespace mlir;
 
+int getConstantIntValue(Value val) {
+  int val_int;
+  if (auto constOp = val.getDefiningOp<arith::ConstantOp>()) {
+    Attribute constantAttr = constOp.getValue();
+    if (auto intAttr = mlir::dyn_cast<IntegerAttr>(constantAttr)) {
+      val_int = intAttr.getInt();
+    }
+  }
+  return val_int;
+}
+
 namespace {
 
 struct DmaFineGrained : public PassWrapper<DmaFineGrained, OperationPass<func::FuncOp>> {
@@ -77,8 +88,12 @@ void DmaFineGrained::runOnOperation() {
   func.walk([&](affine::AffineDmaStartOp dmaStartOp) {
     dmaOps.push_back(dmaStartOp);
   });
-  affine::AffineDmaStartOp dma1 = dmaOps[0];
-  affine::AffineDmaStartOp dma2 = dmaOps[1];
+  bool is_bias = false;
+  if (dmaOps.size() == 4) {
+    is_bias = true;
+  }
+  affine::AffineDmaStartOp dma1 = dmaOps[0 + is_bias];
+  affine::AffineDmaStartOp dma2 = dmaOps[1 + is_bias];
   // Get insertion point for new loops
   auto loc = dma1.getLoc();
   builder.setInsertionPoint(dma1);
@@ -115,7 +130,16 @@ void DmaFineGrained::runOnOperation() {
   // update srcIndices
   src_indices.push_back(new_idx);
   // affine_map<(d0, d1) -> (d0 * (tileSizeK / vectorlane) + d1)>
-  auto spad_map_m = AffineMap::get(2, 0, builder.getAffineDimExpr(0) * (tileSizeM / vectorlane) + builder.getAffineDimExpr(1));
+  auto num_elt_per_stride = dma1.getNumElementsPerStride();
+  uint64_t chunk_size = getConstantIntValue(num_elt_per_stride);
+  bool is_transposed = chunk_size > 2; // use x_chunk
+  auto new_set = builder.create<arith::ConstantIndexOp>(loc, 2147483648 + chunk_size);
+  AffineMap spad_map_m;
+  if (is_transposed) {
+    spad_map_m = AffineMap::get(2, 0, builder.getAffineDimExpr(0) * (tileSizeK / vectorlane) + builder.getAffineDimExpr(1));
+  } else {
+    spad_map_m = AffineMap::get(2, 0, builder.getAffineDimExpr(0) * (tileSizeM / vectorlane) + builder.getAffineDimExpr(1));
+  }
   auto dst_idx = builder.create<affine::AffineApplyOp>(loc, spad_map_m, ValueRange{k, i});
   dst_indices.push_back(zeroIndex);
   dst_indices.push_back(dst_idx);
@@ -131,7 +155,7 @@ void DmaFineGrained::runOnOperation() {
       loc, dma1.getSrcMemRef(), src_map, src_indices,
       dma1.getDstMemRef(), dst_map, dst_indices,
       XtagMemRef, tag_map, tag_indices,
-      dma1.getNumElements(), dma1.getStride(), c_set);
+      dma1.getNumElements(), dma1.getStride(), new_set);
 
   // Insert the second dma_start operation
   srcIndices = dma2.getSrcIndices();
@@ -144,7 +168,18 @@ void DmaFineGrained::runOnOperation() {
   new_idx = builder.create<affine::AffineApplyOp>(loc, sum_map, ValueRange{new_idx, srcIndices[0]});
   src_indices.clear();
   src_indices.push_back(new_idx);
-  auto spad_map_k = AffineMap::get(2, 0, builder.getAffineDimExpr(0) * (tileSizeK / vectorlane) + builder.getAffineDimExpr(1));
+
+  num_elt_per_stride = dma2.getNumElementsPerStride();
+  chunk_size = getConstantIntValue(num_elt_per_stride);
+  new_set = builder.create<arith::ConstantIndexOp>(loc, 2147483648 + chunk_size);
+  is_transposed = chunk_size > 2; // use w_chunk
+  AffineMap spad_map_k;
+  if (is_transposed) {
+    spad_map_k = AffineMap::get(2, 0, builder.getAffineDimExpr(0) * (tileSizeN / vectorlane) + builder.getAffineDimExpr(1));
+  } else {
+    spad_map_k = AffineMap::get(2, 0, builder.getAffineDimExpr(0) * (tileSizeK / vectorlane) + builder.getAffineDimExpr(1));
+  }
+
   dst_idx = builder.create<affine::AffineApplyOp>(loc, spad_map_k, ValueRange{j, k});
   dst_indices.clear();
   dst_indices.push_back(zeroIndex);
@@ -160,7 +195,7 @@ void DmaFineGrained::runOnOperation() {
       loc, dma2.getSrcMemRef(), src_map, src_indices,
       dma2.getDstMemRef(), dst_map, dst_indices,
       WtagMemRef, tag_map, tag_indices,
-      dma2.getNumElements(), dma2.getStride(), c_set);
+      dma2.getNumElements(), dma2.getStride(), new_set);
 
   // Erase the original dma_start operations
   dma1.erase();
@@ -168,7 +203,7 @@ void DmaFineGrained::runOnOperation() {
 
   //MVOUT
   // reset builder location
-  affine::AffineDmaStartOp dma3 = dmaOps[2];
+  affine::AffineDmaStartOp dma3 = dmaOps[2 + is_bias];
   loc = dma3.getLoc();
   builder.setInsertionPoint(dma3);
   // Create two nested affine.for loops
