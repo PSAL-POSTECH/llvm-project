@@ -399,7 +399,10 @@ mlir::AffineExpr TestLoopPadding::updateAffineExprWithBounds(mlir::AffineExpr ex
 
   // Step 2: Modify the coefficients based on the updated_position_index
   SmallVector<std::tuple<int64_t, unsigned>, 4> modifiedCoefficients;
-  int64_t targetCoefficient = std::get<0>(coefficients[coefficients.size() -1 - updated_position_index]);
+  int64_t targetCoefficient = std::get<0>(coefficients[updated_position_index]);
+  //llvm::dbgs() << "Target coeff: " << targetCoefficient << "\n";
+  //llvm::dbgs() << "Upper: " << upperBound << "\n";
+  //llvm::dbgs() << "PaddedUpper: " << paddedUpperBound << "\n";
 
   for (int i = 0; i < static_cast<int>(coefficients.size()); ++i) {
     int64_t coeff = coefficients[i].first;
