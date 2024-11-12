@@ -130,6 +130,7 @@ struct TestLoopPadding
   int64_t roundUpToMultiple(int64_t value, int64_t multiple);
   void modifyMemrefWithPadding(Value memref, int64_t stepSize, int64_t paddedUpperBound);
   int findLoopVariableIndex(mlir::Value loopVar);
+  int getArgumentIndex(mlir::affine::AffineApplyOp applyOp, mlir::Value targetValue);
   SmallVector<std::pair<int64_t, unsigned>, 4> collectCoefficientsFromAffineExpr(mlir::AffineExpr expr);
   mlir::AffineExpr updateAffineExprWithBounds(mlir::AffineExpr expr,
                                             int updated_position_index,
@@ -240,7 +241,7 @@ void TestLoopPadding::runOnOperation() {
       Value dram_memref = result.first;
       Value fifthOperand = dmaOp.getStride();
       auto strideVal = fifthOperand.getDefiningOp<arith::ConstantIndexOp>();
-      auto index_pos = findLoopVariableIndex(forOp.getInductionVar());
+      //auto index_pos = findLoopVariableIndex(forOp.getInductionVar());
       int64_t mm_stride = -1;
 
       if (!strideVal) {
@@ -278,7 +279,7 @@ void TestLoopPadding::runOnOperation() {
         if (!applyOp) {
           continue;
         }
-
+        auto index_pos = getArgumentIndex(applyOp, forOp.getInductionVar());
         AffineMap map = applyOp.getAffineMap();
         AffineExpr expr = dmaOpExpr[dmaOp.getAsOpaquePointer()];
         /* Need to check which is updated */
@@ -452,6 +453,16 @@ int TestLoopPadding::findLoopVariableIndex(mlir::Value loopVar) {
       return index;
     }
     ++index;
+  }
+  return -1;
+}
+
+int TestLoopPadding::getArgumentIndex(mlir::affine::AffineApplyOp applyOp, mlir::Value targetValue) {
+  mlir::OperandRange operands = applyOp.getOperands();
+  for (size_t i = 0; i < operands.size(); ++i) {
+    if (operands[i] == targetValue) {
+      return i;
+    }
   }
   return -1;
 }

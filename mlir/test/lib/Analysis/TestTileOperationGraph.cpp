@@ -219,6 +219,9 @@ void TestTileOperationGraph::printOperation(Operation &op, TOGNode *node) {
         tag_index_list.push_back(std::to_string(constant));
       }
     }
+    if (tag_range.size() == 0) {
+      tag_index_list.push_back("0");
+    }
 
     TOGDMANode *tog_dma = new TOGDMANode("DMANode", address, stride_list, tile_size, tile_stride,
                                          element_size, is_write, tag_index_list, loop_index_list);
