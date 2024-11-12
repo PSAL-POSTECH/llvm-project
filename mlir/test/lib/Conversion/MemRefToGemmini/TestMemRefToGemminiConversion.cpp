@@ -37,7 +37,7 @@ int extractConstantIntValue(Value val) {
   int val_int;
   if (auto constOp = val.getDefiningOp<arith::ConstantOp>()) {
     Attribute constantAttr = constOp.getValue();
-    if (auto intAttr = constantAttr.dyn_cast<IntegerAttr>()) {
+    if (auto intAttr = llvm::dyn_cast<IntegerAttr>(constantAttr)) {
       val_int = intAttr.getInt();
     }
   }
@@ -46,10 +46,10 @@ int extractConstantIntValue(Value val) {
 
 char* getAsmString(unsigned func7) {
   // return ".insn r CUSTOM_1, 0x3, " + std::to_string(func7) + ", x0, $0, $1";
-  char *asmStr = ".insn r CUSTOM_1, 0x3, ";
+  const char *asmStr = ".insn r CUSTOM_1, 0x3, ";
+  const char *commaStr = ", x0, $0, $1";
   char *func7Str = (char*) malloc(10);
   sprintf(func7Str, "%d", func7);
-  char *commaStr = ", x0, $0, $1";
   char *result = (char*) malloc(strlen(asmStr) + strlen(func7Str) + strlen(commaStr) + 1);
   strcpy(result, asmStr);
   strcat(result, func7Str);
@@ -76,10 +76,8 @@ struct DmaWaitOpLowering : public ConvertOpToLLVMPattern<memref::DmaWaitOp> {
 /// Lowering memref.dma_start operation to Gemmini instructions with LLVM Asm.
 struct DmaStartOpLowering : public ConvertOpToLLVMPattern<memref::DmaStartOp> {
   // using ConvertOpToLLVMPattern<memref::DmaStartOp>::ConvertOpToLLVMPattern;
-  int vectorlaneStride;
-  DmaStartOpLowering(LLVMTypeConverter &typeConverter, int vectorlaneStride = 4)
+  DmaStartOpLowering(LLVMTypeConverter &typeConverter)
       : ConvertOpToLLVMPattern<memref::DmaStartOp>(typeConverter) {
-    this->vectorlaneStride = vectorlaneStride;
   }
 
   LogicalResult
@@ -233,6 +231,22 @@ struct DmaStartOpLowering : public ConvertOpToLLVMPattern<memref::DmaStartOp> {
   }
 };
 
+/// Lowering memref.dma_start operation to Gemmini instructions with LLVM Asm.
+struct TimingDmaStartOpLowering : public ConvertOpToLLVMPattern<memref::DmaStartOp> {
+  // using ConvertOpToLLVMPattern<memref::DmaStartOp>::ConvertOpToLLVMPattern;
+  TimingDmaStartOpLowering(LLVMTypeConverter &typeConverter)
+      : ConvertOpToLLVMPattern<memref::DmaStartOp>(typeConverter) {
+  }
+
+  LogicalResult
+  matchAndRewrite(memref::DmaStartOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    rewriter.eraseOp(op);
+    return success();
+  }
+};
+
+
 struct TestMemRefToGemmini
     : PassWrapper<TestMemRefToGemmini, OperationPass<func::FuncOp>> {
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(TestMemRefToGemmini)
@@ -249,6 +263,9 @@ struct TestMemRefToGemmini
       llvm::cl::desc("Vector lane size for gemmini instructions"),
       llvm::cl::init(4)};
 
+  Option<bool> timing_mode{*this, "timing",
+                   llvm::cl::desc("tming mode switch"),
+                   llvm::cl::init(false)};
   TestMemRefToGemmini() = default;
   TestMemRefToGemmini(const TestMemRefToGemmini &) {}
 
@@ -265,7 +282,10 @@ struct TestMemRefToGemmini
     VECTOR_LANE = vectorlane;
     RewritePatternSet patterns(ctx);
     // vectorlane is passed to the pattern as an argument
-    patterns.add<DmaStartOpLowering>(typeConverter);
+    if (timing_mode)
+      patterns.add<TimingDmaStartOpLowering>(typeConverter);
+    else
+      patterns.add<DmaStartOpLowering>(typeConverter);
     patterns.add<DmaWaitOpLowering>(typeConverter);
     LLVMConversionTarget target(getContext());
     if (failed(applyPartialConversion(getOperation(), target,

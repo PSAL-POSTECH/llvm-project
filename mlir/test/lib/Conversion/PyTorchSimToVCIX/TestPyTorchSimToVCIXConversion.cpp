@@ -216,7 +216,6 @@ struct MatmulOpLowering : public OpRewritePattern<linalg::MatmulOp> {
     // Put dma wait operation
     mlir::Value ADmaTag;
     mlir::Value BDmaTag;
-    mlir::Value index = rewriter.create<mlir::arith::ConstantIndexOp>(loc, 0);
     mlir::Value numElements = rewriter.create<mlir::arith::ConstantIndexOp>(loc, 1);
     op->getParentRegion()->walk([&](mlir::Operation *nestedOp) {
       if (auto dmaStartOp = llvm::dyn_cast<affine::AffineDmaStartOp>(nestedOp)) { // Replace DMAStartOp with actual `dma_start` op type
