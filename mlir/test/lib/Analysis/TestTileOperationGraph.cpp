@@ -20,6 +20,7 @@
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
 #include "mlir/Dialect/LLVMIR/VCIXDialect.h"
 #include "mlir/Pass/Pass.h"
+#include <algorithm>
 
 using namespace mlir;
 
@@ -64,8 +65,11 @@ struct TestTileOperationGraph
                     vcix::VCIXDialect, vector::VectorDialect, affine::AffineDialect,
                     memref::MemRefDialect, LLVM::LLVMDialect>();
   }
+  void processDramIndices(mlir::Value value,
+                        std::vector<std::string> &loop_index_list,
+                        llvm::DenseMap<void *, std::string> &loop_var_name);
   int nr_loop = 0;
-  std::unordered_map<void*, std::string> loop_var_name;
+  llvm::DenseMap<void*, std::string> loop_var_name;
 };
 } // namespace
 
@@ -172,15 +176,8 @@ void TestTileOperationGraph::printOperation(Operation &op, TOGNode *node) {
     }
 
     /* Record used loop index names */
-    if (auto applyOp = dram_indices.front().getDefiningOp<affine::AffineApplyOp>()) {
-      // Get the operands of affine.apply, which should be %arg3 and %arg5
-      mlir::OperandRange applyOperands = applyOp.getOperands();
-      for (auto operand : applyOperands) {
-        loop_index_list.push_back(loop_var_name.at(operand.getAsOpaquePointer()));
-      }
-    } else if (auto blockArg = dyn_cast<BlockArgument>(dram_indices.front())) {
-      loop_index_list.push_back(loop_var_name.at(blockArg.getAsOpaquePointer()));
-    }
+    processDramIndices(dram_indices.front(), loop_index_list, loop_var_name);
+    std::sort(loop_index_list.begin(), loop_index_list.end());
 
     /* Get DRAM argument index */
     if (auto blockArg = dyn_cast<BlockArgument>(dram_memref)) {
@@ -376,6 +373,26 @@ void TestTileOperationGraph::runOnOperation() {
     );
   }
   return;
+}
+
+void TestTileOperationGraph::processDramIndices(mlir::Value value,
+                        std::vector<std::string> &loop_index_list,
+                        llvm::DenseMap<void *, std::string> &loop_var_name) {
+  if (auto applyOp = value.getDefiningOp<mlir::affine::AffineApplyOp>()) {
+    mlir::OperandRange applyOperands = applyOp.getOperands();
+    for (auto operand : applyOperands) {
+      // If the operand is a BlockArgument, add it to the loop_index_list
+      if (auto blockArg = llvm::dyn_cast<mlir::BlockArgument>(operand)) {
+        loop_index_list.push_back(loop_var_name.at(blockArg.getAsOpaquePointer()));
+      } else {
+        // Otherwise, recursively process the operand
+        processDramIndices(operand, loop_index_list, loop_var_name);
+      }
+    }
+  } else if (auto blockArg = llvm::dyn_cast<mlir::BlockArgument>(value)) {
+    // If the value itself is a BlockArgument, add it to the list
+    loop_index_list.push_back(loop_var_name.at(blockArg.getAsOpaquePointer()));
+  }
 }
 
 namespace mlir {
