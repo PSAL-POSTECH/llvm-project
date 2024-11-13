@@ -117,7 +117,7 @@ struct DmaStartOpLowering : public ConvertOpToLLVMPattern<memref::DmaStartOp> {
     uint64_t chunk_size = extractConstantIntValue(num_elt_per_stride);
     bool is_col_major = chunk_size % 2;
     int is_fine_grained = (chunk_size >> 31) & 1;
-    chunk_size = chunk_size / 2 * elen / 8;
+    chunk_size = ((chunk_size / 2) & 0x7FFF) * elen / 8;
     Value numElements = op.getNumElements();
     int dmaType = extractConstantIntValue(numElements);
     Value rs1;

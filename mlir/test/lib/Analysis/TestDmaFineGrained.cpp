@@ -145,14 +145,8 @@ void DmaFineGrained::runOnOperation() {
   // affine_map<(d0, d1) -> (d0 * (tileSizeK / vectorlane) + d1)>
   auto num_elt_per_stride = dma1.getNumElementsPerStride();
   uint64_t chunk_size = getConstantIntValue(num_elt_per_stride);
-  bool is_transposed = chunk_size > 2; // use x_chunk
   auto new_set = builder.create<arith::ConstantIndexOp>(loc, 2147483648 + chunk_size);
-  AffineMap spad_map_m;
-  if (is_transposed) {
-    spad_map_m = AffineMap::get(2, 0, builder.getAffineDimExpr(0) * (tileSizeK / vectorlane) + builder.getAffineDimExpr(1));
-  } else {
-    spad_map_m = AffineMap::get(2, 0, builder.getAffineDimExpr(0) * (tileSizeM / vectorlane) + builder.getAffineDimExpr(1));
-  }
+  AffineMap spad_map_m = AffineMap::get(2, 0, builder.getAffineDimExpr(0) * (tileSizeM / vectorlane) + builder.getAffineDimExpr(1));
   auto dst_idx = builder.create<affine::AffineApplyOp>(loc, spad_map_m, ValueRange{k, i});
   dst_indices.push_back(zeroIndex);
   dst_indices.push_back(dst_idx);
@@ -190,13 +184,7 @@ void DmaFineGrained::runOnOperation() {
   num_elt_per_stride = dma2.getNumElementsPerStride();
   chunk_size = getConstantIntValue(num_elt_per_stride);
   new_set = builder.create<arith::ConstantIndexOp>(loc, 2147483648 + chunk_size);
-  is_transposed = chunk_size > 2; // use w_chunk
-  AffineMap spad_map_k;
-  if (is_transposed) {
-    spad_map_k = AffineMap::get(2, 0, builder.getAffineDimExpr(0) * (tileSizeN / vectorlane) + builder.getAffineDimExpr(1));
-  } else {
-    spad_map_k = AffineMap::get(2, 0, builder.getAffineDimExpr(0) * (tileSizeK / vectorlane) + builder.getAffineDimExpr(1));
-  }
+  AffineMap spad_map_k = AffineMap::get(2, 0, builder.getAffineDimExpr(0) * (tileSizeK / vectorlane) + builder.getAffineDimExpr(1));
 
   dst_idx = builder.create<affine::AffineApplyOp>(loc, spad_map_k, ValueRange{j, k});
   dst_indices.clear();
