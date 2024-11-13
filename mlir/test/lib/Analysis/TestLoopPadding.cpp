@@ -132,6 +132,7 @@ struct TestLoopPadding
   int findLoopVariableIndex(mlir::Value loopVar);
   int getArgumentIndex(mlir::affine::AffineApplyOp applyOp, mlir::Value targetValue);
   SmallVector<std::pair<int64_t, unsigned>, 4> collectCoefficientsFromAffineExpr(mlir::AffineExpr expr);
+  int64_t getCoefficientFromDim(mlir::AffineExpr expr, int dim);
   mlir::AffineExpr updateAffineExprWithBounds(mlir::AffineExpr expr,
                                             int updated_position_index,
                                             int64_t upperBound,
@@ -383,6 +384,42 @@ SmallVector<std::pair<int64_t, unsigned>, 4> TestLoopPadding::collectCoefficient
  return coefficients;
 }
 
+int64_t TestLoopPadding::getCoefficientFromDim(mlir::AffineExpr expr, int dim) {
+  std::function<int64_t(mlir::AffineExpr)> collectCoefficients = [&](mlir::AffineExpr expr) {
+    if (auto binExpr = llvm::dyn_cast<mlir::AffineBinaryOpExpr>(expr)) {
+      if (binExpr.getKind() == mlir::AffineExprKind::Mul) {
+        if (auto lhs = llvm::dyn_cast<mlir::AffineConstantExpr>(binExpr.getLHS())) {
+          if (auto rhs = llvm::dyn_cast<mlir::AffineDimExpr>(binExpr.getRHS())) {
+            if (rhs.isFunctionOfDim(dim)) {
+              return lhs.getValue();
+            }
+          }
+        } else if (auto rhs = llvm::dyn_cast<mlir::AffineConstantExpr>(binExpr.getRHS())) {
+          if (auto lhs = llvm::dyn_cast<mlir::AffineDimExpr>(binExpr.getLHS())) {
+            if (lhs.isFunctionOfDim(dim)) {
+              return rhs.getValue();
+            }
+          }
+        }
+      } else if (binExpr.getKind() == mlir::AffineExprKind::Add) {
+        // Add: Recursively collect both sides
+        int64_t result = collectCoefficients(binExpr.getLHS());
+        if (result != -1)
+          return result;
+        result = collectCoefficients(binExpr.getRHS());
+        if (result != -1)
+          return result;
+      }
+    } else if (auto dimExpr = llvm::dyn_cast<mlir::AffineDimExpr>(expr)) {
+      if (dimExpr.isFunctionOfDim(dim)) {
+        return 1L;
+      }
+    }
+    return -1L;
+  };
+  return collectCoefficients(expr);
+}
+
 mlir::AffineExpr TestLoopPadding::updateAffineExprWithBounds(mlir::AffineExpr expr,
                                             int updated_position_index,
                                             int64_t upperBound,
@@ -399,7 +436,7 @@ mlir::AffineExpr TestLoopPadding::updateAffineExprWithBounds(mlir::AffineExpr ex
 
   // Step 2: Modify the coefficients based on the updated_position_index
   SmallVector<std::tuple<int64_t, unsigned>, 4> modifiedCoefficients;
-  int64_t targetCoefficient = std::get<0>(coefficients[updated_position_index]);
+  int64_t targetCoefficient = getCoefficientFromDim(expr, updated_position_index);
   //llvm::dbgs() << "Target coeff: " << targetCoefficient << "\n";
   //llvm::dbgs() << "Upper: " << upperBound << "\n";
   //llvm::dbgs() << "PaddedUpper: " << paddedUpperBound << "\n";
