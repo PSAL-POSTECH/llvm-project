@@ -64,13 +64,14 @@ void DmaFineGrained::runOnOperation() {
   int64_t vectorlane = systolicSize;
   builder.setInsertionPointToStart(&func.front());
   Value zeroIndex = builder.create<arith::ConstantIndexOp>(func.getLoc(), 0);
-  auto c_set = builder.create<arith::ConstantIndexOp>(func.getLoc(), 2147483650); // FIXME: transpose is not supported
+  auto c_set = builder.create<arith::ConstantIndexOp>(func.getLoc(), 2147483650);
   auto tagMemRefType = MemRefType::get({tileSizeM / vectorlane, tileSizeN / vectorlane, tileSizeK / vectorlane}, builder.getIntegerType(32));
   auto XtagMemRef = builder.create<memref::AllocOp>(func.getLoc(), tagMemRefType);
   auto WtagMemRef = builder.create<memref::AllocOp>(func.getLoc(), tagMemRefType);
 
   // outer loop step modify
   int loopDepth = 0;
+  Value b;
   func.walk([&](affine::AffineForOp loop) {
     // Adjust the step size based on loop depth
     if (loopDepth == 0) {
@@ -79,9 +80,15 @@ void DmaFineGrained::runOnOperation() {
       loop.setStep(tileSizeN); // Second loop (e.g., %t_n) uses tileSizeN
     } else if (loopDepth == 2) {
       loop.setStep(tileSizeM); // Third loop (e.g., %t_k) uses tileSizeK
+    } else if (loopDepth == 3) {
+      b = loop.getInductionVar(); // Fourth loop (e.g., %b) is the batch loop
     }
     loopDepth++;
   });
+  bool is_bmm = false;
+  if (loopDepth == 4) { // bmm has 4 loops (b, m, n, k)
+    is_bmm = true;
+  }
 
   // inner loop fine-grained dma
   SmallVector<affine::AffineDmaStartOp, 2> dmaOps;
@@ -124,7 +131,13 @@ void DmaFineGrained::runOnOperation() {
       new_map = applyOp.getAffineMap();
     }
   }
-  auto new_idx = builder.create<affine::AffineApplyOp>(loc, new_map, ValueRange{i, k});
+  SmallVector<Value> new_map_indices;
+  if (is_bmm) {
+    new_map_indices = {b, i, k};
+  } else {
+    new_map_indices = {i, k};
+  }
+  auto new_idx = builder.create<affine::AffineApplyOp>(loc, new_map, new_map_indices);
   // sum_map = affine_map<(d0, d1) -> (d0 + d1)>
   new_idx = builder.create<affine::AffineApplyOp>(loc, sum_map, ValueRange{new_idx, srcIndices[0]});
   // update srcIndices
@@ -164,7 +177,12 @@ void DmaFineGrained::runOnOperation() {
       new_map = applyOp.getAffineMap();
     }
   }
-  new_idx = builder.create<affine::AffineApplyOp>(loc, new_map, ValueRange{k, j});
+  if (is_bmm) {
+    new_map_indices = {b, k, j};
+  } else {
+    new_map_indices = {k, j};
+  }
+  new_idx = builder.create<affine::AffineApplyOp>(loc, new_map, new_map_indices);
   new_idx = builder.create<affine::AffineApplyOp>(loc, sum_map, ValueRange{new_idx, srcIndices[0]});
   src_indices.clear();
   src_indices.push_back(new_idx);
@@ -223,7 +241,12 @@ void DmaFineGrained::runOnOperation() {
       new_map = applyOp.getAffineMap();
     }
   }
-  new_idx = builder.create<affine::AffineApplyOp>(loc, new_map, ValueRange{i, j});
+  if (is_bmm) {
+    new_map_indices = {b, i, j};
+  } else {
+    new_map_indices = {i, j};
+  }
+  new_idx = builder.create<affine::AffineApplyOp>(loc, new_map, new_map_indices);
   new_idx = builder.create<affine::AffineApplyOp>(loc, sum_map, ValueRange{new_idx, dstIndices[0]});
   dst_indices.clear();
   dst_indices.push_back(new_idx);
