@@ -133,7 +133,7 @@ void DmaFineGrained::runOnOperation() {
   }
   SmallVector<Value> new_map_indices;
   if (is_bmm) {
-    new_map_indices = {b, i, k};
+    new_map_indices = {zeroIndex, i, k}; // other approach is make sub map using only i, k
   } else {
     new_map_indices = {i, k};
   }
@@ -178,7 +178,7 @@ void DmaFineGrained::runOnOperation() {
     }
   }
   if (is_bmm) {
-    new_map_indices = {b, k, j};
+    new_map_indices = {zeroIndex, k, j};
   } else {
     new_map_indices = {k, j};
   }
@@ -242,7 +242,7 @@ void DmaFineGrained::runOnOperation() {
     }
   }
   if (is_bmm) {
-    new_map_indices = {b, i, j};
+    new_map_indices = {zeroIndex, i, j};
   } else {
     new_map_indices = {i, j};
   }
