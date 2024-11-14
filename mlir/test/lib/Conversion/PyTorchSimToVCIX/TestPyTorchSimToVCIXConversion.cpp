@@ -216,10 +216,13 @@ struct MatmulOpLowering : public OpRewritePattern<linalg::MatmulOp> {
     // Put dma wait operation
     mlir::Value ADmaTag;
     mlir::Value BDmaTag;
+    mlir::Value BiasDmaTag;
+    ValueRange BiasDMAIndices;
     mlir::Value numElements = rewriter.create<mlir::arith::ConstantIndexOp>(loc, 1);
     op->getParentRegion()->walk([&](mlir::Operation *nestedOp) {
       if (auto dmaStartOp = llvm::dyn_cast<affine::AffineDmaStartOp>(nestedOp)) { // Replace DMAStartOp with actual `dma_start` op type
         auto result = getDramMemRef(dmaStartOp);
+        /* Only DMA load */
         if (result.second)
           return WalkResult::advance();
         auto blockArg = mlir::cast<mlir::BlockArgument>(result.first);
@@ -229,6 +232,9 @@ struct MatmulOpLowering : public OpRewritePattern<linalg::MatmulOp> {
           ADmaTag = dmaStartOp.getTagMemRef(); // Assuming `getTag()` retrieves the `tag` from `dma_start`.
         } else if (blockArg.getArgNumber() == 1) {
           BDmaTag = dmaStartOp.getTagMemRef(); // Assuming `getTag()` retrieves the `tag` from `dma_start`.
+        } else if (blockArg.getArgNumber() == 2) {
+          BiasDmaTag = dmaStartOp.getTagMemRef(); // Assuming `getTag()` retrieves the `tag` from `dma_start`.
+          BiasDMAIndices = dmaStartOp.getTagIndices();
         }
       }
       return WalkResult::advance();
@@ -242,6 +248,13 @@ struct MatmulOpLowering : public OpRewritePattern<linalg::MatmulOp> {
     auto BTagMap = rewriter.getMultiDimIdentityMap(llvm::dyn_cast<MemRefType>(BDmaTag.getType()).getRank());
     rewriter.create<affine::AffineDmaWaitOp>(loc, ADmaTag, ATagMap, ValueRange{c0, k_idx, m_idx}, numElements);
     rewriter.create<affine::AffineDmaWaitOp>(loc, BDmaTag, BTagMap, ValueRange{n_idx, k_idx, c0}, numElements);
+    if (BiasDmaTag) {
+      /* Bias could be 1D or 2D */
+      Value first_index = BiasDMAIndices[0].getDefiningOp<mlir::arith::ConstantIndexOp>() ? c0 : n_idx;
+      Value third_index = BiasDMAIndices[0].getDefiningOp<mlir::arith::ConstantIndexOp>() ? c0 : m_idx;
+      auto BiasTagMap = rewriter.getMultiDimIdentityMap(llvm::dyn_cast<MemRefType>(ADmaTag.getType()).getRank());
+      rewriter.create<affine::AffineDmaWaitOp>(loc, BiasDmaTag, BiasTagMap, ValueRange{first_index, c0, third_index}, numElements);
+    }
 
     // For vpush weight loop part
     for (int i=0; i<SYSTOLIC_SIZE; i+=nr_element) { // KxN
