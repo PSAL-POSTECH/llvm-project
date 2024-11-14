@@ -65,9 +65,10 @@ void DmaFineGrained::runOnOperation() {
   builder.setInsertionPointToStart(&func.front());
   Value zeroIndex = builder.create<arith::ConstantIndexOp>(func.getLoc(), 0);
   auto c_set = builder.create<arith::ConstantIndexOp>(func.getLoc(), 2147483650);
-  auto tagMemRefType = MemRefType::get({tileSizeM / vectorlane, tileSizeN / vectorlane, tileSizeK / vectorlane}, builder.getIntegerType(32));
+  auto tagMemRefType = MemRefType::get({tileSizeN / vectorlane, tileSizeK / vectorlane, tileSizeM / vectorlane}, builder.getIntegerType(32));
   auto XtagMemRef = builder.create<memref::AllocOp>(func.getLoc(), tagMemRefType);
   auto WtagMemRef = builder.create<memref::AllocOp>(func.getLoc(), tagMemRefType);
+  auto BtagMemRef = builder.create<memref::AllocOp>(func.getLoc(), tagMemRefType);
 
   // outer loop step modify
   int loopDepth = 0;
@@ -99,6 +100,18 @@ void DmaFineGrained::runOnOperation() {
   if (dmaOps.size() == 4) {
     is_bias = true;
   }
+
+  Value i, j, k;
+  SmallVector<Value, 2> src_indices;
+  SmallVector<Value, 2> dst_indices;
+  SmallVector<Value, 3> tag_indices;
+  AffineMap new_map;
+  SmallVector<Value> new_map_indices;
+  ValueRange srcIndices;
+  // sum_map = affine_map<(d0, d1) -> (d0 + d1)>
+  auto sum_map = AffineMap::get(2, 0, builder.getAffineDimExpr(0) + builder.getAffineDimExpr(1));
+  AffineMap tag_idx_map = AffineMap::get(1, 0, builder.getAffineDimExpr(0).floorDiv(vectorlane));
+
   affine::AffineDmaStartOp dma1 = dmaOps[0 + is_bias];
   affine::AffineDmaStartOp dma2 = dmaOps[1 + is_bias];
   // Get insertion point for new loops
@@ -106,7 +119,6 @@ void DmaFineGrained::runOnOperation() {
   builder.setInsertionPoint(dma1);
 
   // Create three nested affine.for loops
-  Value i, j, k;
   auto loopN = builder.create<affine::AffineForOp>(loc, 0, tileSizeN, vectorlane);
   loopN->setAttr("inner_loop", builder.getBoolAttr(true));
   builder.setInsertionPointToStart(loopN.getBody());
@@ -120,39 +132,78 @@ void DmaFineGrained::runOnOperation() {
   builder.setInsertionPointToStart(loopM.getBody());
   i = loopM.getInductionVar();
 
-  SmallVector<Value, 2> src_indices;
-  SmallVector<Value, 2> dst_indices;
-  SmallVector<Value, 3> tag_indices;
-  auto sum_map = AffineMap::get(2, 0, builder.getAffineDimExpr(0) + builder.getAffineDimExpr(1));
-  ValueRange srcIndices = dma1.getSrcIndices();
-  AffineMap new_map;
+  if (is_bias) {
+    // BIAS MVIN
+    // reset builder location
+    affine::AffineDmaStartOp dma = dmaOps[0];
+    srcIndices = dma.getSrcIndices();
+    for (auto index : srcIndices) {
+      if (auto applyOp = index.getDefiningOp<affine::AffineApplyOp>()) {
+        new_map = applyOp.getAffineMap();
+      }
+    }
+    new_map_indices = {i, j}; // bmm has no bias
+    Value new_idx;
+    if (new_map) {
+      new_idx = builder.create<affine::AffineApplyOp>(loc, new_map, new_map_indices);
+    } else {
+      new_idx = j;
+    }
+    new_idx = builder.create<affine::AffineApplyOp>(loc, sum_map, ValueRange{new_idx, srcIndices[0]});
+    src_indices.push_back(new_idx);
+    auto num_elt_per_stride = dma.getNumElementsPerStride();
+    uint64_t chunk_size = getConstantIntValue(num_elt_per_stride);
+    auto new_set = builder.create<arith::ConstantIndexOp>(loc, 2147483648 + chunk_size);
+    AffineMap spad_map_m = AffineMap::get(2, 0, builder.getAffineDimExpr(0) * (tileSizeM / vectorlane) + builder.getAffineDimExpr(1));
+    auto dst_idx = builder.create<affine::AffineApplyOp>(loc, spad_map_m, ValueRange{j, i});
+
+    dst_indices.push_back(zeroIndex);
+    dst_indices.push_back(dst_idx);
+    tag_indices.push_back(builder.create<affine::AffineApplyOp>(loc, tag_idx_map, j));
+    tag_indices.push_back(zeroIndex);
+    tag_indices.push_back(builder.create<affine::AffineApplyOp>(loc, tag_idx_map, i));
+    auto src_map = builder.getMultiDimIdentityMap(src_indices.size());
+    auto dst_map = builder.getMultiDimIdentityMap(dst_indices.size());
+    auto tag_map = builder.getMultiDimIdentityMap(tag_indices.size());
+
+    // Insert the first dma_start operation
+    builder.create<affine::AffineDmaStartOp>(
+        loc, dma.getSrcMemRef(), src_map, src_indices,
+        dma.getDstMemRef(), dst_map, dst_indices,
+        BtagMemRef, tag_map, tag_indices,
+        dma.getNumElements(), dma.getStride(), new_set);
+    dma.erase();
+    src_indices.clear();
+    dst_indices.clear();
+    tag_indices.clear();
+  }
+
+  srcIndices = dma1.getSrcIndices();
   for (auto index : srcIndices) {
     if (auto applyOp = index.getDefiningOp<affine::AffineApplyOp>()) {
       new_map = applyOp.getAffineMap();
     }
   }
-  SmallVector<Value> new_map_indices;
   if (is_bmm) {
     new_map_indices = {zeroIndex, i, k}; // other approach is make sub map using only i, k
   } else {
     new_map_indices = {i, k};
   }
   auto new_idx = builder.create<affine::AffineApplyOp>(loc, new_map, new_map_indices);
-  // sum_map = affine_map<(d0, d1) -> (d0 + d1)>
   new_idx = builder.create<affine::AffineApplyOp>(loc, sum_map, ValueRange{new_idx, srcIndices[0]});
   // update srcIndices
   src_indices.push_back(new_idx);
-  // affine_map<(d0, d1) -> (d0 * (tileSizeK / vectorlane) + d1)>
   auto num_elt_per_stride = dma1.getNumElementsPerStride();
   uint64_t chunk_size = getConstantIntValue(num_elt_per_stride);
   auto new_set = builder.create<arith::ConstantIndexOp>(loc, 2147483648 + chunk_size);
+  // affine_map<(d0, d1) -> (d0 * (tileSizeM / vectorlane) + d1)>
   AffineMap spad_map_m = AffineMap::get(2, 0, builder.getAffineDimExpr(0) * (tileSizeM / vectorlane) + builder.getAffineDimExpr(1));
   auto dst_idx = builder.create<affine::AffineApplyOp>(loc, spad_map_m, ValueRange{k, i});
   dst_indices.push_back(zeroIndex);
   dst_indices.push_back(dst_idx);
   tag_indices.push_back(zeroIndex);
-  tag_indices.push_back(k);
-  tag_indices.push_back(i);
+  tag_indices.push_back(builder.create<affine::AffineApplyOp>(loc, tag_idx_map, k));
+  tag_indices.push_back(builder.create<affine::AffineApplyOp>(loc, tag_idx_map, i));
   auto src_map = builder.getMultiDimIdentityMap(src_indices.size());
   auto dst_map = builder.getMultiDimIdentityMap(dst_indices.size());
   auto tag_map = builder.getMultiDimIdentityMap(tag_indices.size());
@@ -191,8 +242,8 @@ void DmaFineGrained::runOnOperation() {
   dst_indices.push_back(zeroIndex);
   dst_indices.push_back(dst_idx);
   tag_indices.clear();
-  tag_indices.push_back(j);
-  tag_indices.push_back(k);
+  tag_indices.push_back(builder.create<affine::AffineApplyOp>(loc, tag_idx_map, j));
+  tag_indices.push_back(builder.create<affine::AffineApplyOp>(loc, tag_idx_map, k));
   tag_indices.push_back(zeroIndex);
   src_map = builder.getMultiDimIdentityMap(src_indices.size());
   dst_map = builder.getMultiDimIdentityMap(dst_indices.size());
