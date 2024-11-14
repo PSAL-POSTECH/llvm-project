@@ -219,7 +219,8 @@ struct MatmulOpLowering : public OpRewritePattern<linalg::MatmulOp> {
     mlir::Value BiasDmaTag;
     ValueRange BiasDMAIndices;
     mlir::Value numElements = rewriter.create<mlir::arith::ConstantIndexOp>(loc, 1);
-    op->getParentRegion()->walk([&](mlir::Operation *nestedOp) {
+    // Search outer K loop
+    op->getParentRegion()->getParentRegion()->walk([&](mlir::Operation *nestedOp) {
       if (auto dmaStartOp = llvm::dyn_cast<affine::AffineDmaStartOp>(nestedOp)) { // Replace DMAStartOp with actual `dma_start` op type
         auto result = getDramMemRef(dmaStartOp);
         /* Only DMA load */
