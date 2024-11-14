@@ -217,9 +217,17 @@ void TestTileOperationGraph::printOperation(Operation &op, TOGNode *node) {
       } else if (auto constOp = tag_idx.getDefiningOp<arith::ConstantIndexOp>()) {
         auto constant = static_cast<int>(constOp.value());
         tag_index_list.push_back(std::to_string(constant));
+      } else if (auto applyOp = tag_idx.getDefiningOp<affine::AffineApplyOp>()) {
+        for (auto operand : applyOp.getOperands()) {
+          if (auto blockArg = dyn_cast<BlockArgument>(operand)) {
+            tag_index_list.push_back(loop_var_name.at(blockArg.getAsOpaquePointer()));
+          } else {
+            op.emitError() << "tag index apply op is not valid!\n";
+          }
+        }
       }
     }
-    if (tag_range.size() == 0) {
+    if (tag_index_list.size() == 0) {
       tag_index_list.push_back("0");
     }
 
@@ -245,6 +253,8 @@ void TestTileOperationGraph::printOperation(Operation &op, TOGNode *node) {
       } else if (auto constOp = tag_idx.getDefiningOp<arith::ConstantIndexOp>()) {
         auto constant = static_cast<int>(constOp.value());
         tag_index_list.push_back(std::to_string(constant));
+      } else {
+        dma_op.emitError() << "Unexpected tag indices in the dma.wait\n";
       }
     }
 
