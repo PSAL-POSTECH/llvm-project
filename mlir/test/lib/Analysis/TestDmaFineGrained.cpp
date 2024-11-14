@@ -112,30 +112,20 @@ void DmaFineGrained::runOnOperation() {
   auto sum_map = AffineMap::get(2, 0, builder.getAffineDimExpr(0) + builder.getAffineDimExpr(1));
   AffineMap tag_idx_map = AffineMap::get(1, 0, builder.getAffineDimExpr(0).floorDiv(vectorlane));
 
-  affine::AffineDmaStartOp dma1 = dmaOps[0 + is_bias];
-  affine::AffineDmaStartOp dma2 = dmaOps[1 + is_bias];
-  // Get insertion point for new loops
-  auto loc = dma1.getLoc();
-  builder.setInsertionPoint(dma1);
-
-  // Create three nested affine.for loops
-  auto loopN = builder.create<affine::AffineForOp>(loc, 0, tileSizeN, vectorlane);
-  loopN->setAttr("inner_loop", builder.getBoolAttr(true));
-  builder.setInsertionPointToStart(loopN.getBody());
-  j = loopN.getInductionVar();
-  auto loopK = builder.create<affine::AffineForOp>(loc, 0, tileSizeK, vectorlane);
-  loopK->setAttr("inner_loop", builder.getBoolAttr(true));
-  builder.setInsertionPointToStart(loopK.getBody());
-  k = loopK.getInductionVar();
-  auto loopM = builder.create<affine::AffineForOp>(loc, 0, tileSizeM, vectorlane);
-  loopM->setAttr("inner_loop", builder.getBoolAttr(true));
-  builder.setInsertionPointToStart(loopM.getBody());
-  i = loopM.getInductionVar();
-
   if (is_bias) {
     // BIAS MVIN
     // reset builder location
     affine::AffineDmaStartOp dma = dmaOps[0];
+    auto loc = dma.getLoc();
+    builder.setInsertionPoint(dma);
+    auto loopN = builder.create<affine::AffineForOp>(loc, 0, tileSizeN, vectorlane);
+    loopN->setAttr("inner_loop", builder.getBoolAttr(true));
+    builder.setInsertionPointToStart(loopN.getBody());
+    j = loopN.getInductionVar();
+    auto loopM = builder.create<affine::AffineForOp>(loc, 0, tileSizeM, vectorlane);
+    loopM->setAttr("inner_loop", builder.getBoolAttr(true));
+    builder.setInsertionPointToStart(loopM.getBody());
+    i = loopM.getInductionVar();
     srcIndices = dma.getSrcIndices();
     for (auto index : srcIndices) {
       if (auto applyOp = index.getDefiningOp<affine::AffineApplyOp>()) {
@@ -177,6 +167,27 @@ void DmaFineGrained::runOnOperation() {
     dst_indices.clear();
     tag_indices.clear();
   }
+
+
+  affine::AffineDmaStartOp dma1 = dmaOps[0 + is_bias];
+  affine::AffineDmaStartOp dma2 = dmaOps[1 + is_bias];
+  // Get insertion point for new loops
+  auto loc = dma1.getLoc();
+  builder.setInsertionPoint(dma1);
+
+  // Create three nested affine.for loops
+  auto loopN = builder.create<affine::AffineForOp>(loc, 0, tileSizeN, vectorlane);
+  loopN->setAttr("inner_loop", builder.getBoolAttr(true));
+  builder.setInsertionPointToStart(loopN.getBody());
+  j = loopN.getInductionVar();
+  auto loopK = builder.create<affine::AffineForOp>(loc, 0, tileSizeK, vectorlane);
+  loopK->setAttr("inner_loop", builder.getBoolAttr(true));
+  builder.setInsertionPointToStart(loopK.getBody());
+  k = loopK.getInductionVar();
+  auto loopM = builder.create<affine::AffineForOp>(loc, 0, tileSizeM, vectorlane);
+  loopM->setAttr("inner_loop", builder.getBoolAttr(true));
+  builder.setInsertionPointToStart(loopM.getBody());
+  i = loopM.getInductionVar();
 
   srcIndices = dma1.getSrcIndices();
   for (auto index : srcIndices) {
