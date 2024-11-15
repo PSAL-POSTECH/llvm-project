@@ -21,6 +21,8 @@
 #include "mlir/Dialect/LLVMIR/VCIXDialect.h"
 #include "mlir/Pass/Pass.h"
 #include <algorithm>
+#include <iomanip>
+#include <sstream>
 
 using namespace mlir;
 
@@ -124,7 +126,9 @@ void TestTileOperationGraph::printOperation(Operation &op, TOGNode *node) {
       // Get loop information and create loop node
       int start, end, step;
       getAffineForBounds(for_op, start, end, step);
-      std::string loop_index = "loop_arg" + std::to_string(nr_loop++);
+      std::ostringstream oss;
+      oss << "loop_arg" << std::setw(3) << std::setfill('0') << nr_loop++;
+      std::string loop_index = oss.str();
       mlir::Value iter_var = for_op.getInductionVar();
       loop_var_name[iter_var.getAsOpaquePointer()] = loop_index;
       TOGLoopNode *tog_loop = new TOGLoopNode("loopNode", loop_index, start, end, step, loop_type);
