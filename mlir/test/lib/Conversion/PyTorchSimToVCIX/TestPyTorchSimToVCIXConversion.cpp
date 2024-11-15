@@ -253,8 +253,8 @@ struct MatmulOpLowering : public OpRewritePattern<linalg::MatmulOp> {
       /* Bias could be 1D or 2D */
       Value first_index = BiasDMAIndices[0].getDefiningOp<mlir::arith::ConstantIndexOp>() ? c0 : n_idx;
       Value third_index = BiasDMAIndices[0].getDefiningOp<mlir::arith::ConstantIndexOp>() ? c0 : m_idx;
-      auto BiasTagMap = rewriter.getMultiDimIdentityMap(llvm::dyn_cast<MemRefType>(ADmaTag.getType()).getRank());
-      rewriter.create<affine::AffineDmaWaitOp>(loc, BiasDmaTag, BiasTagMap, ValueRange{first_index, c0, third_index}, numElements);
+      auto BiasTagMap = rewriter.getMultiDimIdentityMap(llvm::dyn_cast<MemRefType>(BiasDmaTag.getType()).getRank());
+      rewriter.create<affine::AffineDmaWaitOp>(loc, BiasDmaTag, BiasTagMap, ValueRange{first_index, third_index}, numElements);
     }
 
     // For vpush weight loop part

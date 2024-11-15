@@ -66,9 +66,10 @@ void DmaFineGrained::runOnOperation() {
   Value zeroIndex = builder.create<arith::ConstantIndexOp>(func.getLoc(), 0);
   auto c_set = builder.create<arith::ConstantIndexOp>(func.getLoc(), 2147483650);
   auto tagMemRefType = MemRefType::get({tileSizeN / vectorlane, tileSizeK / vectorlane, tileSizeM / vectorlane}, builder.getIntegerType(32));
+  auto BtagMemRefType = MemRefType::get({tileSizeN / vectorlane, tileSizeM / vectorlane}, builder.getIntegerType(32));
   auto XtagMemRef = builder.create<memref::AllocOp>(func.getLoc(), tagMemRefType);
   auto WtagMemRef = builder.create<memref::AllocOp>(func.getLoc(), tagMemRefType);
-  auto BtagMemRef = builder.create<memref::AllocOp>(func.getLoc(), tagMemRefType);
+  auto BtagMemRef = builder.create<memref::AllocOp>(func.getLoc(), BtagMemRefType);
 
   // outer loop step modify
   int loopDepth = 0;
@@ -150,7 +151,6 @@ void DmaFineGrained::runOnOperation() {
     dst_indices.push_back(zeroIndex);
     dst_indices.push_back(dst_idx);
     tag_indices.push_back(builder.create<affine::AffineApplyOp>(loc, tag_idx_map, j));
-    tag_indices.push_back(zeroIndex);
     tag_indices.push_back(builder.create<affine::AffineApplyOp>(loc, tag_idx_map, i));
     auto src_map = builder.getMultiDimIdentityMap(src_indices.size());
     auto dst_map = builder.getMultiDimIdentityMap(dst_indices.size());
