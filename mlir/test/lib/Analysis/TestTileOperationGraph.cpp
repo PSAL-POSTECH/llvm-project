@@ -68,7 +68,7 @@ struct TestTileOperationGraph
                     memref::MemRefDialect, LLVM::LLVMDialect>();
   }
   void processDramIndices(mlir::Value value,
-                        std::vector<std::string> &loop_index_list,
+                        std::map<std::string, int> &loop_index_list,
                         llvm::DenseMap<void *, std::string> &loop_var_name);
   int nr_loop = 0;
   llvm::DenseMap<void*, std::string> loop_var_name;
@@ -158,8 +158,9 @@ void TestTileOperationGraph::printOperation(Operation &op, TOGNode *node) {
     MemRefType tile_memref_type;
     ValueRange dram_indices;
     Value dram_memref;
-    std::vector<std::string> tag_index_list;
     std::vector<std::string> loop_index_list;
+    std::vector<std::string> tag_index_list;
+    std::map<std::string, int> loop_index_map;
     Value num_elt_per_stride = dma_op.getNumElementsPerStride();
     uint64_t chunk_size = extractConstantIntValue(num_elt_per_stride);
     int is_fine_grained = (chunk_size >> 31) & 1;
@@ -180,8 +181,11 @@ void TestTileOperationGraph::printOperation(Operation &op, TOGNode *node) {
     }
 
     /* Record used loop index names */
-    processDramIndices(dram_indices.front(), loop_index_list, loop_var_name);
-    std::sort(loop_index_list.begin(), loop_index_list.end());
+    processDramIndices(dram_indices.front(), loop_index_map, loop_var_name);
+    for (const auto& pair : loop_index_map) {
+        loop_index_list.push_back(pair.first);
+        stride_list.push_back(pair.second);
+    }
 
     /* Get DRAM argument index */
     if (auto blockArg = dyn_cast<BlockArgument>(dram_memref)) {
@@ -193,11 +197,6 @@ void TestTileOperationGraph::printOperation(Operation &op, TOGNode *node) {
     }
     std::vector<int64_t> vec = {VECTOR_LANE, VECTOR_LANE};
     auto tile_shape = is_fine_grained? llvm::ArrayRef<int64_t> (vec) : tile_memref_type.getShape();
-    int mm_stride = dma_op.getStride().getDefiningOp<arith::ConstantIndexOp>().value();
-
-    /* Fill stride info */
-    tile_stride = {mm_stride, 1};
-    stride_list = {mm_stride, 1};
 
     /* Extract destination tile size */
     for (int64_t iter: tile_shape)
@@ -235,7 +234,7 @@ void TestTileOperationGraph::printOperation(Operation &op, TOGNode *node) {
       tag_index_list.push_back("0");
     }
 
-    TOGDMANode *tog_dma = new TOGDMANode("DMANode", address, stride_list, tile_size, tile_stride,
+    TOGDMANode *tog_dma = new TOGDMANode("DMANode", address, stride_list, tile_size,
                                          element_size, is_write, tag_index_list, loop_index_list);
     tog_dma->setOp(&op);
     /* Link child and parent */
@@ -392,15 +391,66 @@ void TestTileOperationGraph::runOnOperation() {
   return;
 }
 
+int getArgumentIndex(mlir::affine::AffineApplyOp applyOp, mlir::Value targetValue) {
+  mlir::OperandRange operands = applyOp.getOperands();
+  for (size_t i = 0; i < operands.size(); ++i) {
+    if (operands[i] == targetValue) {
+      return i;
+    }
+  }
+  return -1;
+}
+
+int64_t getCoefficientFromDim(mlir::AffineExpr expr, int dim) {
+  std::function<int64_t(mlir::AffineExpr)> collectCoefficients = [&](mlir::AffineExpr expr) {
+    if (auto binExpr = llvm::dyn_cast<mlir::AffineBinaryOpExpr>(expr)) {
+      if (binExpr.getKind() == mlir::AffineExprKind::Mul) {
+        if (auto lhs = llvm::dyn_cast<mlir::AffineConstantExpr>(binExpr.getLHS())) {
+          if (auto rhs = llvm::dyn_cast<mlir::AffineDimExpr>(binExpr.getRHS())) {
+            if (rhs.isFunctionOfDim(dim)) {
+              return lhs.getValue();
+            }
+          }
+        } else if (auto rhs = llvm::dyn_cast<mlir::AffineConstantExpr>(binExpr.getRHS())) {
+          if (auto lhs = llvm::dyn_cast<mlir::AffineDimExpr>(binExpr.getLHS())) {
+            if (lhs.isFunctionOfDim(dim)) {
+              return rhs.getValue();
+            }
+          }
+        }
+      } else if (binExpr.getKind() == mlir::AffineExprKind::Add) {
+        // Add: Recursively collect both sides
+        int64_t result = collectCoefficients(binExpr.getLHS());
+        if (result != -1)
+          return result;
+        result = collectCoefficients(binExpr.getRHS());
+        if (result != -1)
+          return result;
+      }
+    } else if (auto dimExpr = llvm::dyn_cast<mlir::AffineDimExpr>(expr)) {
+      if (dimExpr.isFunctionOfDim(dim)) {
+        return 1L;
+      }
+    }
+    return -1L;
+  };
+  return collectCoefficients(expr);
+}
+
 void TestTileOperationGraph::processDramIndices(mlir::Value value,
-                        std::vector<std::string> &loop_index_list,
+                        std::map<std::string, int> &loop_index_list,
                         llvm::DenseMap<void *, std::string> &loop_var_name) {
   if (auto applyOp = value.getDefiningOp<mlir::affine::AffineApplyOp>()) {
+    mlir::AffineMap map = applyOp.getAffineMap();
     mlir::OperandRange applyOperands = applyOp.getOperands();
-    for (auto operand : applyOperands) {
-      // If the operand is a BlockArgument, add it to the loop_index_list
+
+    for (unsigned i = 0; i < applyOperands.size(); ++i) {
+      auto operand = applyOperands[i];
       if (auto blockArg = llvm::dyn_cast<mlir::BlockArgument>(operand)) {
-        loop_index_list.push_back(loop_var_name.at(blockArg.getAsOpaquePointer()));
+        mlir::AffineExpr expr = map.getResult(0);
+        auto index_pos = getArgumentIndex(applyOp, blockArg);
+        int coeff = getCoefficientFromDim(expr, index_pos);
+        loop_index_list[loop_var_name.at(blockArg.getAsOpaquePointer())] = coeff;
       } else {
         // Otherwise, recursively process the operand
         processDramIndices(operand, loop_index_list, loop_var_name);
@@ -408,7 +458,7 @@ void TestTileOperationGraph::processDramIndices(mlir::Value value,
     }
   } else if (auto blockArg = llvm::dyn_cast<mlir::BlockArgument>(value)) {
     // If the value itself is a BlockArgument, add it to the list
-    loop_index_list.push_back(loop_var_name.at(blockArg.getAsOpaquePointer()));
+    loop_index_list[loop_var_name.at(blockArg.getAsOpaquePointer())] = 1;
   }
 }
 
