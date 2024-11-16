@@ -174,7 +174,6 @@ class TOGDMANode : public TOGNode {
   std::string base_addr;
   std::vector<int> stride_list;
   std::vector<int> tile_size;
-  std::vector<int> tile_stride;
   int element_size;
   bool is_write;
   std::vector<std::string> tag_idx_list;
@@ -183,21 +182,19 @@ class TOGDMANode : public TOGNode {
  public:
   TOGDMANode(const std::string &name, const std::string &addr,
              const std::vector<int> &strides, const std::vector<int> &sizes,
-             const std::vector<int> &tileStrides, int elemSize, bool is_write,
-             std::vector<std::string> &tag_idx_list, std::vector<std::string> &idx_list)
+             int elemSize, bool is_write, std::vector<std::string> &tag_idx_list,
+             std::vector<std::string> &idx_list)
       : TOGNode(name), base_addr(addr), stride_list(strides), tile_size(sizes),
-        tile_stride(tileStrides), element_size(elemSize), is_write(is_write),
+        element_size(elemSize), is_write(is_write),
         tag_idx_list(tag_idx_list), loop_idx_list(idx_list) {}
   std::string getBaseAddr() const { return base_addr; }
   std::vector<int> getStrideList() const { return stride_list; }
   std::vector<int> getTileSize() const { return tile_size; }
-  std::vector<int> getTileStride() const { return tile_stride; }
   int getElementSize() const { return element_size; }
   bool isWrite() const { return is_write; }
   void setBaseAddr(const std::string &addr) { base_addr = addr; }
   void setStrideList(const std::vector<int> &strides) { stride_list = strides; }
   void setTileSize(const std::vector<int> &sizes) { tile_size = sizes; }
-  void setTileStride(const std::vector<int> &tileStrides) { tile_stride = tileStrides; }
   void setElementSize(int elemSize) { element_size = elemSize; }
   void setIsWrite(bool is_write) const { is_write = is_write; }
   void display() const override {
@@ -208,9 +205,6 @@ class TOGDMANode : public TOGNode {
 
     auto name = std::string("stride_list");
     printLoopInfo(name, this->stride_list);
-    std::cout << ",\n";
-    name = std::string("tile_stride");
-    printLoopInfo(name, this->tile_stride);
     std::cout << ",\n";
 
     name = std::string("tile_size");
