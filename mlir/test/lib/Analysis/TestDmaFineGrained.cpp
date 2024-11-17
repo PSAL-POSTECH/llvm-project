@@ -114,6 +114,55 @@ void DmaFineGrained::runOnOperation() {
   // sum_map = affine_map<(d0, d1) -> (d0 + d1)>
   auto sum_map = AffineMap::get(2, 0, builder.getAffineDimExpr(0) + builder.getAffineDimExpr(1));
   AffineMap tag_idx_map = AffineMap::get(1, 0, builder.getAffineDimExpr(0).floorDiv(vectorlane));
+  affine::AffineDmaStartOp dma1 = dmaOps[0 + is_bias];
+  affine::AffineDmaStartOp dma2 = dmaOps[1 + is_bias];
+  affine::AffineDmaStartOp dma3 = dmaOps[2 + is_bias];
+  llvm::SmallVector<mlir::Attribute, 2> dma1Subtile = getSubtileSize(dma1);
+  llvm::SmallVector<mlir::Attribute, 2> dma2Subtile = getSubtileSize(dma2);
+  llvm::SmallVector<mlir::Attribute, 2> dma3Subtile = getSubtileSize(dma3);
+  int dma1Async = getAsyncValue(dma1);
+  int dma2Async = getAsyncValue(dma2);
+  int dma3Async = getAsyncValue(dma3);
+  NamedAttrList dma1Attr;
+  NamedAttrList dma2Attr;
+  NamedAttrList dma3Attr;
+
+  int64_t subTileSizeM;
+  int64_t subTileSizeN;
+  int64_t subTileSizeK;
+
+  // Sanity check
+  if (dma1Subtile.size() == 2 && dma2Subtile.size() == 2 && dma3Subtile.size() == 2) {
+    if (auto intAttr1 = llvm::dyn_cast<mlir::IntegerAttr>(dma1Subtile[1])) {
+      if (auto intAttr2 = llvm::dyn_cast<mlir::IntegerAttr>(dma2Subtile[0]))
+        if (intAttr1.getInt() != intAttr2.getInt()) {
+          dma2.emitError() << " Not matched: "
+                          << "dma1Subtile[1] = " << intAttr1.getInt()
+                          << ", dma2Subtile[0] = " << intAttr2.getInt()
+                          << "\n";
+        } else {
+          subTileSizeK = intAttr1.getInt();
+        }
+      else
+        dma2.emitError() << "dma2Subtile[0] is not an IntegerAttr.\n";
+    } else
+      dma1.emitError() << "dma1Subtile[1] is not an IntegerAttr.\n";
+  } else {
+    dma1.emitError() << "subtile_size attribute required for matmul.\n";
+  }
+  subTileSizeM = llvm::dyn_cast<mlir::IntegerAttr>(dma1Subtile[0]).getInt();
+  subTileSizeN = llvm::dyn_cast<mlir::IntegerAttr>(dma2Subtile[1]).getInt();
+  llvm::errs() << subTileSizeM << ", " << subTileSizeN << ", " << subTileSizeK << "\n";
+
+  if (dma1Subtile.size())
+    dma1Attr.set("subtile_size", builder.getArrayAttr(dma1Subtile));
+  if (dma2Subtile.size())
+    dma2Attr.set("subtile_size", builder.getArrayAttr(dma2Subtile));
+  if (dma3Subtile.size())
+    dma3Attr.set("subtile_size", builder.getArrayAttr(dma3Subtile));
+  dma1Attr.set("async", builder.getIntegerAttr(builder.getI1Type(), dma1Async));
+  dma2Attr.set("async", builder.getIntegerAttr(builder.getI1Type(), dma2Async));
+  dma3Attr.set("async", builder.getIntegerAttr(builder.getI1Type(), dma3Async));
 
   if (is_bias) {
     // BIAS MVIN
@@ -129,11 +178,11 @@ void DmaFineGrained::runOnOperation() {
 
     auto loc = dma.getLoc();
     builder.setInsertionPoint(dma);
-    auto loopN = builder.create<affine::AffineForOp>(loc, 0, tileSizeN, vectorlane);
+    auto loopN = builder.create<affine::AffineForOp>(loc, 0, tileSizeN, subTileSizeM);
     loopN->setAttr("inner_loop", builder.getBoolAttr(true));
     builder.setInsertionPointToStart(loopN.getBody());
     j = loopN.getInductionVar();
-    auto loopM = builder.create<affine::AffineForOp>(loc, 0, tileSizeM, vectorlane);
+    auto loopM = builder.create<affine::AffineForOp>(loc, 0, tileSizeM, subTileSizeN);
     loopM->setAttr("inner_loop", builder.getBoolAttr(true));
     builder.setInsertionPointToStart(loopM.getBody());
     i = loopM.getInductionVar();
@@ -178,44 +227,20 @@ void DmaFineGrained::runOnOperation() {
     tag_indices.clear();
   }
 
-
-  affine::AffineDmaStartOp dma1 = dmaOps[0 + is_bias];
-  affine::AffineDmaStartOp dma2 = dmaOps[1 + is_bias];
-  affine::AffineDmaStartOp dma3 = dmaOps[2 + is_bias];
-  llvm::SmallVector<mlir::Attribute, 2> dma1Subtile = getSubtileSize(dma1);
-  llvm::SmallVector<mlir::Attribute, 2> dma2Subtile = getSubtileSize(dma2);
-  llvm::SmallVector<mlir::Attribute, 2> dma3Subtile = getSubtileSize(dma3);
-  int dma1Async = getAsyncValue(dma1);
-  int dma2Async = getAsyncValue(dma2);
-  int dma3Async = getAsyncValue(dma3);
-  NamedAttrList dma1Attr;
-  NamedAttrList dma2Attr;
-  NamedAttrList dma3Attr;
-
-  if (dma1Subtile.size())
-    dma1Attr.set("subtile_size", builder.getArrayAttr(dma1Subtile));
-  if (dma2Subtile.size())
-    dma2Attr.set("subtile_size", builder.getArrayAttr(dma2Subtile));
-  if (dma3Subtile.size())
-    dma3Attr.set("subtile_size", builder.getArrayAttr(dma3Subtile));
-  dma1Attr.set("async", builder.getIntegerAttr(builder.getI1Type(), dma1Async));
-  dma2Attr.set("async", builder.getIntegerAttr(builder.getI1Type(), dma2Async));
-  dma3Attr.set("async", builder.getIntegerAttr(builder.getI1Type(), dma3Async));
-
   // Get insertion point for new loops
   auto loc = dma1.getLoc();
   builder.setInsertionPoint(dma1);
 
   // Create three nested affine.for loops
-  auto loopN = builder.create<affine::AffineForOp>(loc, 0, tileSizeN, vectorlane);
+  auto loopN = builder.create<affine::AffineForOp>(loc, 0, tileSizeN, subTileSizeN);
   loopN->setAttr("inner_loop", builder.getBoolAttr(true));
   builder.setInsertionPointToStart(loopN.getBody());
   j = loopN.getInductionVar();
-  auto loopK = builder.create<affine::AffineForOp>(loc, 0, tileSizeK, tileSizeK);
+  auto loopK = builder.create<affine::AffineForOp>(loc, 0, tileSizeK, subTileSizeK);
   loopK->setAttr("inner_loop", builder.getBoolAttr(true));
   builder.setInsertionPointToStart(loopK.getBody());
   k = loopK.getInductionVar();
-  auto loopM = builder.create<affine::AffineForOp>(loc, 0, tileSizeM, vectorlane);
+  auto loopM = builder.create<affine::AffineForOp>(loc, 0, tileSizeM, subTileSizeM);
   loopM->setAttr("inner_loop", builder.getBoolAttr(true));
   builder.setInsertionPointToStart(loopM.getBody());
   i = loopM.getInductionVar();
