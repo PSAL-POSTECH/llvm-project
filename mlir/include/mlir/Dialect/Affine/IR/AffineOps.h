@@ -95,12 +95,12 @@ class AffineDmaStartOp
 public:
   using Op::Op;
   static ArrayRef<StringRef> getAttributeNames() { return {}; }
-
   static void build(OpBuilder &builder, OperationState &result, Value srcMemRef,
                     AffineMap srcMap, ValueRange srcIndices, Value destMemRef,
                     AffineMap dstMap, ValueRange destIndices, Value tagMemRef,
                     AffineMap tagMap, ValueRange tagIndices, Value numElements,
-                    Value stride = nullptr, Value elementsPerStride = nullptr);
+                    Value stride = nullptr, Value elementsPerStride = nullptr,
+                    mlir::NamedAttrList attribute = mlir::NamedAttrList());
 
   /// Returns the operand index of the source memref.
   unsigned getSrcMemRefOperandIndex() { return 0; }

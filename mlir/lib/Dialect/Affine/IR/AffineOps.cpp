@@ -1543,7 +1543,8 @@ void AffineDmaStartOp::build(OpBuilder &builder, OperationState &result,
                              AffineMap dstMap, ValueRange destIndices,
                              Value tagMemRef, AffineMap tagMap,
                              ValueRange tagIndices, Value numElements,
-                             Value stride, Value elementsPerStride) {
+                             Value stride, Value elementsPerStride,
+                             mlir::NamedAttrList attributes) {
   result.addOperands(srcMemRef);
   result.addAttribute(getSrcMapAttrStrName(), AffineMapAttr::get(srcMap));
   result.addOperands(srcIndices);
@@ -1557,6 +1558,8 @@ void AffineDmaStartOp::build(OpBuilder &builder, OperationState &result,
   if (stride) {
     result.addOperands({stride, elementsPerStride});
   }
+  for (auto attr : attributes)
+      result.addAttribute(attr.getName(), attr.getValue());
 }
 
 void AffineDmaStartOp::print(OpAsmPrinter &p) {
@@ -1573,6 +1576,23 @@ void AffineDmaStartOp::print(OpAsmPrinter &p) {
   }
   p << " : " << getSrcMemRefType() << ", " << getDstMemRefType() << ", "
     << getTagMemRefType();
+
+  bool first = true;
+  p << " {";
+  for (auto attr : getOperation()->getAttrs()) {
+    static StringRef excludedKeys[] = {"src_map", "dst_map", "tag_map"};
+    if (llvm::is_contained(excludedKeys, attr.getName()))
+      continue;
+
+    if (first) {
+      first = false;
+    } else {
+      p << ", ";
+    }
+    p << attr.getName() << " = ";
+    attr.getValue().print(p.getStream());
+  }
+  p << "}";
 }
 
 // Parse AffineDmaStartOp.
@@ -1630,7 +1650,6 @@ ParseResult AffineDmaStartOp::parse(OpAsmParser &parser,
 
   if (parser.parseColonTypeList(types))
     return failure();
-
   if (types.size() != 3)
     return parser.emitError(parser.getNameLoc(), "expected three types");
 
@@ -1654,6 +1673,10 @@ ParseResult AffineDmaStartOp::parse(OpAsmParser &parser,
       tagMapOperands.size() != tagMapAttr.getValue().getNumInputs())
     return parser.emitError(parser.getNameLoc(),
                             "memref operand count not equal to map.numInputs");
+
+  if (parser.parseOptionalAttrDict(result.attributes))
+    return parser.emitError(parser.getCurrentLocation(), "failed to parse attribute dictionary");
+
   return success();
 }
 
