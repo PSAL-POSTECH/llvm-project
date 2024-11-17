@@ -247,8 +247,8 @@ struct MatmulOpLowering : public OpRewritePattern<linalg::MatmulOp> {
     }
     auto ATagMap = rewriter.getMultiDimIdentityMap(llvm::dyn_cast<MemRefType>(ADmaTag.getType()).getRank());
     auto BTagMap = rewriter.getMultiDimIdentityMap(llvm::dyn_cast<MemRefType>(BDmaTag.getType()).getRank());
-    rewriter.create<affine::AffineDmaWaitOp>(loc, ADmaTag, ATagMap, ValueRange{c0, k_idx, m_idx}, numElements);
-    rewriter.create<affine::AffineDmaWaitOp>(loc, BDmaTag, BTagMap, ValueRange{n_idx, k_idx, c0}, numElements);
+    rewriter.create<affine::AffineDmaWaitOp>(loc, ADmaTag, ATagMap, ValueRange{c0, c0, m_idx}, numElements);
+    rewriter.create<affine::AffineDmaWaitOp>(loc, BDmaTag, BTagMap, ValueRange{n_idx, c0, c0}, numElements);
     if (BiasDmaTag) {
       /* Bias could be 1D or 2D */
       Value first_index = BiasDMAIndices[0].getDefiningOp<mlir::arith::ConstantIndexOp>() ? c0 : n_idx;
