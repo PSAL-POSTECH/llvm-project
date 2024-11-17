@@ -70,6 +70,8 @@ struct TestTileOperationGraph
   void processDramIndices(mlir::Value value,
                         std::map<std::string, int> &loop_index_list,
                         llvm::DenseMap<void *, std::string> &loop_var_name);
+  llvm::SmallVector<mlir::Attribute, 2> getSubtileSize(mlir::Operation *operation);
+  int getAsyncValue(mlir::Operation *operation);
   int nr_loop = 0;
   llvm::DenseMap<void*, std::string> loop_var_name;
 };
@@ -153,6 +155,7 @@ void TestTileOperationGraph::printOperation(Operation &op, TOGNode *node) {
     std::string address = "arg";
     int element_size = 0;
     bool is_write;
+    bool dmaAsync = (bool)getAsyncValue(dma_op);
     auto dst_space = dma_op.getDstMemorySpace();
     auto src_space = dma_op.getSrcMemorySpace();
     MemRefType tile_memref_type;
@@ -161,9 +164,10 @@ void TestTileOperationGraph::printOperation(Operation &op, TOGNode *node) {
     std::vector<std::string> loop_index_list;
     std::vector<std::string> tag_index_list;
     std::map<std::string, int> loop_index_map;
-    Value num_elt_per_stride = dma_op.getNumElementsPerStride();
-    uint64_t chunk_size = extractConstantIntValue(num_elt_per_stride);
-    int is_fine_grained = (chunk_size >> 31) & 1;
+    llvm::SmallVector<int64_t, 2> dmaSubtileValues;
+    for (auto attr : getSubtileSize(dma_op))
+      if (auto intAttr = llvm::dyn_cast<mlir::IntegerAttr>(attr))
+        dmaSubtileValues.push_back(intAttr.getInt());
 
     if (dst_space == 0 && src_space == 1) {
       is_write = true;
@@ -195,8 +199,8 @@ void TestTileOperationGraph::printOperation(Operation &op, TOGNode *node) {
     } else {
       op.emitError() << "Unexpected dram buffer argument: " << dram_memref << "\n";
     }
-    std::vector<int64_t> vec = {VECTOR_LANE, VECTOR_LANE};
-    auto tile_shape = is_fine_grained? llvm::ArrayRef<int64_t> (vec) : tile_memref_type.getShape();
+    // Select tile or subtile
+    auto tile_shape = dmaSubtileValues.size()? dmaSubtileValues : tile_memref_type.getShape();
 
     /* Extract destination tile size */
     for (int64_t iter: tile_shape)
@@ -235,7 +239,7 @@ void TestTileOperationGraph::printOperation(Operation &op, TOGNode *node) {
     }
 
     TOGDMANode *tog_dma = new TOGDMANode("DMANode", address, stride_list, tile_size,
-                                         element_size, is_write, tag_index_list, loop_index_list);
+                                         element_size, is_write, dmaAsync, tag_index_list, loop_index_list);
     tog_dma->setOp(&op);
     /* Link child and parent */
     node->addChild(tog_dma);
@@ -462,6 +466,37 @@ void TestTileOperationGraph::processDramIndices(mlir::Value value,
   }
 }
 
+llvm::SmallVector<mlir::Attribute, 2> TestTileOperationGraph::getSubtileSize(mlir::Operation *operation) {
+  llvm::SmallVector<mlir::Attribute, 2> subtileSizes;
+  auto attr = operation->getAttr("subtile_size");
+  if (!attr) {
+    llvm::errs() << "'subtile_size' attribute is not set.\n";
+    return subtileSizes; // Return empty SmallVector
+  }
+
+  if (auto arrayAttr = llvm::dyn_cast<mlir::ArrayAttr>(attr)) {
+    for (auto element : arrayAttr) {
+      // Assume the elements are integers
+      if (auto intAttr = llvm::dyn_cast<mlir::IntegerAttr>(element)) {
+        subtileSizes.push_back(intAttr);
+      } else {
+        llvm::errs() << "Unsupported element type in 'subtile_size'.\n";
+      }
+    }
+  }
+  return subtileSizes;
+}
+
+int TestTileOperationGraph::getAsyncValue(mlir::Operation *operation) {
+  auto attr = operation->getAttr("async");
+  if (!attr)
+    return 0;
+
+  if (auto intAttr = llvm::dyn_cast<mlir::IntegerAttr>(attr))
+    return intAttr.getInt(); // Treat non-zero as true
+  else
+    return 1;
+}
 namespace mlir {
 namespace test {
 void registerTestTileOperationGraphPass() { PassRegistration<TestTileOperationGraph>(); }
