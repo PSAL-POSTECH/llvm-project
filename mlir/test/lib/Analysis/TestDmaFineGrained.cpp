@@ -45,6 +45,8 @@ struct DmaFineGrained : public PassWrapper<DmaFineGrained, OperationPass<func::F
                           llvm::cl::desc("Tile size for M, N, K"),
                           llvm::cl::ZeroOrMore};
   void runOnOperation() override;
+  llvm::SmallVector<mlir::Attribute, 2> getSubtileSize(mlir::Operation *operation);
+  int getAsyncValue(mlir::Operation *operation);
 };
 
 } // namespace
@@ -65,7 +67,7 @@ void DmaFineGrained::runOnOperation() {
   builder.setInsertionPointToStart(&func.front());
   Value zeroIndex = builder.create<arith::ConstantIndexOp>(func.getLoc(), 0);
   auto c_set = builder.create<arith::ConstantIndexOp>(func.getLoc(), 2147483650);
-  auto tagMemRefType = MemRefType::get({tileSizeN / vectorlane, tileSizeK / vectorlane, tileSizeM / vectorlane}, builder.getIntegerType(32));
+  auto tagMemRefType = MemRefType::get({tileSizeN / vectorlane, 1, tileSizeM / vectorlane}, builder.getIntegerType(32));
   auto BtagMemRefType = MemRefType::get({tileSizeN / vectorlane, tileSizeM / vectorlane}, builder.getIntegerType(32));
   auto XtagMemRef = builder.create<memref::AllocOp>(func.getLoc(), tagMemRefType);
   auto WtagMemRef = builder.create<memref::AllocOp>(func.getLoc(), tagMemRefType);
@@ -117,6 +119,14 @@ void DmaFineGrained::runOnOperation() {
     // BIAS MVIN
     // reset builder location
     affine::AffineDmaStartOp dma = dmaOps[0];
+    llvm::SmallVector<mlir::Attribute, 2> dmaSubtile = getSubtileSize(dma);
+    int dmaAsync = getAsyncValue(dma);
+    NamedAttrList dmaAttr;
+    if (dmaSubtile.size()) {
+      dmaAttr.set("subtile_size", builder.getArrayAttr(dmaSubtile));
+    }
+    dmaAttr.set("async", builder.getBoolAttr(dmaAsync));
+
     auto loc = dma.getLoc();
     builder.setInsertionPoint(dma);
     auto loopN = builder.create<affine::AffineForOp>(loc, 0, tileSizeN, vectorlane);
@@ -161,7 +171,7 @@ void DmaFineGrained::runOnOperation() {
         loc, dma.getSrcMemRef(), src_map, src_indices,
         dma.getDstMemRef(), dst_map, dst_indices,
         BtagMemRef, tag_map, tag_indices,
-        dma.getNumElements(), dma.getStride(), new_set);
+        dma.getNumElements(), dma.getStride(), new_set, dmaAttr);
     dma.erase();
     src_indices.clear();
     dst_indices.clear();
@@ -171,6 +181,27 @@ void DmaFineGrained::runOnOperation() {
 
   affine::AffineDmaStartOp dma1 = dmaOps[0 + is_bias];
   affine::AffineDmaStartOp dma2 = dmaOps[1 + is_bias];
+  affine::AffineDmaStartOp dma3 = dmaOps[2 + is_bias];
+  llvm::SmallVector<mlir::Attribute, 2> dma1Subtile = getSubtileSize(dma1);
+  llvm::SmallVector<mlir::Attribute, 2> dma2Subtile = getSubtileSize(dma2);
+  llvm::SmallVector<mlir::Attribute, 2> dma3Subtile = getSubtileSize(dma3);
+  int dma1Async = getAsyncValue(dma1);
+  int dma2Async = getAsyncValue(dma2);
+  int dma3Async = getAsyncValue(dma3);
+  NamedAttrList dma1Attr;
+  NamedAttrList dma2Attr;
+  NamedAttrList dma3Attr;
+
+  if (dma1Subtile.size())
+    dma1Attr.set("subtile_size", builder.getArrayAttr(dma1Subtile));
+  if (dma2Subtile.size())
+    dma2Attr.set("subtile_size", builder.getArrayAttr(dma2Subtile));
+  if (dma3Subtile.size())
+    dma3Attr.set("subtile_size", builder.getArrayAttr(dma3Subtile));
+  dma1Attr.set("async", builder.getIntegerAttr(builder.getI1Type(), dma1Async));
+  dma2Attr.set("async", builder.getIntegerAttr(builder.getI1Type(), dma2Async));
+  dma3Attr.set("async", builder.getIntegerAttr(builder.getI1Type(), dma3Async));
+
   // Get insertion point for new loops
   auto loc = dma1.getLoc();
   builder.setInsertionPoint(dma1);
@@ -180,7 +211,7 @@ void DmaFineGrained::runOnOperation() {
   loopN->setAttr("inner_loop", builder.getBoolAttr(true));
   builder.setInsertionPointToStart(loopN.getBody());
   j = loopN.getInductionVar();
-  auto loopK = builder.create<affine::AffineForOp>(loc, 0, tileSizeK, vectorlane);
+  auto loopK = builder.create<affine::AffineForOp>(loc, 0, tileSizeK, tileSizeK);
   loopK->setAttr("inner_loop", builder.getBoolAttr(true));
   builder.setInsertionPointToStart(loopK.getBody());
   k = loopK.getInductionVar();
@@ -224,7 +255,7 @@ void DmaFineGrained::runOnOperation() {
       loc, dma1.getSrcMemRef(), src_map, src_indices,
       dma1.getDstMemRef(), dst_map, dst_indices,
       XtagMemRef, tag_map, tag_indices,
-      dma1.getNumElements(), dma1.getStride(), new_set);
+      dma1.getNumElements(), dma1.getStride(), new_set, dma1Attr);
 
   // Insert the second dma_start operation
   srcIndices = dma2.getSrcIndices();
@@ -263,7 +294,7 @@ void DmaFineGrained::runOnOperation() {
       loc, dma2.getSrcMemRef(), src_map, src_indices,
       dma2.getDstMemRef(), dst_map, dst_indices,
       WtagMemRef, tag_map, tag_indices,
-      dma2.getNumElements(), dma2.getStride(), new_set);
+      dma2.getNumElements(), dma2.getStride(), new_set, dma2Attr);
 
   // Erase the original dma_start operations
   dma1.erase();
@@ -271,7 +302,6 @@ void DmaFineGrained::runOnOperation() {
 
   //MVOUT
   // reset builder location
-  affine::AffineDmaStartOp dma3 = dmaOps[2 + is_bias];
   loc = dma3.getLoc();
   builder.setInsertionPoint(dma3);
   // Create two nested affine.for loops
@@ -314,8 +344,40 @@ void DmaFineGrained::runOnOperation() {
       loc, dma3.getSrcMemRef(), src_map, src_indices,
       dma3.getDstMemRef(), dst_map, dst_indices,
       dma3.getTagMemRef(), tag_map, tag_indices,
-      dma3.getNumElements(), dma3.getStride(), c_set);
+      dma3.getNumElements(), dma3.getStride(), c_set, dma3Attr);
   dma3.erase();
+}
+
+llvm::SmallVector<mlir::Attribute, 2> DmaFineGrained::getSubtileSize(mlir::Operation *operation) {
+  llvm::SmallVector<mlir::Attribute, 2> subtileSizes;
+  auto attr = operation->getAttr("subtile_size");
+  if (!attr) {
+    llvm::errs() << "'subtile_size' attribute is not set.\n";
+    return subtileSizes; // Return empty SmallVector
+  }
+
+  if (auto arrayAttr = llvm::dyn_cast<mlir::ArrayAttr>(attr)) {
+    for (auto element : arrayAttr) {
+      // Assume the elements are integers
+      if (auto intAttr = llvm::dyn_cast<mlir::IntegerAttr>(element)) {
+        subtileSizes.push_back(intAttr);
+      } else {
+        llvm::errs() << "Unsupported element type in 'subtile_size'.\n";
+      }
+    }
+  }
+  return subtileSizes;
+}
+
+int DmaFineGrained::getAsyncValue(mlir::Operation *operation) {
+  auto attr = operation->getAttr("async");
+  if (!attr)
+    return 0;
+
+  if (auto intAttr = llvm::dyn_cast<mlir::IntegerAttr>(attr))
+    return intAttr.getInt(); // Treat non-zero as true
+  else
+    return 1;
 }
 
 namespace mlir {
