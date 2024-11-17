@@ -488,7 +488,7 @@ mlir::AffineExpr TestLoopPadding::updateAffineExprWithBounds(mlir::AffineExpr ex
       llvm::errs() << "Failed to update dimension \"" << dimExpr << "\"";
       return dimExpr;
     } else if (auto constExpr = llvm::dyn_cast<mlir::AffineConstantExpr>(expr)) {
-      return mlir::getAffineConstantExpr(1, context);
+      return mlir::getAffineConstantExpr(constExpr.getValue(), context);
     }
     return expr; // Return the original expression if no specific case matches
   };
