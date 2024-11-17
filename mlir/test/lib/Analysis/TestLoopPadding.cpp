@@ -474,6 +474,16 @@ mlir::AffineExpr TestLoopPadding::updateAffineExprWithBounds(mlir::AffineExpr ex
       mlir::AffineExpr rhs = rebuildExprWithUpdatedCoefficients(binExpr.getRHS());
 
       auto result = binExpr.getKind() == mlir::AffineExprKind::Add ? lhs + rhs : lhs * rhs;
+      if (binExpr.getKind() == mlir::AffineExprKind::Add)
+        auto result =  lhs + rhs;
+      else {
+        if (auto constExpr = llvm::dyn_cast<mlir::AffineConstantExpr>(rhs)) {
+          return lhs;
+        } else {
+          return rhs;
+        }
+      }
+
       return result;
     } else if (auto dimExpr = llvm::dyn_cast<mlir::AffineDimExpr>(expr)) {
       for (const auto& entry : modifiedCoefficients) {
