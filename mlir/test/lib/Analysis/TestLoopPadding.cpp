@@ -632,26 +632,6 @@ void TestLoopPadding::createTimingWrapperFunction(mlir::ModuleOp module, mlir::O
       mlir::MemRefType paddedMemRefType = mlir::dyn_cast<mlir::MemRefType>(postMemRef.getType());
       auto allocOp = builder.create<mlir::memref::AllocOp>(
         builder.getUnknownLoc(), paddedMemRefType);
-      auto elementType = paddedMemRefType.getElementType();
-
-      // Create a constant 0.0f value
-      mlir::Value zero;
-      if (mlir::isa<mlir::FloatType>(elementType)) {
-        zero = builder.create<mlir::arith::ConstantOp>(
-          loc, mlir::FloatAttr::get(elementType, 0.0));
-      } else if (mlir::isa<mlir::IntegerType>(elementType)) {
-        zero = builder.create<mlir::arith::ConstantOp>(
-          loc, mlir::IntegerAttr::get(elementType, 0));
-      } else {
-        llvm::errs() << "Unsupported element type for initialization.\n";
-        return;
-      }
-
-      auto upperBound = paddedMemRefType.getShape()[0];
-      last = builder.create<affine::AffineForOp>(loc, 0, upperBound, 1);
-      builder.setInsertionPointToStart(last.getBody());
-      mlir::Value iv = last.getInductionVar();
-      builder.create<affine::AffineStoreOp>(loc, zero, allocOp, mlir::ValueRange{iv});
 
       padded_buffer[argIdx] = allocOp;
       usedMemRefs.insert(postMemRef.getAsOpaquePointer());
