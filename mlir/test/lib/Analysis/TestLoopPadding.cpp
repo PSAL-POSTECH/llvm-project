@@ -326,8 +326,8 @@ void TestLoopPadding::runOnOperation() {
 
   // Analysis post-padding info
   analysisDMAStartNode(function, postPaddingInfo);
-  for (auto i : postPaddingInfo)
-    i.printLog();
+  //for (auto i : postPaddingInfo)
+  //  i.printLog();
 
   // Create padding wrapper function
   mlir::OpBuilder builder(module.getContext());
@@ -693,7 +693,7 @@ void TestLoopPadding::createValidationWrapperFunction(mlir::ModuleOp module, mli
 
   // Declare global buffers
   builder.setInsertionPointToEnd(module.getBody());
-  for (size_t i = 0; i < (int)prePaddingInfo.size() && i < (int)postPaddingInfo.size(); ++i) {
+  for (size_t i = 0; i < prePaddingInfo.size() && i < postPaddingInfo.size(); ++i) {
     auto& postInfo = postPaddingInfo[i];
     auto& preInfo = prePaddingInfo[i];
 
