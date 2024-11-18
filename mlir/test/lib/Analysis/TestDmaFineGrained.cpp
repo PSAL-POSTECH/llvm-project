@@ -152,7 +152,6 @@ void DmaFineGrained::runOnOperation() {
   }
   subTileSizeM = llvm::dyn_cast<mlir::IntegerAttr>(dma1Subtile[0]).getInt();
   subTileSizeN = llvm::dyn_cast<mlir::IntegerAttr>(dma2Subtile[1]).getInt();
-  llvm::errs() << subTileSizeM << ", " << subTileSizeN << ", " << subTileSizeK << "\n";
 
   if (dma1Subtile.size())
     dma1Attr.set("subtile_size", builder.getArrayAttr(dma1Subtile));
@@ -377,7 +376,6 @@ llvm::SmallVector<mlir::Attribute, 2> DmaFineGrained::getSubtileSize(mlir::Opera
   llvm::SmallVector<mlir::Attribute, 2> subtileSizes;
   auto attr = operation->getAttr("subtile_size");
   if (!attr) {
-    llvm::errs() << "'subtile_size' attribute is not set.\n";
     return subtileSizes; // Return empty SmallVector
   }
 

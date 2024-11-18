@@ -62,7 +62,6 @@ llvm::SmallVector<int64_t, 2> getSubtileSize(mlir::Operation *operation) {
   operation->dump();
   auto attr = operation->getAttr("subtile_size");
   if (!attr) {
-    llvm::errs() << "'subtile_size' attribute is not set.\n";
     return subtileSizes; // Return empty SmallVector
   }
 
