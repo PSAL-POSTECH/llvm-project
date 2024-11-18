@@ -57,6 +57,39 @@ char* getAsmString(unsigned func7) {
   return result;
 }
 
+llvm::SmallVector<int64_t, 2> getSubtileSize(mlir::Operation *operation) {
+  llvm::SmallVector<int64_t, 2> subtileSizes;
+  operation->dump();
+  auto attr = operation->getAttr("subtile_size");
+  if (!attr) {
+    llvm::errs() << "'subtile_size' attribute is not set.\n";
+    return subtileSizes; // Return empty SmallVector
+  }
+
+  if (auto arrayAttr = llvm::dyn_cast<mlir::ArrayAttr>(attr)) {
+    for (auto element : arrayAttr) {
+      // Assume the elements are integers
+      if (auto intAttr = llvm::dyn_cast<mlir::IntegerAttr>(element)) {
+        subtileSizes.push_back(intAttr.getInt());
+      } else {
+        llvm::errs() << "Unsupported element type in 'subtile_size'.\n";
+      }
+    }
+  }
+  return subtileSizes;
+}
+
+int getAsyncValue(mlir::Operation *operation) {
+  auto attr = operation->getAttr("async");
+  if (!attr)
+    return 0;
+
+  if (auto intAttr = llvm::dyn_cast<mlir::IntegerAttr>(attr))
+    return intAttr.getInt(); // Treat non-zero as true
+  else
+    return 1;
+}
+
 /// Lowering memref.dma_start operation to Gemmini instructions with LLVM Asm.
 struct DmaWaitOpLowering : public ConvertOpToLLVMPattern<memref::DmaWaitOp> {
   int vectorlaneStride;
@@ -88,6 +121,7 @@ struct DmaStartOpLowering : public ConvertOpToLLVMPattern<memref::DmaStartOp> {
     const char* constraintStr = "r,r,~{dirflag},~{fpsr},~{flags}";
     auto loc = op.getLoc();
     unsigned func7;
+    llvm::SmallVector<int64_t, 2> dmaSubtile = getSubtileSize(op);
 
     SmallVector<Value> operands;
     for (auto val : adaptor.getOperands())
@@ -123,6 +157,7 @@ struct DmaStartOpLowering : public ConvertOpToLLVMPattern<memref::DmaStartOp> {
     Value rs1;
     Value spad_addr;
     llvm::ArrayRef<int64_t> tile_shape;
+    llvm::ArrayRef<int64_t> subtile_shape(dmaSubtile);
     bool is_mvin = dmaType == MVIN || dmaType == MVIN2 || dmaType == MVIN3;
 
     if (is_mvin) { // MVIN
@@ -134,26 +169,27 @@ struct DmaStartOpLowering : public ConvertOpToLLVMPattern<memref::DmaStartOp> {
       spad_addr = rewriter.create<LLVM::PtrToIntOp>(loc, rewriter.getI64Type(), SrcPtr);
       tile_shape = srcMemRefType.getShape();
     }
+    
+    /* Use subtile size if it has subtile attribute */
+    if (subtile_shape.size())
+      tile_shape = subtile_shape;
+
     func7 = dmaType;
     Value rows;
     Value cols;
     int col_factor = 1;
+    uint64_t tile_row;
+    uint64_t tile_col;
     if (elen < 8) {
       assert(cols >= 8);
       assert(chunk_size > 0);
       col_factor = 8 / elen;
       elen = 8;
     }
-    uint64_t tile_row;
-    uint64_t tile_col;
+
     if (tile_shape.size() == 2) {
-      if (is_fine_grained) {
-        tile_row = std::min(tile_shape[0], VECTOR_LANE);
-        tile_col = std::min((tile_shape[1] / col_factor), VECTOR_LANE);
-      } else {
-        tile_row = tile_shape[0];
-        tile_col = tile_shape[1];
-      }
+      tile_row = tile_shape[0];
+      tile_col = tile_shape[1];
       rows = rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(tile_row));
       cols = rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(tile_col));
     } else if (tile_shape.size() == 1) {
