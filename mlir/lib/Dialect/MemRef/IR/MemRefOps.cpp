@@ -1160,7 +1160,8 @@ void DmaStartOp::build(OpBuilder &builder, OperationState &result,
                        Value srcMemRef, ValueRange srcIndices, Value destMemRef,
                        ValueRange destIndices, Value numElements,
                        Value tagMemRef, ValueRange tagIndices, Value stride,
-                       Value elementsPerStride) {
+                       Value elementsPerStride,
+                       mlir::NamedAttrList attributes) {
   result.addOperands(srcMemRef);
   result.addOperands(srcIndices);
   result.addOperands(destMemRef);
@@ -1169,6 +1170,8 @@ void DmaStartOp::build(OpBuilder &builder, OperationState &result,
   result.addOperands(tagIndices);
   if (stride)
     result.addOperands({stride, elementsPerStride});
+  for (auto attr : attributes)
+    result.addAttribute(attr.getName(), attr.getValue());
 }
 
 void DmaStartOp::print(OpAsmPrinter &p) {
@@ -1181,6 +1184,23 @@ void DmaStartOp::print(OpAsmPrinter &p) {
   p.printOptionalAttrDict((*this)->getAttrs());
   p << " : " << getSrcMemRef().getType() << ", " << getDstMemRef().getType()
     << ", " << getTagMemRef().getType();
+
+  bool first = true;
+  p << " {";
+  for (auto attr : getOperation()->getAttrs()) {
+    static StringRef excludedKeys[] = {"src_map", "dst_map", "tag_map"};
+    if (llvm::is_contained(excludedKeys, attr.getName()))
+      continue;
+
+    if (first) {
+      first = false;
+    } else {
+      p << ", ";
+    }
+    p << attr.getName() << " = ";
+    attr.getValue().print(p.getStream());
+  }
+  p << "}";
 }
 
 // Parse DmaStartOp.
@@ -1247,6 +1267,9 @@ ParseResult DmaStartOp::parse(OpAsmParser &parser, OperationState &result) {
     if (parser.resolveOperands(strideInfo, indexType, result.operands))
       return failure();
   }
+
+  if (parser.parseOptionalAttrDict(result.attributes))
+    return parser.emitError(parser.getCurrentLocation(), "failed to parse attribute dictionary");
 
   return success();
 }

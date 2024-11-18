@@ -700,7 +700,8 @@ def MemRef_DmaStartOp : MemRef_Op<"dma_start"> {
                    "Value":$destMemRef, "ValueRange":$destIndices,
                    "Value":$numElements, "Value":$tagMemRef,
                    "ValueRange":$tagIndices, CArg<"Value", "{}">:$stride,
-                   CArg<"Value", "{}">:$elementsPerStride)>
+                   CArg<"Value", "{}">:$elementsPerStride,
+                   CArg<"mlir::NamedAttrList", "{}">:$attribute)>
   ];
 
   let extraClassDeclaration = [{

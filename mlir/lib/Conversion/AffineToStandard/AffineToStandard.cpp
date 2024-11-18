@@ -445,12 +445,17 @@ public:
         operandsRef.drop_front(op.getTagMemRefOperandIndex() + 1));
     if (!maybeExpandedTagMap)
       return failure();
-
     // Build memref.dma_start operation with affine map results.
-    rewriter.replaceOpWithNewOp<memref::DmaStartOp>(
+    auto dmaOp = rewriter.replaceOpWithNewOp<memref::DmaStartOp>(
         op, op.getSrcMemRef(), *maybeExpandedSrcMap, op.getDstMemRef(),
         *maybeExpandedDstMap, op.getNumElements(), op.getTagMemRef(),
         *maybeExpandedTagMap, op.getStride(), op.getNumElementsPerStride());
+    auto subTileAttr = op->getAttr("subtile_size");
+    auto asyncAttr = op->getAttr("async");
+    if (subTileAttr)
+      dmaOp->setAttr("subtile_size", subTileAttr);
+    if (asyncAttr)
+      dmaOp->setAttr("async", asyncAttr);
     return success();
   }
 };
