@@ -1184,23 +1184,6 @@ void DmaStartOp::print(OpAsmPrinter &p) {
   p.printOptionalAttrDict((*this)->getAttrs());
   p << " : " << getSrcMemRef().getType() << ", " << getDstMemRef().getType()
     << ", " << getTagMemRef().getType();
-
-  bool first = true;
-  p << " {";
-  for (auto attr : getOperation()->getAttrs()) {
-    static StringRef excludedKeys[] = {"src_map", "dst_map", "tag_map"};
-    if (llvm::is_contained(excludedKeys, attr.getName()))
-      continue;
-
-    if (first) {
-      first = false;
-    } else {
-      p << ", ";
-    }
-    p << attr.getName() << " = ";
-    attr.getValue().print(p.getStream());
-  }
-  p << "}";
 }
 
 // Parse DmaStartOp.
