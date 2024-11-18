@@ -58,24 +58,25 @@ std::pair<Value, bool> getDramMemRef(mlir::affine::AffineDmaStartOp dmaOp) {
 class MemRefAffineMapForOps {
 private:
   mlir::Value memRef;                            // Single memref
-  mlir::AffineMap affineMap;                     // Single affine map
+  std::vector<mlir::AffineMap> affineMap;        // Single affine map
   std::vector<std::tuple<int64_t, int64_t, int64_t>> loopRange;   // Multiple AffineForOp loops
   bool is_write;
 public:
   MemRefAffineMapForOps(mlir::Value memRef, affine::AffineApplyOp applyOp, bool is_write) : memRef(memRef), is_write(is_write) {
-    affineMap = applyOp.getAffineMap();
+    affineMap.push_back(applyOp.getAffineMap());
     addLoopsFromApplyOp(applyOp);
   }
   MemRefAffineMapForOps(mlir::Value memRef, affine::AffineForOp affineForOp, bool is_write) : memRef(memRef), is_write(is_write) {
     mlir::MLIRContext *context = memRef.getContext();
     mlir::AffineExpr d0 = mlir::getAffineDimExpr(0, context); // Represents d0
     mlir::AffineMap identityMap = mlir::AffineMap::get(1, 0, d0);
-    affineMap = identityMap;
+    affineMap.push_back(identityMap);
     addLoopFromAffineFor(affineForOp);
   }
   void addLoopRange(std::tuple<int64_t, int64_t, int64_t>& loop) { loopRange.push_back(loop); }
   mlir::Value getMemRef() const { return memRef; }
-  mlir::AffineMap getAffineMap() const { return affineMap; }
+  const std::vector<mlir::AffineMap>& getAffineMap() const { return affineMap; }
+  void addAffineMap(mlir::AffineMap map) { affineMap.push_back(map); }
   const std::vector<std::tuple<int64_t, int64_t, int64_t>>& getLoopRange() const { return loopRange; }
   void clearLoopRange() { loopRange.clear(); }
   void addLoopsFromApplyOp(affine::AffineApplyOp applyOp);
@@ -100,7 +101,8 @@ public:
       llvm::errs() << "  MemRef: " << memRef << "\n";
     else
       llvm::errs() << "  MemRef: Not set\n";
-    llvm::errs() << "  AffineMap: " << affineMap << "\n";
+    for (auto& afMap : affineMap)
+      llvm::errs() << "  AffineMap: " << afMap << "\n";
     llvm::errs() << "  loopRange (" << loopRange.size() << " loops):\n";
     for (auto &iter : loopRange) {
       llvm::errs() << "    Loop Lower " << std::get<0>(iter) << "\n";
@@ -242,7 +244,7 @@ void TestLoopPadding::runOnOperation() {
         dmaOpExpr[dmaOp.getAsOpaquePointer()] = expr;
       }
     });
-
+    std::vector<Value> memRefSet;
     //llvm::errs() << "=============updated axis===========\n";
     function.walk([&](mlir::affine::AffineDmaStartOp dmaOp) {
       auto result = getDramMemRef(dmaOp);
@@ -276,10 +278,12 @@ void TestLoopPadding::runOnOperation() {
       }
       if (!isAffected)
         return;
-
-      // Padding memref and update the function signature to match the new padded memref types
-      modifyMemrefWithPadding(dram_memref, upperBound, paddedUpperBound);
-      updateFunctionSignatureWithMemRef(function, dram_memref);
+      if (std::find(memRefSet.begin(), memRefSet.end(), dram_memref) == memRefSet.end()) {
+        // Padding memref and update the function signature to match the new padded memref types
+        modifyMemrefWithPadding(dram_memref, upperBound, paddedUpperBound);
+        updateFunctionSignatureWithMemRef(function, dram_memref);
+        memRefSet.push_back(dram_memref);
+      }
 
       for (auto operand : dmaOp.getOperands()) {
         int expr_idx = 0;
@@ -322,8 +326,8 @@ void TestLoopPadding::runOnOperation() {
 
   // Analysis post-padding info
   analysisDMAStartNode(function, postPaddingInfo);
-  //for (auto i : postPaddingInfo)
-  //  i.printLog();
+  for (auto i : postPaddingInfo)
+    i.printLog();
 
   // Create padding wrapper function
   mlir::OpBuilder builder(module.getContext());
@@ -554,9 +558,23 @@ void TestLoopPadding::analysisDMAStartNode(
     Value dram_memref = result.first;
     bool is_write = result.second;
 
-    for (const auto &existingInfo : targetBuffer) {
+    for (auto &existingInfo : targetBuffer) {
       if (existingInfo.getMemRef() == dram_memref) {
-        return;
+        for (auto operand : dmaOp.getOperands()) {
+          if (auto applyOp = operand.getDefiningOp<mlir::affine::AffineApplyOp>()) {
+            existingInfo.addAffineMap(applyOp.getAffineMap());
+            return;
+          } else if (auto blockArg = llvm::dyn_cast<mlir::BlockArgument>(operand)) {
+            auto definingOp = blockArg.getOwner()->getParentOp();
+            if (auto affineForOp = llvm::dyn_cast<mlir::affine::AffineForOp>(definingOp)) {
+              mlir::MLIRContext *context = dram_memref.getContext();
+              mlir::AffineExpr d0 = mlir::getAffineDimExpr(0, context); // Represents d0
+              mlir::AffineMap identityMap = mlir::AffineMap::get(1, 0, d0);
+              existingInfo.addAffineMap(identityMap);
+              return;
+            }
+          }
+        }
       }
     }
 
@@ -675,7 +693,7 @@ void TestLoopPadding::createValidationWrapperFunction(mlir::ModuleOp module, mli
 
   // Declare global buffers
   builder.setInsertionPointToEnd(module.getBody());
-  for (size_t i = 0; i < prePaddingInfo.size() && i < postPaddingInfo.size(); ++i) {
+  for (size_t i = 0; i < (int)prePaddingInfo.size() && i < (int)postPaddingInfo.size(); ++i) {
     auto& postInfo = postPaddingInfo[i];
     auto& preInfo = prePaddingInfo[i];
 
@@ -713,8 +731,8 @@ void TestLoopPadding::createValidationWrapperFunction(mlir::ModuleOp module, mli
     auto& postInfo = postPaddingInfo[i];
 
     mlir::SmallVector<mlir::Value, 2> mapOperands;
-    AffineMap preAffineMap = preInfo.getAffineMap();
-    AffineMap postAffineMap = postInfo.getAffineMap();
+    std::vector<AffineMap> preAffineMap = preInfo.getAffineMap();
+    std::vector<AffineMap> postAffineMap = postInfo.getAffineMap();
     builder.setInsertionPointToEnd(entryBlock);
     mlir::Value preMemRef = preInfo.getMemRef();
     auto blockArg = mlir::cast<mlir::BlockArgument>(preMemRef);
@@ -737,16 +755,18 @@ void TestLoopPadding::createValidationWrapperFunction(mlir::ModuleOp module, mli
       loc = last.getLoc();
     }
     if (mapOperands.size()) {
-      auto preApplyOp = builder.create<affine::AffineApplyOp>(last.getLoc(), preAffineMap, mapOperands);
-      mlir::Value preResultIndex = preApplyOp.getResult();
-      auto loadedValue = builder.create<affine::AffineLoadOp>(preApplyOp.getLoc(), argValue, preResultIndex);
+      for (int i=0; i<(int)preAffineMap.size(); i++) {
+        auto preApplyOp = builder.create<affine::AffineApplyOp>(last.getLoc(), preAffineMap.at(i), mapOperands);
+        mlir::Value preResultIndex = preApplyOp.getResult();
+        auto loadedValue = builder.create<affine::AffineLoadOp>(preApplyOp.getLoc(), argValue, preResultIndex);
 
-      /* Get Global */
-      auto loadedMemRef = builder.create<mlir::memref::GetGlobalOp>(
-        loadedValue.getLoc(), globalMemRefOp.getType(), globalMemRefOp.getName());
-      auto postApplyOp = builder.create<affine::AffineApplyOp>(loadedValue.getLoc(), postAffineMap, mapOperands);
-      mlir::Value postResultIndex = postApplyOp.getResult();
-      builder.create<affine::AffineStoreOp>(postApplyOp.getLoc(), loadedValue, loadedMemRef, postResultIndex);
+        /* Get Global */
+        auto loadedMemRef = builder.create<mlir::memref::GetGlobalOp>(
+          loadedValue.getLoc(), globalMemRefOp.getType(), globalMemRefOp.getName());
+        auto postApplyOp = builder.create<affine::AffineApplyOp>(loadedValue.getLoc(), postAffineMap.at(i), mapOperands);
+        mlir::Value postResultIndex = postApplyOp.getResult();
+        builder.create<affine::AffineStoreOp>(postApplyOp.getLoc(), loadedValue, loadedMemRef, postResultIndex);
+      }
     }
   }
 
@@ -774,8 +794,8 @@ void TestLoopPadding::createValidationWrapperFunction(mlir::ModuleOp module, mli
     auto& postInfo = postPaddingInfo[i];
 
     mlir::SmallVector<mlir::Value, 2> mapOperands;
-    AffineMap preAffineMap = preInfo.getAffineMap();
-    AffineMap postAffineMap = postInfo.getAffineMap();
+    std::vector<AffineMap> preAffineMap = preInfo.getAffineMap();
+    std::vector<AffineMap> postAffineMap = postInfo.getAffineMap();
     builder.setInsertionPointToEnd(entryBlock);
     mlir::Value preMemRef = preInfo.getMemRef();
     auto blockArg = mlir::cast<mlir::BlockArgument>(preMemRef);
@@ -799,16 +819,17 @@ void TestLoopPadding::createValidationWrapperFunction(mlir::ModuleOp module, mli
     }
     if (mapOperands.size()) {
       /* Get Global */
-      auto loadedMemRef = builder.create<mlir::memref::GetGlobalOp>(
-        loc, globalMemRefOp.getType(), globalMemRefOp.getName());
-      auto postApplyOp = builder.create<affine::AffineApplyOp>(loadedMemRef.getLoc(), postAffineMap, mapOperands);
-      mlir::Value postResultIndex = postApplyOp.getResult();
-      auto loadedValue = builder.create<affine::AffineLoadOp>(postApplyOp.getLoc(), loadedMemRef, postResultIndex);
-
-      auto preApplyOp = builder.create<affine::AffineApplyOp>(loadedValue.getLoc(), preAffineMap, mapOperands);
-      mlir::Value preResultIndex = preApplyOp.getResult();
-      builder.create<affine::AffineStoreOp>(preApplyOp.getLoc(), loadedValue, argValue, preResultIndex);
-   }
+      for (int i=0; i<(int)preAffineMap.size(); i++) {
+        auto loadedMemRef = builder.create<mlir::memref::GetGlobalOp>(
+          loc, globalMemRefOp.getType(), globalMemRefOp.getName());
+        auto postApplyOp = builder.create<affine::AffineApplyOp>(loadedMemRef.getLoc(), postAffineMap.at(i), mapOperands);
+        mlir::Value postResultIndex = postApplyOp.getResult();
+        auto loadedValue = builder.create<affine::AffineLoadOp>(postApplyOp.getLoc(), loadedMemRef, postResultIndex);
+        auto preApplyOp = builder.create<affine::AffineApplyOp>(loadedValue.getLoc(), preAffineMap.at(i), mapOperands);
+        mlir::Value preResultIndex = preApplyOp.getResult();
+        builder.create<affine::AffineStoreOp>(preApplyOp.getLoc(), loadedValue, argValue, preResultIndex);
+      }
+    }
   }
 
   // Add a return operation to the wrapper function
