@@ -47,6 +47,7 @@ struct DmaFineGrained : public PassWrapper<DmaFineGrained, OperationPass<func::F
   void runOnOperation() override;
   llvm::SmallVector<mlir::Attribute, 2> getSubtileSize(mlir::Operation *operation);
   int getAsyncValue(mlir::Operation *operation);
+  int is_transpose(mlir::Operation *operation);
 };
 
 } // namespace
@@ -123,6 +124,7 @@ void DmaFineGrained::runOnOperation() {
   int dma1Async = getAsyncValue(dma1);
   int dma2Async = getAsyncValue(dma2);
   int dma3Async = getAsyncValue(dma3);
+
   NamedAttrList dma1Attr;
   NamedAttrList dma2Attr;
   NamedAttrList dma3Attr;
@@ -162,6 +164,9 @@ void DmaFineGrained::runOnOperation() {
   dma1Attr.set("async", builder.getIntegerAttr(builder.getI1Type(), dma1Async));
   dma2Attr.set("async", builder.getIntegerAttr(builder.getI1Type(), dma2Async));
   dma3Attr.set("async", builder.getIntegerAttr(builder.getI1Type(), dma3Async));
+  dma1Attr.set("transpose", builder.getIntegerAttr(builder.getI1Type(), is_transpose(dma1)));
+  dma2Attr.set("transpose", builder.getIntegerAttr(builder.getI1Type(), is_transpose(dma2)));
+  dma3Attr.set("transpose", builder.getIntegerAttr(builder.getI1Type(), is_transpose(dma3)));
 
   if (is_bias) {
     // BIAS MVIN
@@ -174,6 +179,7 @@ void DmaFineGrained::runOnOperation() {
       dmaAttr.set("subtile_size", builder.getArrayAttr(dmaSubtile));
     }
     dmaAttr.set("async", builder.getBoolAttr(dmaAsync));
+    dmaAttr.set("transpose", builder.getBoolAttr(is_transpose(dma)));
 
     auto loc = dma.getLoc();
     builder.setInsertionPoint(dma);
@@ -394,6 +400,17 @@ llvm::SmallVector<mlir::Attribute, 2> DmaFineGrained::getSubtileSize(mlir::Opera
 
 int DmaFineGrained::getAsyncValue(mlir::Operation *operation) {
   auto attr = operation->getAttr("async");
+  if (!attr)
+    return 0;
+
+  if (auto intAttr = llvm::dyn_cast<mlir::IntegerAttr>(attr))
+    return intAttr.getInt(); // Treat non-zero as true
+  else
+    return 1;
+}
+
+int DmaFineGrained::is_transpose(mlir::Operation *operation) {
+  auto attr = operation->getAttr("transpose");
   if (!attr)
     return 0;
 

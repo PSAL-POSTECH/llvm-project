@@ -59,7 +59,6 @@ char* getAsmString(unsigned func7) {
 
 llvm::SmallVector<int64_t, 2> getSubtileSize(mlir::Operation *operation) {
   llvm::SmallVector<int64_t, 2> subtileSizes;
-  operation->dump();
   auto attr = operation->getAttr("subtile_size");
   if (!attr) {
     return subtileSizes; // Return empty SmallVector
@@ -80,6 +79,17 @@ llvm::SmallVector<int64_t, 2> getSubtileSize(mlir::Operation *operation) {
 
 int getAsyncValue(mlir::Operation *operation) {
   auto attr = operation->getAttr("async");
+  if (!attr)
+    return 0;
+
+  if (auto intAttr = llvm::dyn_cast<mlir::IntegerAttr>(attr))
+    return intAttr.getInt(); // Treat non-zero as true
+  else
+    return 1;
+}
+
+int is_transpose(mlir::Operation *operation) {
+  auto attr = operation->getAttr("transpose");
   if (!attr)
     return 0;
 
@@ -121,6 +131,7 @@ struct DmaStartOpLowering : public ConvertOpToLLVMPattern<memref::DmaStartOp> {
     auto loc = op.getLoc();
     unsigned func7;
     llvm::SmallVector<int64_t, 2> dmaSubtile = getSubtileSize(op);
+    bool is_transposed = is_transpose(op);
 
     SmallVector<Value> operands;
     for (auto val : adaptor.getOperands())
@@ -150,7 +161,8 @@ struct DmaStartOpLowering : public ConvertOpToLLVMPattern<memref::DmaStartOp> {
     uint64_t chunk_size = extractConstantIntValue(num_elt_per_stride);
     bool is_col_major = chunk_size % 2;
     int is_fine_grained = (chunk_size >> 31) & 1;
-    chunk_size = ((chunk_size / 2) & 0x7FFF) * elen / 8;
+    chunk_size = ((chunk_size / 2) & 0x7FFF);
+    uint64_t chunk_size_byte = chunk_size * elen / 8;
     Value numElements = op.getNumElements();
     int dmaType = extractConstantIntValue(numElements);
     Value rs1;
@@ -168,10 +180,20 @@ struct DmaStartOpLowering : public ConvertOpToLLVMPattern<memref::DmaStartOp> {
       spad_addr = rewriter.create<LLVM::PtrToIntOp>(loc, rewriter.getI64Type(), SrcPtr);
       tile_shape = srcMemRefType.getShape();
     }
-    
+
+    if (is_transposed) {
+      SmallVector<int64_t> new_tile_shape(tile_shape.rbegin(), tile_shape.rend());
+      tile_shape = llvm::ArrayRef<int64_t>(new_tile_shape);
+      SmallVector<int64_t> new_subtile_shape(subtile_shape.rbegin(), subtile_shape.rend());
+      subtile_shape = llvm::ArrayRef<int64_t>(new_subtile_shape);
+    }
     /* Use subtile size if it has subtile attribute */
-    if (subtile_shape.size())
+    uint64_t spad_stride = tile_shape[0] * elen / 8;
+    bool lane_split_axis = chunk_size < subtile_shape[1] ? 0 : 1;
+    if (subtile_shape.size()) {
+      spad_stride = tile_shape[lane_split_axis] * elen / 8;
       tile_shape = subtile_shape;
+    }
 
     func7 = dmaType;
     Value rows;
@@ -181,7 +203,7 @@ struct DmaStartOpLowering : public ConvertOpToLLVMPattern<memref::DmaStartOp> {
     uint64_t tile_col;
     if (elen < 8) {
       assert(cols >= 8);
-      assert(chunk_size > 0);
+      assert(chunk_size_byte > 0);
       col_factor = 8 / elen;
       elen = 8;
     }
@@ -231,12 +253,14 @@ struct DmaStartOpLowering : public ConvertOpToLLVMPattern<memref::DmaStartOp> {
     auto &firstOp = entryBlock.front();
     OpBuilder::InsertionGuard guard(rewriter);
     rewriter.setInsertionPoint(&firstOp);
-    // config_rs1 = main memory stride
+    // config_rs1 = main memory stride << 32 | spad stride
     // config_rs2 = chunk-size << 32 | config_type << 17 | is_col_major << 16 | element size
     Value config_rs1 = rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(main_mem_stride_val));
     Value config_shift16 = rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(16));
     Value config_shift32 = rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(32));
-    Value config_rs2 = rewriter.create<LLVM::ShlOp>(loc, rewriter.getI64Type(), rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(chunk_size)), config_shift32);
+    config_rs1 = rewriter.create<LLVM::ShlOp>(loc, rewriter.getI64Type(), config_rs1, config_shift32);
+    config_rs1 = rewriter.create<LLVM::OrOp>(loc, config_rs1, rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(spad_stride)));
+    Value config_rs2 = rewriter.create<LLVM::ShlOp>(loc, rewriter.getI64Type(), rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(chunk_size_byte)), config_shift32);
     Value config_shift17 = rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(17));
     config_rs2 = rewriter.create<LLVM::OrOp>(loc, config_rs2, rewriter.create<LLVM::ShlOp>(loc, rewriter.getI64Type(), rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(config_type)), config_shift17));
     config_rs2 = rewriter.create<LLVM::OrOp>(loc, config_rs2, rewriter.create<LLVM::ShlOp>(loc, rewriter.getI64Type(), rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(is_col_major)), config_shift16));

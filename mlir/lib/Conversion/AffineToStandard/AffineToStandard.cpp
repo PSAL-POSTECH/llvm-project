@@ -449,10 +449,13 @@ public:
     NamedAttrList attr;
     auto subTileAttr = op->getAttr("subtile_size");
     auto asyncAttr = op->getAttr("async");
+    auto transposeAttr = op->getAttr("transpose");
     if (subTileAttr)
       attr.append(NamedAttribute(StringAttr::get(op->getContext(), "subtile_size"), subTileAttr));
     if (asyncAttr)
       attr.append(NamedAttribute(StringAttr::get(op->getContext(), "async"), asyncAttr));
+    if (transposeAttr)
+      attr.append(NamedAttribute(StringAttr::get(op->getContext(), "transpose"), transposeAttr));
 
     rewriter.replaceOpWithNewOp<memref::DmaStartOp>(
         op, op.getSrcMemRef(), *maybeExpandedSrcMap, op.getDstMemRef(),
