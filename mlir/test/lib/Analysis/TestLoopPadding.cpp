@@ -166,12 +166,13 @@ void MemRefAffineMapForOps::addLoopsFromApplyOp(affine::AffineApplyOp applyOp) {
   // Extract operands of the affine.apply (which are the loop indices)
   for (mlir::Value operand : applyOp.getMapOperands()) {
     // Walk up the block to find the loop defining this operand as an induction variable
-    auto blockArg = mlir::cast<mlir::BlockArgument>(operand);
-    auto owner = blockArg.getOwner();
-    if (owner) {
-      auto operation = owner->getParentOp();
-      if (auto affineForOp = llvm::dyn_cast<affine::AffineForOp>(operation))
-        addLoopFromAffineFor(affineForOp);
+    if (auto blockArg = mlir::dyn_cast<mlir::BlockArgument>(operand)) {
+      auto owner = blockArg.getOwner();
+      if (owner) {
+        auto operation = owner->getParentOp();
+        if (auto affineForOp = llvm::dyn_cast<affine::AffineForOp>(operation))
+          addLoopFromAffineFor(affineForOp);
+      }
     }
   }
 }
@@ -580,8 +581,20 @@ void TestLoopPadding::analysisDMAStartNode(
 
     for (auto operand : dmaOp.getOperands()) {
       if (auto applyOp = operand.getDefiningOp<mlir::affine::AffineApplyOp>()) {
-        auto info = MemRefAffineMapForOps(dram_memref, applyOp, is_write);
-        targetBuffer.push_back(info);
+        bool nested = false;
+        for (mlir::Value operand : applyOp.getMapOperands()) {
+          // Walk up the block to find the loop defining this operand as an induction variable
+          if (auto nestedApplyOp = operand.getDefiningOp<mlir::affine::AffineApplyOp>()) {
+            nested = true;
+            auto info = MemRefAffineMapForOps(dram_memref, nestedApplyOp, is_write);
+            targetBuffer.push_back(info);
+            break;
+          }
+        }
+        if (!nested) {
+          auto info = MemRefAffineMapForOps(dram_memref, applyOp, is_write);
+          targetBuffer.push_back(info);
+        }
         break;
       } else if (auto blockArg = llvm::dyn_cast<mlir::BlockArgument>(operand)) {
         auto definingOp = blockArg.getOwner()->getParentOp();
