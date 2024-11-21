@@ -470,7 +470,6 @@ llvm::SmallVector<mlir::Attribute, 2> TestTileOperationGraph::getSubtileSize(mli
   llvm::SmallVector<mlir::Attribute, 2> subtileSizes;
   auto attr = operation->getAttr("subtile_size");
   if (!attr) {
-    llvm::errs() << "'subtile_size' attribute is not set.\n";
     return subtileSizes; // Return empty SmallVector
   }
 
