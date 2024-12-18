@@ -56,8 +56,10 @@ void DmaFineGrained::runOnOperation() {
   auto func = getOperation();
   OpBuilder builder(func.getContext());
   bool hasMatmul = false;
+  Value matmulResult;
   func.walk([&](linalg::MatmulOp matmulOp) {
     hasMatmul = true;
+    matmulResult = matmulOp.getOutputs()[0];
   });
   if (!hasMatmul) // only apply to functions with matmul
     return;
@@ -100,8 +102,11 @@ void DmaFineGrained::runOnOperation() {
   func.walk([&](affine::AffineDmaStartOp dmaStartOp) {
     dmaOps.push_back(dmaStartOp);
   });
+
+  // check Bias is moved to Output buffer
   bool is_bias = false;
-  if (dmaOps.size() == 4) {
+  Value Y_buffer = dmaOps[0].getDstMemRef();
+  if (Y_buffer == matmulResult) {
     is_bias = true;
   }
 
