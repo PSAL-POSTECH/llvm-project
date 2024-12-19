@@ -248,11 +248,6 @@ struct DmaStartOpLowering : public ConvertOpToLLVMPattern<memref::DmaStartOp> {
     }
     char* configAsmStr = getAsmString(func7);
     // Insert the config instruction at the beginning of the function
-    auto funcOp = op->getParentOfType<func::FuncOp>();
-    auto &entryBlock = funcOp.getRegion().front();
-    auto &firstOp = entryBlock.front();
-    OpBuilder::InsertionGuard guard(rewriter);
-    rewriter.setInsertionPoint(&firstOp);
     // config_rs1 = main memory stride << 32 | spad stride
     // config_rs2 = chunk-size << 32 | config_type << 17 | is_col_major << 16 | element size
     Value config_rs1 = rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(main_mem_stride_val));
@@ -276,7 +271,6 @@ struct DmaStartOpLowering : public ConvertOpToLLVMPattern<memref::DmaStartOp> {
         /*asm_dialect=*/asmDialectAttr,
         /*operand_attrs=*/ArrayAttr());
 
-    rewriter.setInsertionPoint(op);
     rewriter.replaceOpWithNewOp<LLVM::InlineAsmOp>(op,
         /*resultTypes=*/TypeRange(),
         /*operands=*/ValueRange({rs1, rs2}),
