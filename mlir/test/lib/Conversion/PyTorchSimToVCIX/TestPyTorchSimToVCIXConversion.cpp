@@ -55,9 +55,6 @@ static std::pair<unsigned, VectorType> legalizeVectorType(const Type &type) {
   if (!vt || vt.getRank() != 1)
     return {0, nullptr};
 
-  if (!vt.isScalable())
-    return {1, vt};
-
   Type eltTy = vt.getElementType();
   unsigned sew = 0;
   if (eltTy.isF32())
@@ -73,6 +70,13 @@ static std::pair<unsigned, VectorType> legalizeVectorType(const Type &type) {
   const unsigned lmul = eltCount * sew / 64;
 
   unsigned n = lmul > 8 ? llvm::Log2_32(lmul) - 2 : 1;
+  if (!vt.isScalable()) {
+    n = lmul > 32 ? llvm::Log2_32(lmul) - 2 : 1;
+    if (n == 1)
+      return {n, vt};
+    else
+      return {n, VectorType::get({eltCount >> (n - 2)}, eltTy)};
+  }
   return {n, VectorType::get({eltCount >> (n - 1)}, eltTy, {true})};
 }
 
@@ -335,13 +339,24 @@ struct MathExpToVCIX: public OpRewritePattern<math::ExpOp> {
       Value zero = rewriter.create<arith::ConstantOp>(
           loc, eltTy, rewriter.getZeroAttr(eltTy));
       res = rewriter.create<vector::BroadcastOp>(loc, opType, zero /*dummy*/);
-      for (unsigned i = 0; i < n; ++i) {
-        Value extracted = rewriter.create<vector::ScalableExtractOp>(
-            loc, legalType, vec, i * eltCount);
-        Value v = rewriter.create<vcix::BinaryImmOp>(loc, legalType, opcodeAttr,
-                                                      extracted, zeroImmAttr, rvl);
-        res = rewriter.create<vector::ScalableInsertOp>(loc, v, res,
-                                                        i * eltCount);
+      if (legalType.isScalable()) {
+        for (unsigned i = 0; i < n; ++i) {
+          Value extracted = rewriter.create<vector::ScalableExtractOp>(
+              loc, legalType, vec, i * eltCount);
+          Value v = rewriter.create<vcix::BinaryImmOp>(loc, legalType, opcodeAttr,
+                                                        extracted, zeroImmAttr, rvl);
+          res = rewriter.create<vector::ScalableInsertOp>(loc, v, res,
+                                                          i * eltCount);
+        }
+      } else { // Fixed-length vector > VLEN
+        for (unsigned i = 0; i < n; ++i) {
+          Value extracted = rewriter.create<vector::ExtractStridedSliceOp>(
+              loc, vec, i * eltCount, eltCount, 1);
+          Value v = rewriter.create<vcix::BinaryImmOp>(loc, legalType, opcodeAttr,
+                                                        extracted, zeroImmAttr, rvl);
+          res = rewriter.create<vector::InsertStridedSliceOp>(loc, v, res,
+                                                              i * eltCount, 1);
+        }
       }
     }
     rewriter.replaceOp(op, res);
