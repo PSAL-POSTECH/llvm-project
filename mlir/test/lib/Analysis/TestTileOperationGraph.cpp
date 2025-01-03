@@ -183,7 +183,6 @@ void TestTileOperationGraph::printOperation(Operation &op, TOGNode *node) {
       op.emitError() << "Unexpected memory space, src: " << src_space << "des: " << dst_space << "\n";
       return;
     }
-
     /* Record used loop index names */
     processDramIndices(dram_indices.front(), loop_index_map, loop_var_name);
     for (const auto& pair : loop_index_map) {
@@ -463,6 +462,9 @@ void TestTileOperationGraph::processDramIndices(mlir::Value value,
   } else if (auto blockArg = llvm::dyn_cast<mlir::BlockArgument>(value)) {
     // If the value itself is a BlockArgument, add it to the list
     loop_index_list[loop_var_name.at(blockArg.getAsOpaquePointer())] = 1;
+  } else if (auto constOp = value.getDefiningOp<arith::ConstantIndexOp>()) {
+    int constValue = static_cast<int>(constOp.value());
+    loop_index_list["c" + std::to_string(constValue)] = constValue;
   }
 }
 
