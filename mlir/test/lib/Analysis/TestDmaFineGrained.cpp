@@ -11,6 +11,11 @@
 #include "mlir/Pass/Pass.h"
 #include "mlir/Pass/PassManager.h"
 
+#define MVIN 2
+#define MVIN2 1
+#define MVIN3 14
+#define MVOUT 3
+
 using namespace mlir;
 
 int getConstantIntValue(Value val) {
@@ -56,10 +61,12 @@ void DmaFineGrained::runOnOperation() {
   auto func = getOperation();
   OpBuilder builder(func.getContext());
   bool hasMatmul = false;
-  Value matmulResult;
+  Value matmulResult, matmulInput, matmulWeight;
   func.walk([&](linalg::MatmulOp matmulOp) {
     hasMatmul = true;
     matmulResult = matmulOp.getOutputs()[0];
+    matmulInput = matmulOp.getInputs()[0];
+    matmulWeight = matmulOp.getInputs()[1];
   });
   if (!hasMatmul) // only apply to functions with matmul
     return;
@@ -105,9 +112,23 @@ void DmaFineGrained::runOnOperation() {
 
   // check Bias is moved to Output buffer
   bool is_bias = false;
-  Value Y_buffer = dmaOps[0].getDstMemRef();
-  if (Y_buffer == matmulResult) {
-    is_bias = true;
+  affine::AffineDmaStartOp mvin_bias;
+  affine::AffineDmaStartOp mvin_input;
+  affine::AffineDmaStartOp mvin_weight;
+
+  for(auto dmaOp : dmaOps) {
+    Value numElements = dmaOp.getNumElements();
+    int dmaType = getConstantIntValue(numElements);
+    if (dmaType != MVOUT) {
+      if (dmaOp.getDstMemRef() == matmulInput) {
+        mvin_input = dmaOp;
+      } else if (dmaOp.getDstMemRef() == matmulWeight) {
+        mvin_weight = dmaOp;
+      } else if (dmaOp.getDstMemRef() == matmulResult) {
+        mvin_bias = dmaOp;
+        is_bias = true;
+      }
+    }
   }
 
   Value i, j, k;
@@ -120,30 +141,24 @@ void DmaFineGrained::runOnOperation() {
   // sum_map = affine_map<(d0, d1) -> (d0 + d1)>
   auto sum_map = AffineMap::get(2, 0, builder.getAffineDimExpr(0) + builder.getAffineDimExpr(1));
   AffineMap tag_idx_map = AffineMap::get(1, 0, builder.getAffineDimExpr(0).floorDiv(vectorlane));
-  affine::AffineDmaStartOp dma1 = dmaOps[0 + is_bias];
-  affine::AffineDmaStartOp dma2 = dmaOps[1 + is_bias];
-  affine::AffineDmaStartOp dma3 = dmaOps[2 + is_bias];
-  llvm::SmallVector<mlir::Attribute, 2> dma1Subtile = getSubtileSize(dma1);
-  llvm::SmallVector<mlir::Attribute, 2> dma2Subtile = getSubtileSize(dma2);
-  llvm::SmallVector<mlir::Attribute, 2> dma3Subtile = getSubtileSize(dma3);
-  int dma1Async = getAsyncValue(dma1);
-  int dma2Async = getAsyncValue(dma2);
-  int dma3Async = getAsyncValue(dma3);
+  llvm::SmallVector<mlir::Attribute, 2> dma1Subtile = getSubtileSize(mvin_input);
+  llvm::SmallVector<mlir::Attribute, 2> dma2Subtile = getSubtileSize(mvin_weight);
+  int dma1Async = getAsyncValue(mvin_input);
+  int dma2Async = getAsyncValue(mvin_weight);
 
   NamedAttrList dma1Attr;
   NamedAttrList dma2Attr;
-  NamedAttrList dma3Attr;
 
   int64_t subTileSizeM;
   int64_t subTileSizeN;
   int64_t subTileSizeK;
 
   // Sanity check
-  if (dma1Subtile.size() == 2 && dma2Subtile.size() == 2 && dma3Subtile.size() == 2) {
+  if (dma1Subtile.size() == 2 && dma2Subtile.size() == 2) {
     if (auto intAttr1 = llvm::dyn_cast<mlir::IntegerAttr>(dma1Subtile[1])) {
       if (auto intAttr2 = llvm::dyn_cast<mlir::IntegerAttr>(dma2Subtile[0]))
         if (intAttr1.getInt() != intAttr2.getInt()) {
-          dma2.emitError() << " Not matched: "
+          mvin_weight.emitError() << " Not matched: "
                           << "dma1Subtile[1] = " << intAttr1.getInt()
                           << ", dma2Subtile[0] = " << intAttr2.getInt()
                           << "\n";
@@ -151,11 +166,11 @@ void DmaFineGrained::runOnOperation() {
           subTileSizeK = intAttr1.getInt();
         }
       else
-        dma2.emitError() << "dma2Subtile[0] is not an IntegerAttr.\n";
+        mvin_weight.emitError() << "dma2Subtile[0] is not an IntegerAttr.\n";
     } else
-      dma1.emitError() << "dma1Subtile[1] is not an IntegerAttr.\n";
+      mvin_input.emitError() << "dma1Subtile[1] is not an IntegerAttr.\n";
   } else {
-    dma1.emitError() << "subtile_size attribute required for matmul.\n";
+    mvin_input.emitError() << "subtile_size attribute required for matmul.\n";
   }
   subTileSizeM = llvm::dyn_cast<mlir::IntegerAttr>(dma1Subtile[0]).getInt();
   subTileSizeN = llvm::dyn_cast<mlir::IntegerAttr>(dma2Subtile[1]).getInt();
@@ -164,30 +179,25 @@ void DmaFineGrained::runOnOperation() {
     dma1Attr.set("subtile_size", builder.getArrayAttr(dma1Subtile));
   if (dma2Subtile.size())
     dma2Attr.set("subtile_size", builder.getArrayAttr(dma2Subtile));
-  if (dma3Subtile.size())
-    dma3Attr.set("subtile_size", builder.getArrayAttr(dma3Subtile));
   dma1Attr.set("async", builder.getIntegerAttr(builder.getI1Type(), dma1Async));
   dma2Attr.set("async", builder.getIntegerAttr(builder.getI1Type(), dma2Async));
-  dma3Attr.set("async", builder.getIntegerAttr(builder.getI1Type(), dma3Async));
-  dma1Attr.set("transpose", builder.getIntegerAttr(builder.getI1Type(), is_transpose(dma1)));
-  dma2Attr.set("transpose", builder.getIntegerAttr(builder.getI1Type(), is_transpose(dma2)));
-  dma3Attr.set("transpose", builder.getIntegerAttr(builder.getI1Type(), is_transpose(dma3)));
+  dma1Attr.set("transpose", builder.getIntegerAttr(builder.getI1Type(), is_transpose(mvin_input)));
+  dma2Attr.set("transpose", builder.getIntegerAttr(builder.getI1Type(), is_transpose(mvin_weight)));
 
   if (is_bias) {
     // BIAS MVIN
     // reset builder location
-    affine::AffineDmaStartOp dma = dmaOps[0];
-    llvm::SmallVector<mlir::Attribute, 2> dmaSubtile = getSubtileSize(dma);
-    int dmaAsync = getAsyncValue(dma);
+    llvm::SmallVector<mlir::Attribute, 2> dmaSubtile = getSubtileSize(mvin_bias);
+    int dmaAsync = getAsyncValue(mvin_bias);
     NamedAttrList dmaAttr;
     if (dmaSubtile.size()) {
       dmaAttr.set("subtile_size", builder.getArrayAttr(dmaSubtile));
     }
     dmaAttr.set("async", builder.getBoolAttr(dmaAsync));
-    dmaAttr.set("transpose", builder.getBoolAttr(is_transpose(dma)));
+    dmaAttr.set("transpose", builder.getBoolAttr(is_transpose(mvin_bias)));
 
-    auto loc = dma.getLoc();
-    builder.setInsertionPoint(dma);
+    auto loc = mvin_bias.getLoc();
+    builder.setInsertionPoint(mvin_bias);
     auto loopN = builder.create<affine::AffineForOp>(loc, 0, tileSizeN, subTileSizeM);
     loopN->setAttr("inner_loop", builder.getBoolAttr(true));
     builder.setInsertionPointToStart(loopN.getBody());
@@ -196,7 +206,7 @@ void DmaFineGrained::runOnOperation() {
     loopM->setAttr("inner_loop", builder.getBoolAttr(true));
     builder.setInsertionPointToStart(loopM.getBody());
     i = loopM.getInductionVar();
-    srcIndices = dma.getSrcIndices();
+    srcIndices = mvin_bias.getSrcIndices();
     for (auto index : srcIndices) {
       if (auto applyOp = index.getDefiningOp<affine::AffineApplyOp>()) {
         new_map = applyOp.getAffineMap();
@@ -211,7 +221,7 @@ void DmaFineGrained::runOnOperation() {
     }
     new_idx = builder.create<affine::AffineApplyOp>(loc, sum_map, ValueRange{new_idx, srcIndices[0]});
     src_indices.push_back(new_idx);
-    auto num_elt_per_stride = dma.getNumElementsPerStride();
+    auto num_elt_per_stride = mvin_bias.getNumElementsPerStride();
     uint64_t chunk_size = getConstantIntValue(num_elt_per_stride);
     auto new_set = builder.create<arith::ConstantIndexOp>(loc, 2147483648 + chunk_size);
     AffineMap spad_map_m = AffineMap::get(2, 0, builder.getAffineDimExpr(0) * (tileSizeM / vectorlane) + builder.getAffineDimExpr(1));
@@ -227,19 +237,19 @@ void DmaFineGrained::runOnOperation() {
 
     // Insert the first dma_start operation
     builder.create<affine::AffineDmaStartOp>(
-        loc, dma.getSrcMemRef(), src_map, src_indices,
-        dma.getDstMemRef(), dst_map, dst_indices,
+        loc, mvin_bias.getSrcMemRef(), src_map, src_indices,
+        mvin_bias.getDstMemRef(), dst_map, dst_indices,
         BtagMemRef, tag_map, tag_indices,
-        dma.getNumElements(), dma.getStride(), new_set, dmaAttr);
-    dma.erase();
+        mvin_bias.getNumElements(), mvin_bias.getStride(), new_set, dmaAttr);
+    mvin_bias.erase();
     src_indices.clear();
     dst_indices.clear();
     tag_indices.clear();
   }
 
   // Get insertion point for new loops
-  auto loc = dma1.getLoc();
-  builder.setInsertionPoint(dma1);
+  auto loc = mvin_input.getLoc();
+  builder.setInsertionPoint(mvin_input);
 
   // Create three nested affine.for loops
   auto loopN = builder.create<affine::AffineForOp>(loc, 0, tileSizeN, subTileSizeN);
@@ -255,7 +265,7 @@ void DmaFineGrained::runOnOperation() {
   builder.setInsertionPointToStart(loopM.getBody());
   i = loopM.getInductionVar();
 
-  srcIndices = dma1.getSrcIndices();
+  srcIndices = mvin_input.getSrcIndices();
   for (auto index : srcIndices) {
     if (auto applyOp = index.getDefiningOp<affine::AffineApplyOp>()) {
       new_map = applyOp.getAffineMap();
@@ -270,7 +280,7 @@ void DmaFineGrained::runOnOperation() {
   new_idx = builder.create<affine::AffineApplyOp>(loc, sum_map, ValueRange{new_idx, srcIndices[0]});
   // update srcIndices
   src_indices.push_back(new_idx);
-  auto num_elt_per_stride = dma1.getNumElementsPerStride();
+  auto num_elt_per_stride = mvin_input.getNumElementsPerStride();
   uint64_t chunk_size = getConstantIntValue(num_elt_per_stride);
   auto new_set = builder.create<arith::ConstantIndexOp>(loc, 2147483648 + chunk_size);
   // affine_map<(d0, d1) -> (d0 * (tileSizeM / vectorlane) + d1)>
@@ -287,13 +297,13 @@ void DmaFineGrained::runOnOperation() {
 
   // Insert the first dma_start operation
   builder.create<affine::AffineDmaStartOp>(
-      loc, dma1.getSrcMemRef(), src_map, src_indices,
-      dma1.getDstMemRef(), dst_map, dst_indices,
+      loc, mvin_input.getSrcMemRef(), src_map, src_indices,
+      mvin_input.getDstMemRef(), dst_map, dst_indices,
       XtagMemRef, tag_map, tag_indices,
-      dma1.getNumElements(), dma1.getStride(), new_set, dma1Attr);
+      mvin_input.getNumElements(), mvin_input.getStride(), new_set, dma1Attr);
 
   // Insert the second dma_start operation
-  srcIndices = dma2.getSrcIndices();
+  srcIndices = mvin_weight.getSrcIndices();
   for (auto index : srcIndices) {
     if (auto applyOp = index.getDefiningOp<affine::AffineApplyOp>()) {
       new_map = applyOp.getAffineMap();
@@ -309,7 +319,7 @@ void DmaFineGrained::runOnOperation() {
   src_indices.clear();
   src_indices.push_back(new_idx);
 
-  num_elt_per_stride = dma2.getNumElementsPerStride();
+  num_elt_per_stride = mvin_weight.getNumElementsPerStride();
   chunk_size = getConstantIntValue(num_elt_per_stride);
   new_set = builder.create<arith::ConstantIndexOp>(loc, 2147483648 + chunk_size);
   AffineMap spad_map_k = AffineMap::get(2, 0, builder.getAffineDimExpr(0) * (tileSizeK / vectorlane) + builder.getAffineDimExpr(1));
@@ -326,61 +336,14 @@ void DmaFineGrained::runOnOperation() {
   dst_map = builder.getMultiDimIdentityMap(dst_indices.size());
   tag_map = builder.getMultiDimIdentityMap(tag_indices.size());
   builder.create<affine::AffineDmaStartOp>(
-      loc, dma2.getSrcMemRef(), src_map, src_indices,
-      dma2.getDstMemRef(), dst_map, dst_indices,
+      loc, mvin_weight.getSrcMemRef(), src_map, src_indices,
+      mvin_weight.getDstMemRef(), dst_map, dst_indices,
       WtagMemRef, tag_map, tag_indices,
-      dma2.getNumElements(), dma2.getStride(), new_set, dma2Attr);
+      mvin_weight.getNumElements(), mvin_weight.getStride(), new_set, dma2Attr);
 
   // Erase the original dma_start operations
-  dma1.erase();
-  dma2.erase();
-
-  //MVOUT
-  // reset builder location
-  loc = dma3.getLoc();
-  builder.setInsertionPoint(dma3);
-  // Create two nested affine.for loops
-  auto loopN2 = builder.create<affine::AffineForOp>(loc, 0, tileSizeN, vectorlane);
-  loopN2->setAttr("inner_loop", builder.getBoolAttr(true));
-  builder.setInsertionPointToStart(loopN2.getBody());
-  j = loopN2.getInductionVar();
-  auto loopM2 = builder.create<affine::AffineForOp>(loc, 0, tileSizeM, vectorlane);
-  loopM2->setAttr("inner_loop", builder.getBoolAttr(true));
-  builder.setInsertionPointToStart(loopM2.getBody());
-  i = loopM2.getInductionVar();
-
-
-  auto dstIndices = dma3.getDstIndices();
-  for (auto index : dstIndices) {
-    if (auto applyOp = index.getDefiningOp<affine::AffineApplyOp>()) {
-      new_map = applyOp.getAffineMap();
-    }
-  }
-  if (is_bmm) {
-    new_map_indices = {zeroIndex, i, j};
-  } else {
-    new_map_indices = {i, j};
-  }
-  new_idx = builder.create<affine::AffineApplyOp>(loc, new_map, new_map_indices);
-  new_idx = builder.create<affine::AffineApplyOp>(loc, sum_map, ValueRange{new_idx, dstIndices[0]});
-  dst_indices.clear();
-  dst_indices.push_back(new_idx);
-  auto src_idx = builder.create<affine::AffineApplyOp>(loc, spad_map_m, ValueRange{j, i});
-  src_indices.clear();
-  src_indices.push_back(zeroIndex);
-  src_indices.push_back(src_idx);
-  tag_indices.clear();
-  tag_indices.push_back(zeroIndex);
-
-  src_map = builder.getMultiDimIdentityMap(src_indices.size());
-  dst_map = builder.getMultiDimIdentityMap(dst_indices.size());
-  tag_map = builder.getMultiDimIdentityMap(tag_indices.size());
-  builder.create<affine::AffineDmaStartOp>(
-      loc, dma3.getSrcMemRef(), src_map, src_indices,
-      dma3.getDstMemRef(), dst_map, dst_indices,
-      dma3.getTagMemRef(), tag_map, tag_indices,
-      dma3.getNumElements(), dma3.getStride(), c_set, dma3Attr);
-  dma3.erase();
+  mvin_input.erase();
+  mvin_weight.erase();
 }
 
 llvm::SmallVector<mlir::Attribute, 2> DmaFineGrained::getSubtileSize(mlir::Operation *operation) {
