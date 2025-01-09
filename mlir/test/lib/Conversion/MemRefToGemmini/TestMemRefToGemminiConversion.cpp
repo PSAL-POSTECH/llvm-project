@@ -11,6 +11,7 @@
 #include "mlir/Conversion/LLVMCommon/TypeConverter.h"
 #include "mlir/Conversion/LLVMCommon/Pattern.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/IR/PatternMatch.h"
@@ -90,17 +91,6 @@ int getAsyncValue(mlir::Operation *operation) {
     return 1;
 }
 
-int is_transpose(mlir::Operation *operation) {
-  auto attr = operation->getAttr("transpose");
-  if (!attr)
-    return 0;
-
-  if (auto intAttr = llvm::dyn_cast<mlir::IntegerAttr>(attr))
-    return intAttr.getInt(); // Treat non-zero as true
-  else
-    return 1;
-}
-
 /// Lowering memref.dma_start operation to Gemmini instructions with LLVM Asm.
 struct DmaWaitOpLowering : public ConvertOpToLLVMPattern<memref::DmaWaitOp> {
   int vectorlaneStride;
@@ -133,7 +123,6 @@ struct DmaStartOpLowering : public ConvertOpToLLVMPattern<memref::DmaStartOp> {
     auto loc = op.getLoc();
     unsigned func7;
     llvm::SmallVector<int64_t, 2> dmaSubtile = getSubtileSize(op);
-    bool is_transposed = is_transpose(op);
 
     SmallVector<Value> operands;
     for (auto val : adaptor.getOperands())
@@ -157,14 +146,13 @@ struct DmaStartOpLowering : public ConvertOpToLLVMPattern<memref::DmaStartOp> {
     Value DstMemref = operands[op.getSrcMemRefRank() + 1];
     auto dstMemRefType = cast<MemRefType>(op.getDstMemRef().getType());
     Value DstPtr = getStridedElementPtr(loc, dstMemRefType, DstMemref, dst_indices, rewriter);
-    Value main_mem_stride = op.getStride();
-    int64_t main_mem_stride_val = extractConstantIntValue(main_mem_stride) * elen / 8;
+    Value vlane_split_axis_val = op.getStride();
+    uint64_t vlane_split_axis = extractConstantIntValue(vlane_split_axis_val);
     Value num_elt_per_stride = op.getNumElementsPerStride();
-    uint64_t chunk_size = extractConstantIntValue(num_elt_per_stride);
-    bool is_col_major = chunk_size % 2;
-    int is_fine_grained = (chunk_size >> 31) & 1;
-    chunk_size = ((chunk_size / 2) & 0x7FFF);
-    uint64_t chunk_size_byte = chunk_size * elen / 8;
+    uint64_t vlane_stride = extractConstantIntValue(num_elt_per_stride);
+    int is_fine_grained = (vlane_stride >> 31) & 1; // FIXME: Do we need this? (in sub-tile case)
+    vlane_stride = (vlane_stride & 0x7FFF); // mask out the fine-grained bit
+    uint64_t vlane_stride_byte = vlane_stride * elen / 8;
     Value numElements = op.getNumElements();
     int dmaType = extractConstantIntValue(numElements);
     Value rs1;
@@ -173,40 +161,77 @@ struct DmaStartOpLowering : public ConvertOpToLLVMPattern<memref::DmaStartOp> {
     llvm::ArrayRef<int64_t> subtile_shape(dmaSubtile);
     bool is_mvin = dmaType == MVIN || dmaType == MVIN2 || dmaType == MVIN3;
 
+    SmallVector<int64_t> mm_strides;
+    SmallVector<int64_t> spad_strides;
+    ValueRange indices;
+    int64_t mm_offset;
+    int64_t spad_offset;
     if (is_mvin) { // MVIN
       rs1 = rewriter.create<LLVM::PtrToIntOp>(loc, rewriter.getI64Type(), SrcPtr);
       spad_addr = rewriter.create<LLVM::PtrToIntOp>(loc, rewriter.getI64Type(), DstPtr);
       tile_shape = dstMemRefType.getShape();
+      std::tie(mm_strides, mm_offset) = getStridesAndOffset(srcMemRefType);
+      std::tie(spad_strides, spad_offset) = getStridesAndOffset(dstMemRefType);
+      indices = op.getSrcIndices();;
     } else { // MVOUT
       rs1 = rewriter.create<LLVM::PtrToIntOp>(loc, rewriter.getI64Type(), DstPtr);
       spad_addr = rewriter.create<LLVM::PtrToIntOp>(loc, rewriter.getI64Type(), SrcPtr);
       tile_shape = srcMemRefType.getShape();
+      std::tie(mm_strides, mm_offset) = getStridesAndOffset(dstMemRefType);
+      std::tie(spad_strides, spad_offset) = getStridesAndOffset(srcMemRefType);
+      indices = op.getDstIndices();
+    }
+    AffineMap index_map;
+    for (auto index : indices) {
+      if (auto applyOp = index.getDefiningOp<affine::AffineApplyOp>()) {
+        index_map = applyOp.getAffineMap();
+      }
+    }
+    if (index_map) {
+      // SmallVector<int64_t> strides(index_map.getNumDims(), 0);
+      mm_strides = SmallVector<int64_t>(index_map.getNumDims(), 0);
+      // Ensure the AffineMap has at least one result
+      if (index_map.getNumResults() != 1) {
+        llvm::errs() << "AffineMap should have exactly one result.\n";
+      }
+
+      // Extract the single result expression
+      mlir::AffineExpr resultExpr = index_map.getResult(0);
+
+      // Traverse the result expression to calculate strides
+      resultExpr.walk([&](mlir::AffineExpr subExpr) {
+        if (auto dimExpr = subExpr.dyn_cast<mlir::AffineDimExpr>()) {
+          // Set stride for the corresponding dimension
+          mm_strides[dimExpr.getPosition()] = 1;
+        } else if (auto mulExpr = subExpr.dyn_cast<mlir::AffineBinaryOpExpr>()) {
+          // Handle multiplications
+          if (mulExpr.getKind() == mlir::AffineExprKind::Mul) {
+            if (auto dimExpr = mulExpr.getLHS().dyn_cast<mlir::AffineDimExpr>()) {
+              if (auto constExpr = mulExpr.getRHS().dyn_cast<mlir::AffineConstantExpr>()) {
+                mm_strides[dimExpr.getPosition()] = constExpr.getValue();
+              }
+            }
+          }
+        }
+      });
     }
 
-    if (is_transposed) {
-      SmallVector<int64_t> new_tile_shape(tile_shape.rbegin(), tile_shape.rend());
-      tile_shape = llvm::ArrayRef<int64_t>(new_tile_shape);
-      SmallVector<int64_t> new_subtile_shape(subtile_shape.rbegin(), subtile_shape.rend());
-      subtile_shape = llvm::ArrayRef<int64_t>(new_subtile_shape);
-    }
     /* Use subtile size if it has subtile attribute */
     uint64_t spad_stride = tile_shape[0] * elen / 8;
-    bool lane_split_axis = chunk_size < subtile_shape[1] ? 0 : 1;
+    bool lane_split_axis = vlane_stride < subtile_shape[1] ? 0 : 1;
     if (subtile_shape.size()) {
       spad_stride = tile_shape[lane_split_axis] * elen / 8;
       tile_shape = subtile_shape;
     }
 
     func7 = dmaType;
-    Value rows;
-    Value cols;
     int col_factor = 1;
     uint64_t tile_row;
     uint64_t tile_col;
 
     if (elen < 8) {
-      if (chunk_size_byte < 1) {
-        chunk_size_byte = 1;
+      if (vlane_stride_byte < 1) {
+        vlane_stride_byte = 1;
       }
       col_factor = 8 / elen;
       elen = 8;
@@ -215,21 +240,15 @@ struct DmaStartOpLowering : public ConvertOpToLLVMPattern<memref::DmaStartOp> {
     if (tile_shape.size() == 2) {
       tile_row = tile_shape[0];
       tile_col = tile_shape[1];
-      rows = rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(tile_row));
-      cols = rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(tile_col));
     } else if (tile_shape.size() == 1) {
       if (is_fine_grained) {
         tile_col = std::min((tile_shape[0] / col_factor), VECTOR_LANE);
       } else {
         tile_col = tile_shape[0];
       }
-      rows = rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(1));
-      cols = rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(tile_col));
     }
 
     char* asmStr = getAsmString(func7);
-    // encoding rs2
-    // rs2 = rows << (ADDR_LEN + 16) | (cols << ADDR_LEN) | spad_addr
     // constants for shifting
     Value shift14 = rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(14));
     Value shift17 = rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(17));
@@ -237,9 +256,9 @@ struct DmaStartOpLowering : public ConvertOpToLLVMPattern<memref::DmaStartOp> {
     Value shift32 = rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(32));
     Value shift48 = rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(48));
 
-    Value rs2 = rewriter.create<LLVM::ShlOp>(loc, rewriter.getI64Type(), rows, shift48);
-    rs2 = rewriter.create<LLVM::OrOp>(loc, rs2, rewriter.create<LLVM::ShlOp>(loc, rewriter.getI64Type(), cols, shift32));
-    rs2 = rewriter.create<LLVM::OrOp>(loc, rs2, spad_addr);
+    // encoding rs2
+    // rs2 = spad_addr
+    Value rs2 = spad_addr;
 
     // config_mvin, config_mvout instructions
     func7 = CONFIG;
@@ -256,24 +275,21 @@ struct DmaStartOpLowering : public ConvertOpToLLVMPattern<memref::DmaStartOp> {
       return failure();
     }
 
+    int64_t max_tensor_dim = 4;
     // config1
     char* configAsmStr = getAsmString(func7);
     // config_rs1 = 1st dim << 48 | 2nd dim << 32 | 3rd dim << 16 | 4th dim size
-    // config_rs2 = vlane_stride << 32 | config_type << 17 | is_col_major << 16 | vlane_split_axis << 14 | element size
-    uint64_t dim1_size = 1; //TODO: get the size of the 1st dim
-    uint64_t dim2_size = 1; //TODO: get the size of the 2nd dim
-    uint64_t dim3_size = 1; //TODO: get the size of the 3rd dim
-    uint64_t dim4_size = 1; //TODO: get the size of the 4th dim
-    Value config_rs1 = rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(main_mem_stride_val));
+    // config_rs2 = vlane_stride << 32 | config_type << 17  | vlane_split_axis << 14 | element size
+    SmallVector<int64_t> sub_tensor_shape(max_tensor_dim, 1);
+    for (int i = 0; i < tile_shape.size(); i++)
+      sub_tensor_shape[i] = tile_shape[i];
+    Value config_rs1 = rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(sub_tensor_shape[0]));
     config_rs1 = rewriter.create<LLVM::ShlOp>(loc, rewriter.getI64Type(), config_rs1, shift48);
-    config_rs1 = rewriter.create<LLVM::OrOp>(loc, config_rs1, rewriter.create<LLVM::ShlOp>(loc, rewriter.getI64Type(), rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(dim2_size)), shift32));
-    config_rs1 = rewriter.create<LLVM::OrOp>(loc, config_rs1, rewriter.create<LLVM::ShlOp>(loc, rewriter.getI64Type(), rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(dim3_size)), shift16));
-    config_rs1 = rewriter.create<LLVM::OrOp>(loc, config_rs1, rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(dim4_size)));
-    uint64_t vlane_stride = 1; // TODO: get the vlane stride
-    uint64_t vlane_split_axis = 1; // TODO: get the vlane split axis // 0~3
+    config_rs1 = rewriter.create<LLVM::OrOp>(loc, config_rs1, rewriter.create<LLVM::ShlOp>(loc, rewriter.getI64Type(), rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(sub_tensor_shape[1])), shift32));
+    config_rs1 = rewriter.create<LLVM::OrOp>(loc, config_rs1, rewriter.create<LLVM::ShlOp>(loc, rewriter.getI64Type(), rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(sub_tensor_shape[2])), shift16));
+    config_rs1 = rewriter.create<LLVM::OrOp>(loc, config_rs1, rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(sub_tensor_shape[3])));
     Value config_rs2 = rewriter.create<LLVM::ShlOp>(loc, rewriter.getI64Type(), rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(vlane_stride)), shift32);
     config_rs2 = rewriter.create<LLVM::OrOp>(loc, config_rs2, rewriter.create<LLVM::ShlOp>(loc, rewriter.getI64Type(), rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(config_type)), shift17));
-    config_rs2 = rewriter.create<LLVM::OrOp>(loc, config_rs2, rewriter.create<LLVM::ShlOp>(loc, rewriter.getI64Type(), rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(is_col_major)), shift16));
     config_rs2 = rewriter.create<LLVM::OrOp>(loc, config_rs2, rewriter.create<LLVM::ShlOp>(loc, rewriter.getI64Type(), rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(vlane_split_axis)), shift14));
     config_rs2 = rewriter.create<LLVM::OrOp>(loc, config_rs2, rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(int(elen/8)))); // element size [bytes]
     rewriter.create<LLVM::InlineAsmOp>(
@@ -291,14 +307,13 @@ struct DmaStartOpLowering : public ConvertOpToLLVMPattern<memref::DmaStartOp> {
     char* config2AsmStr = getAsmString(CONFIG2);
     // config_rs1 = 1st dim stride << 32 | 2nd dim stride
     // config_rs2 = 3rd dim stride << 32 | 4th dim stride
-    uint64_t dim1_stride = 1; //TODO: get the stride of the 1st dim
-    uint64_t dim2_stride = 1; //TODO: get the stride of the 2nd dim
-    uint64_t dim3_stride = 1; //TODO: get the stride of the 3rd dim
-    uint64_t dim4_stride = 1; //TODO: get the stride of the 4th dim
-    config_rs1 = rewriter.create<LLVM::ShlOp>(loc, rewriter.getI64Type(), rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(dim1_stride)), shift32);
-    config_rs1 = rewriter.create<LLVM::OrOp>(loc, config_rs1, rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(dim2_stride)));
-    config_rs2 = rewriter.create<LLVM::ShlOp>(loc, rewriter.getI64Type(), rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(dim3_stride)), shift32);
-    config_rs2 = rewriter.create<LLVM::OrOp>(loc, config_rs2, rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(dim4_stride)));
+    for (int i = mm_strides.size(); i < max_tensor_dim; i++) {
+      mm_strides.push_back(1);
+    }
+    config_rs1 = rewriter.create<LLVM::ShlOp>(loc, rewriter.getI64Type(), rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(mm_strides[0])), shift32);
+    config_rs1 = rewriter.create<LLVM::OrOp>(loc, config_rs1, rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(mm_strides[1])));
+    config_rs2 = rewriter.create<LLVM::ShlOp>(loc, rewriter.getI64Type(), rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(mm_strides[2])), shift32);
+    config_rs2 = rewriter.create<LLVM::OrOp>(loc, config_rs2, rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(mm_strides[3])));
     rewriter.create<LLVM::InlineAsmOp>(
         loc,
         /*resultTypes=*/TypeRange(),
@@ -314,14 +329,13 @@ struct DmaStartOpLowering : public ConvertOpToLLVMPattern<memref::DmaStartOp> {
     char* config3AsmStr = getAsmString(CONFIG3);
     // config_rs1 = 1st dim spad_stride << 32 | 2nd dim spad_stride
     // config_rs2 = 3rd dim spad_stride << 32 | 4th dim spad_stride
-    uint64_t dim1_spad_stride = 1; //TODO: get the spad stride of the 1st dim
-    uint64_t dim2_spad_stride = 1; //TODO: get the spad stride of the 2nd dim
-    uint64_t dim3_spad_stride = 1; //TODO: get the spad stride of the 3rd dim
-    uint64_t dim4_spad_stride = 1; //TODO: get the spad stride of the 4th dim
-    config_rs1 = rewriter.create<LLVM::ShlOp>(loc, rewriter.getI64Type(), rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(dim1_spad_stride)), shift32);
-    config_rs1 = rewriter.create<LLVM::OrOp>(loc, config_rs1, rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(dim2_spad_stride)));
-    config_rs2 = rewriter.create<LLVM::ShlOp>(loc, rewriter.getI64Type(), rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(dim3_spad_stride)), shift32);
-    config_rs2 = rewriter.create<LLVM::OrOp>(loc, config_rs2, rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(dim4_spad_stride)));
+    for (int i = spad_strides.size(); i < max_tensor_dim; i++) {
+      spad_strides.push_back(1);
+    }
+    config_rs1 = rewriter.create<LLVM::ShlOp>(loc, rewriter.getI64Type(), rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(spad_strides[0])), shift32);
+    config_rs1 = rewriter.create<LLVM::OrOp>(loc, config_rs1, rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(spad_strides[1])));
+    config_rs2 = rewriter.create<LLVM::ShlOp>(loc, rewriter.getI64Type(), rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(spad_strides[2])), shift32);
+    config_rs2 = rewriter.create<LLVM::OrOp>(loc, config_rs2, rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(spad_strides[3])));
     rewriter.create<LLVM::InlineAsmOp>(
         loc,
         /*resultTypes=*/TypeRange(),
