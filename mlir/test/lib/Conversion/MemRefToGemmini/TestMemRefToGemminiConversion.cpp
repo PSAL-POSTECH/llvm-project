@@ -18,6 +18,8 @@
 #include "mlir/Pass/PassManager.h"
 
 #define CONFIG 0
+#define CONFIG2 4
+#define CONFIG3 5
 #define MVIN 2
 #define MVIN2 1
 #define MVIN3 14
@@ -228,9 +230,14 @@ struct DmaStartOpLowering : public ConvertOpToLLVMPattern<memref::DmaStartOp> {
     char* asmStr = getAsmString(func7);
     // encoding rs2
     // rs2 = rows << (ADDR_LEN + 16) | (cols << ADDR_LEN) | spad_addr
-    Value shift48 = rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(48));
-    Value rs2 = rewriter.create<LLVM::ShlOp>(loc, rewriter.getI64Type(), rows, shift48);
+    // constants for shifting
+    Value shift14 = rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(14));
+    Value shift17 = rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(17));
+    Value shift16 = rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(16));
     Value shift32 = rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(32));
+    Value shift48 = rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(48));
+
+    Value rs2 = rewriter.create<LLVM::ShlOp>(loc, rewriter.getI64Type(), rows, shift48);
     rs2 = rewriter.create<LLVM::OrOp>(loc, rs2, rewriter.create<LLVM::ShlOp>(loc, rewriter.getI64Type(), cols, shift32));
     rs2 = rewriter.create<LLVM::OrOp>(loc, rs2, spad_addr);
 
@@ -248,25 +255,78 @@ struct DmaStartOpLowering : public ConvertOpToLLVMPattern<memref::DmaStartOp> {
     } else{
       return failure();
     }
+
+    // config1
     char* configAsmStr = getAsmString(func7);
-    // Insert the config instruction at the beginning of the function
-    // config_rs1 = main memory stride << 32 | spad stride
-    // config_rs2 = chunk-size << 32 | config_type << 17 | is_col_major << 16 | element size
+    // config_rs1 = 1st dim << 48 | 2nd dim << 32 | 3rd dim << 16 | 4th dim size
+    // config_rs2 = vlane_stride << 32 | config_type << 17 | is_col_major << 16 | vlane_split_axis << 14 | element size
+    uint64_t dim1_size = 1; //TODO: get the size of the 1st dim
+    uint64_t dim2_size = 1; //TODO: get the size of the 2nd dim
+    uint64_t dim3_size = 1; //TODO: get the size of the 3rd dim
+    uint64_t dim4_size = 1; //TODO: get the size of the 4th dim
     Value config_rs1 = rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(main_mem_stride_val));
-    Value config_shift16 = rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(16));
-    Value config_shift32 = rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(32));
-    config_rs1 = rewriter.create<LLVM::ShlOp>(loc, rewriter.getI64Type(), config_rs1, config_shift32);
-    config_rs1 = rewriter.create<LLVM::OrOp>(loc, config_rs1, rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(spad_stride)));
-    Value config_rs2 = rewriter.create<LLVM::ShlOp>(loc, rewriter.getI64Type(), rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(chunk_size_byte)), config_shift32);
-    Value config_shift17 = rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(17));
-    config_rs2 = rewriter.create<LLVM::OrOp>(loc, config_rs2, rewriter.create<LLVM::ShlOp>(loc, rewriter.getI64Type(), rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(config_type)), config_shift17));
-    config_rs2 = rewriter.create<LLVM::OrOp>(loc, config_rs2, rewriter.create<LLVM::ShlOp>(loc, rewriter.getI64Type(), rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(is_col_major)), config_shift16));
+    config_rs1 = rewriter.create<LLVM::ShlOp>(loc, rewriter.getI64Type(), config_rs1, shift48);
+    config_rs1 = rewriter.create<LLVM::OrOp>(loc, config_rs1, rewriter.create<LLVM::ShlOp>(loc, rewriter.getI64Type(), rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(dim2_size)), shift32));
+    config_rs1 = rewriter.create<LLVM::OrOp>(loc, config_rs1, rewriter.create<LLVM::ShlOp>(loc, rewriter.getI64Type(), rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(dim3_size)), shift16));
+    config_rs1 = rewriter.create<LLVM::OrOp>(loc, config_rs1, rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(dim4_size)));
+    uint64_t vlane_stride = 1; // TODO: get the vlane stride
+    uint64_t vlane_split_axis = 1; // TODO: get the vlane split axis // 0~3
+    Value config_rs2 = rewriter.create<LLVM::ShlOp>(loc, rewriter.getI64Type(), rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(vlane_stride)), shift32);
+    config_rs2 = rewriter.create<LLVM::OrOp>(loc, config_rs2, rewriter.create<LLVM::ShlOp>(loc, rewriter.getI64Type(), rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(config_type)), shift17));
+    config_rs2 = rewriter.create<LLVM::OrOp>(loc, config_rs2, rewriter.create<LLVM::ShlOp>(loc, rewriter.getI64Type(), rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(is_col_major)), shift16));
+    config_rs2 = rewriter.create<LLVM::OrOp>(loc, config_rs2, rewriter.create<LLVM::ShlOp>(loc, rewriter.getI64Type(), rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(vlane_split_axis)), shift14));
     config_rs2 = rewriter.create<LLVM::OrOp>(loc, config_rs2, rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(int(elen/8)))); // element size [bytes]
     rewriter.create<LLVM::InlineAsmOp>(
         loc,
         /*resultTypes=*/TypeRange(),
         /*operands=*/ValueRange({config_rs1, config_rs2}),
         /*asm_string=*/configAsmStr,
+        /*constraints=*/constraintStr,
+        /*has_side_effects=*/true,
+        /*is_align_stack=*/false,
+        /*asm_dialect=*/asmDialectAttr,
+        /*operand_attrs=*/ArrayAttr());
+
+    // config2
+    char* config2AsmStr = getAsmString(CONFIG2);
+    // config_rs1 = 1st dim stride << 32 | 2nd dim stride
+    // config_rs2 = 3rd dim stride << 32 | 4th dim stride
+    uint64_t dim1_stride = 1; //TODO: get the stride of the 1st dim
+    uint64_t dim2_stride = 1; //TODO: get the stride of the 2nd dim
+    uint64_t dim3_stride = 1; //TODO: get the stride of the 3rd dim
+    uint64_t dim4_stride = 1; //TODO: get the stride of the 4th dim
+    config_rs1 = rewriter.create<LLVM::ShlOp>(loc, rewriter.getI64Type(), rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(dim1_stride)), shift32);
+    config_rs1 = rewriter.create<LLVM::OrOp>(loc, config_rs1, rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(dim2_stride)));
+    config_rs2 = rewriter.create<LLVM::ShlOp>(loc, rewriter.getI64Type(), rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(dim3_stride)), shift32);
+    config_rs2 = rewriter.create<LLVM::OrOp>(loc, config_rs2, rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(dim4_stride)));
+    rewriter.create<LLVM::InlineAsmOp>(
+        loc,
+        /*resultTypes=*/TypeRange(),
+        /*operands=*/ValueRange({config_rs1, config_rs2}),
+        /*asm_string=*/config2AsmStr,
+        /*constraints=*/constraintStr,
+        /*has_side_effects=*/true,
+        /*is_align_stack=*/false,
+        /*asm_dialect=*/asmDialectAttr,
+        /*operand_attrs=*/ArrayAttr());
+
+    // config3
+    char* config3AsmStr = getAsmString(CONFIG3);
+    // config_rs1 = 1st dim spad_stride << 32 | 2nd dim spad_stride
+    // config_rs2 = 3rd dim spad_stride << 32 | 4th dim spad_stride
+    uint64_t dim1_spad_stride = 1; //TODO: get the spad stride of the 1st dim
+    uint64_t dim2_spad_stride = 1; //TODO: get the spad stride of the 2nd dim
+    uint64_t dim3_spad_stride = 1; //TODO: get the spad stride of the 3rd dim
+    uint64_t dim4_spad_stride = 1; //TODO: get the spad stride of the 4th dim
+    config_rs1 = rewriter.create<LLVM::ShlOp>(loc, rewriter.getI64Type(), rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(dim1_spad_stride)), shift32);
+    config_rs1 = rewriter.create<LLVM::OrOp>(loc, config_rs1, rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(dim2_spad_stride)));
+    config_rs2 = rewriter.create<LLVM::ShlOp>(loc, rewriter.getI64Type(), rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(dim3_spad_stride)), shift32);
+    config_rs2 = rewriter.create<LLVM::OrOp>(loc, config_rs2, rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(dim4_spad_stride)));
+    rewriter.create<LLVM::InlineAsmOp>(
+        loc,
+        /*resultTypes=*/TypeRange(),
+        /*operands=*/ValueRange({config_rs1, config_rs2}),
+        /*asm_string=*/config3AsmStr,
         /*constraints=*/constraintStr,
         /*has_side_effects=*/true,
         /*is_align_stack=*/false,
