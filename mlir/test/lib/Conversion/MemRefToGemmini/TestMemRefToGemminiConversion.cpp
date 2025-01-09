@@ -201,9 +201,11 @@ struct DmaStartOpLowering : public ConvertOpToLLVMPattern<memref::DmaStartOp> {
     int col_factor = 1;
     uint64_t tile_row;
     uint64_t tile_col;
+
     if (elen < 8) {
-      assert(cols >= 8);
-      assert(chunk_size_byte > 0);
+      if (chunk_size_byte < 1) {
+        chunk_size_byte = 1;
+      }
       col_factor = 8 / elen;
       elen = 8;
     }
