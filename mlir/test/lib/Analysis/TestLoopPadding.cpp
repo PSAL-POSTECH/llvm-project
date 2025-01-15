@@ -61,12 +61,15 @@ private:
   std::vector<mlir::AffineMap> affineMap;        // Single affine map
   std::vector<std::tuple<int64_t, int64_t, int64_t>> loopRange;   // Multiple AffineForOp loops
   bool is_write;
+  int padding_type;
 public:
-  MemRefAffineMapForOps(mlir::Value memRef, affine::AffineApplyOp applyOp, bool is_write) : memRef(memRef), is_write(is_write) {
+  MemRefAffineMapForOps(mlir::Value memRef, affine::AffineApplyOp applyOp, bool is_write, int padding_type)
+  : memRef(memRef), is_write(is_write), padding_type(padding_type) {
     affineMap.push_back(applyOp.getAffineMap());
     addLoopsFromApplyOp(applyOp);
   }
-  MemRefAffineMapForOps(mlir::Value memRef, affine::AffineForOp affineForOp, bool is_write) : memRef(memRef), is_write(is_write) {
+  MemRefAffineMapForOps(mlir::Value memRef, affine::AffineForOp affineForOp, bool is_write, int padding_type)
+  : memRef(memRef), is_write(is_write), padding_type(padding_type) {
     mlir::MLIRContext *context = memRef.getContext();
     mlir::AffineExpr d0 = mlir::getAffineDimExpr(0, context); // Represents d0
     mlir::AffineMap identityMap = mlir::AffineMap::get(1, 0, d0);
@@ -82,6 +85,7 @@ public:
   void addLoopsFromApplyOp(affine::AffineApplyOp applyOp);
   void addLoopFromAffineFor(affine::AffineForOp affineForOp);
   bool getIsWrite() { return is_write; }
+  int getPaddingType() { return padding_type; }
   bool areLoopRangesEqual(const MemRefAffineMapForOps &other) const {
     if (loopRange.size() != other.loopRange.size()) {
       return false;
@@ -151,6 +155,7 @@ struct TestLoopPadding
   void analysisDMAStartNode(func::FuncOp function, std::vector<MemRefAffineMapForOps>& targetBuffer);
   void createTimingWrapperFunction(mlir::ModuleOp module, mlir::OpBuilder builder, mlir::FunctionType kernelFuncType);
   void createValidationWrapperFunction(mlir::ModuleOp module, mlir::OpBuilder builder, mlir::FunctionType kernelFuncType);
+  int getPaddingType(mlir::Operation *operation);
   std::vector<std::tuple<int64_t, int64_t, Value>> loopInfoMap;
   std::vector<MemRefAffineMapForOps> prePaddingInfo;
   std::vector<MemRefAffineMapForOps> postPaddingInfo;
@@ -558,6 +563,7 @@ void TestLoopPadding::analysisDMAStartNode(
     auto result = getDramMemRef(dmaOp);
     Value dram_memref = result.first;
     bool is_write = result.second;
+    int padding_type = getPaddingType(dmaOp);
 
     for (auto &existingInfo : targetBuffer) {
       if (existingInfo.getMemRef() == dram_memref) {
@@ -586,20 +592,20 @@ void TestLoopPadding::analysisDMAStartNode(
           // Walk up the block to find the loop defining this operand as an induction variable
           if (auto nestedApplyOp = operand.getDefiningOp<mlir::affine::AffineApplyOp>()) {
             nested = true;
-            auto info = MemRefAffineMapForOps(dram_memref, nestedApplyOp, is_write);
+            auto info = MemRefAffineMapForOps(dram_memref, nestedApplyOp, is_write, padding_type);
             targetBuffer.push_back(info);
             break;
           }
         }
         if (!nested) {
-          auto info = MemRefAffineMapForOps(dram_memref, applyOp, is_write);
+          auto info = MemRefAffineMapForOps(dram_memref, applyOp, is_write, padding_type);
           targetBuffer.push_back(info);
         }
         break;
       } else if (auto blockArg = llvm::dyn_cast<mlir::BlockArgument>(operand)) {
         auto definingOp = blockArg.getOwner()->getParentOp();
         if (auto affineForOp = llvm::dyn_cast<mlir::affine::AffineForOp>(definingOp)) {
-          auto info = MemRefAffineMapForOps(dram_memref, affineForOp, is_write);
+          auto info = MemRefAffineMapForOps(dram_memref, affineForOp, is_write, padding_type);
           targetBuffer.push_back(info);
           break;
         }
@@ -697,14 +703,28 @@ void TestLoopPadding::createValidationWrapperFunction(mlir::ModuleOp module, mli
     if (preInfo.areLoopRangesEqual(postInfo)) {
       continue;
     }
-
     if (usedMemRefs.find(postMemRef.getAsOpaquePointer()) == usedMemRefs.end()) {
       std::string paddedBufName = std::string("_padding_buffer") + std::to_string(i);
       mlir::MemRefType paddedMemRefType = mlir::dyn_cast<mlir::MemRefType>(postMemRef.getType());
+      int padding_type = postInfo.getPaddingType();
+      float initial_value;
+      if (padding_type == 0) { // zero padding
+        initial_value = 0;
+      } else if (padding_type == 1) { // negative padding (-inf) for softmax reduction
+        initial_value = -std::numeric_limits<float>::infinity();
+      }
+      auto InitAttr = builder.getFloatAttr(builder.getF32Type(), initial_value);
+      auto shape = paddedMemRefType.getShape();
+      int64_t totalSize = 1;
+      for (int64_t dim : shape)
+        totalSize *= dim;
+      SmallVector<mlir::Attribute> values(totalSize, InitAttr);
+      auto tensorType = mlir::RankedTensorType::get(shape, paddedMemRefType.getElementType());
+      auto denseAttr = mlir::DenseElementsAttr::get(tensorType, values);
       auto globalMemRefOp = builder.create<mlir::memref::GlobalOp>(
                               builder.getUnknownLoc(), paddedBufName,
                               builder.getStringAttr("private"),
-                              paddedMemRefType, mlir::Attribute(), false,
+                              paddedMemRefType, denseAttr, false,
                               builder.getIntegerAttr(builder.getIntegerType(64), 0x1000));
       padded_buffer[argIdx] = globalMemRefOp;
       usedMemRefs.insert(postMemRef.getAsOpaquePointer());
@@ -828,6 +848,18 @@ void TestLoopPadding::createValidationWrapperFunction(mlir::ModuleOp module, mli
   // Add a return operation to the wrapper function
   builder.setInsertionPointToEnd(entryBlock);
   builder.create<mlir::func::ReturnOp>(module.getLoc());
+}
+
+int TestLoopPadding::getPaddingType(mlir::Operation *operation) {
+  auto attr = operation->getAttr("padding");
+  if (!attr) {
+    return 0;
+  }
+  if (auto intAttr = llvm::dyn_cast<mlir::IntegerAttr>(attr)) {
+    return intAttr.getInt();
+  }
+  else // report error
+    operation->emitError() << "Invalid padding type (0: zero, 1: negative)\n";
 }
 
 namespace mlir {

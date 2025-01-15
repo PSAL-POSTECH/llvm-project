@@ -450,12 +450,15 @@ public:
     auto subTileAttr = op->getAttr("subtile_size");
     auto asyncAttr = op->getAttr("async");
     auto transposeAttr = op->getAttr("transpose");
+    auto paddingAttr = op->getAttr("padding");
     if (subTileAttr)
       attr.append(NamedAttribute(StringAttr::get(op->getContext(), "subtile_size"), subTileAttr));
     if (asyncAttr)
       attr.append(NamedAttribute(StringAttr::get(op->getContext(), "async"), asyncAttr));
     if (transposeAttr)
       attr.append(NamedAttribute(StringAttr::get(op->getContext(), "transpose"), transposeAttr));
+    if (paddingAttr)
+      attr.append(NamedAttribute(StringAttr::get(op->getContext(), "padding"), paddingAttr));
 
     rewriter.replaceOpWithNewOp<memref::DmaStartOp>(
         op, op.getSrcMemRef(), *maybeExpandedSrcMap, op.getDstMemRef(),
