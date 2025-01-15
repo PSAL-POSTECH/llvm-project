@@ -49,6 +49,24 @@ std::pair<Value, bool> getDramMemRef(mlir::affine::AffineDmaStartOp dmaOp) {
   return std::make_pair(dram_memref, is_write);
 }
 
+std::pair<Value, bool> getSramMemRef(mlir::affine::AffineDmaStartOp dmaOp) {
+  auto dst_space = dmaOp.getDstMemorySpace();
+  auto src_space = dmaOp.getSrcMemorySpace();
+  Value sram_memref;
+  bool is_write;
+
+  if (dst_space == 0 && src_space == 1) {
+    sram_memref = dmaOp.getSrcMemRef();
+    is_write = true;
+  } else if (dst_space == 1 && src_space == 0) {
+    sram_memref = dmaOp.getDstMemRef();
+    is_write = false;
+  } else {
+    dmaOp.emitError() << "Unexpected memory space, src: " << src_space << ", dst: " << dst_space << "\n";
+  }
+  return std::make_pair(sram_memref, is_write);
+}
+
 static std::pair<unsigned, VectorType> legalizeVectorType(const Type &type) {
   VectorType vt = cast<VectorType>(type);
   // To simplify test pass, avoid multi-dimensional vectors.
@@ -227,9 +245,23 @@ struct MatmulOpLowering : public OpRewritePattern<linalg::MatmulOp> {
     op->getParentRegion()->getParentRegion()->walk([&](mlir::Operation *nestedOp) {
       if (auto dmaStartOp = llvm::dyn_cast<affine::AffineDmaStartOp>(nestedOp)) { // Replace DMAStartOp with actual `dma_start` op type
         auto result = getDramMemRef(dmaStartOp);
+        auto sramRef = getSramMemRef(dmaStartOp);
+        bool sramUsedInMatmul = false;
+
+        for (auto operand : op->getOperands()) {
+          if (operand == sramRef.first) {
+            sramUsedInMatmul = true;
+            break;
+          }
+        }
         /* Only DMA load */
         if (result.second)
           return WalkResult::advance();
+
+        /* Only wait operand dma */
+        if (!sramUsedInMatmul)
+          return WalkResult::advance();
+
         auto blockArg = mlir::cast<mlir::BlockArgument>(result.first);
         if (!blockArg)
           return WalkResult::advance();
