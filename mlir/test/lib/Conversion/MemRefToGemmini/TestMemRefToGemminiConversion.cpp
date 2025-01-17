@@ -278,11 +278,16 @@ struct DmaStartOpLowering : public ConvertOpToLLVMPattern<memref::DmaStartOp> {
     int64_t max_tensor_dim = 4;
     // config1
     char* configAsmStr = getAsmString(func7);
+
+    // expand vlane_split_axis to 4D
+    int64_t expanding_dim = max_tensor_dim - tile_shape.size();
+    vlane_split_axis += expanding_dim;
     // config_rs1 = 1st dim << 48 | 2nd dim << 32 | 3rd dim << 16 | 4th dim size
     // config_rs2 = vlane_stride << 32 | config_type << 17  | vlane_split_axis << 14 | element size
     SmallVector<int64_t> sub_tensor_shape(max_tensor_dim, 1);
-    for (int i = (max_tensor_dim - tile_shape.size()); i < max_tensor_dim; i++)
-      sub_tensor_shape[i] = tile_shape[i];
+    for (int i = 0; i < tile_shape.size(); i++) {
+      sub_tensor_shape[expanding_dim + i] = tile_shape[i];
+    }
     Value config_rs1 = rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(sub_tensor_shape[0]));
     config_rs1 = rewriter.create<LLVM::ShlOp>(loc, rewriter.getI64Type(), config_rs1, shift48);
     config_rs1 = rewriter.create<LLVM::OrOp>(loc, config_rs1, rewriter.create<LLVM::ShlOp>(loc, rewriter.getI64Type(), rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(sub_tensor_shape[1])), shift32));
@@ -308,8 +313,8 @@ struct DmaStartOpLowering : public ConvertOpToLLVMPattern<memref::DmaStartOp> {
     // config_rs1 = 1st dim stride << 32 | 2nd dim stride
     // config_rs2 = 3rd dim stride << 32 | 4th dim stride
     SmallVector<int64_t> mm_strides_4d(max_tensor_dim, 1);
-    for (int i = (max_tensor_dim - mm_strides.size()); i < max_tensor_dim; i++) {
-      mm_strides_4d[i] = mm_strides[i];
+    for (int i = 0; i < mm_strides.size(); i++) {
+      mm_strides_4d[expanding_dim + i] = mm_strides[i];
     }
     config_rs1 = rewriter.create<LLVM::ShlOp>(loc, rewriter.getI64Type(), rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(mm_strides_4d[0])), shift32);
     config_rs1 = rewriter.create<LLVM::OrOp>(loc, config_rs1, rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(mm_strides_4d[1])));
@@ -331,8 +336,8 @@ struct DmaStartOpLowering : public ConvertOpToLLVMPattern<memref::DmaStartOp> {
     // config_rs1 = 1st dim spad_stride << 32 | 2nd dim spad_stride
     // config_rs2 = 3rd dim spad_stride << 32 | 4th dim spad_stride
     SmallVector<int64_t> spad_strides_4d(max_tensor_dim, 1);
-    for (int i = (max_tensor_dim - spad_strides.size()); i < max_tensor_dim; i++) {
-      spad_strides_4d[i] = spad_strides[i];
+    for (int i = 0; i < spad_strides.size(); i++) {
+      spad_strides_4d[expanding_dim + i] = spad_strides[i];
     }
     config_rs1 = rewriter.create<LLVM::ShlOp>(loc, rewriter.getI64Type(), rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(spad_strides_4d[0])), shift32);
     config_rs1 = rewriter.create<LLVM::OrOp>(loc, config_rs1, rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(spad_strides_4d[1])));
