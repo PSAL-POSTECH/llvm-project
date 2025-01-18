@@ -31,6 +31,8 @@
 #define CONFIG_MVIN3 2
 #define CONFIG_MVOUT 3
 
+#define MAX_TENSOR_DIM 4
+
 namespace mlir {
 namespace {
 
@@ -91,6 +93,26 @@ int getAsyncValue(mlir::Operation *operation) {
     return 1;
 }
 
+llvm::SmallVector<int64_t> getSramStride(mlir::Operation *operation) {
+  llvm::SmallVector<int64_t> sram_stride;
+  auto attr = operation->getAttr("sram_stride");
+  if (!attr) {
+    return sram_stride; // Return empty SmallVector
+  }
+
+  if (auto arrayAttr = llvm::dyn_cast<mlir::ArrayAttr>(attr)) {
+    for (auto element : arrayAttr) {
+      // Assume the elements are integers
+      if (auto intAttr = llvm::dyn_cast<mlir::IntegerAttr>(element)) {
+        sram_stride.push_back(intAttr.getInt());
+      } else {
+        llvm::errs() << "Unsupported element type in 'sram_stride'.\n";
+      }
+    }
+  }
+  return sram_stride;
+}
+
 /// Lowering memref.dma_start operation to Gemmini instructions with LLVM Asm.
 struct DmaWaitOpLowering : public ConvertOpToLLVMPattern<memref::DmaWaitOp> {
   int vectorlaneStride;
@@ -123,6 +145,7 @@ struct DmaStartOpLowering : public ConvertOpToLLVMPattern<memref::DmaStartOp> {
     auto loc = op.getLoc();
     unsigned func7;
     llvm::SmallVector<int64_t, 2> dmaSubtile = getSubtileSize(op);
+    llvm::SmallVector<int64_t> spad_strides = getSramStride(op);
 
     SmallVector<Value> operands;
     for (auto val : adaptor.getOperands())
@@ -150,7 +173,6 @@ struct DmaStartOpLowering : public ConvertOpToLLVMPattern<memref::DmaStartOp> {
     uint64_t vlane_split_axis = extractConstantIntValue(vlane_split_axis_val);
     Value num_elt_per_stride = op.getNumElementsPerStride();
     uint64_t vlane_stride = extractConstantIntValue(num_elt_per_stride);
-    int is_fine_grained = (vlane_stride >> 31) & 1; // FIXME: Do we need this? (in sub-tile case)
     vlane_stride = (vlane_stride & 0x7FFF); // mask out the fine-grained bit
     uint64_t vlane_stride_byte = vlane_stride * elen / 8;
     Value numElements = op.getNumElements();
@@ -162,23 +184,19 @@ struct DmaStartOpLowering : public ConvertOpToLLVMPattern<memref::DmaStartOp> {
     bool is_mvin = dmaType == MVIN || dmaType == MVIN2 || dmaType == MVIN3;
 
     SmallVector<int64_t> mm_strides;
-    SmallVector<int64_t> spad_strides;
     ValueRange indices;
     int64_t mm_offset;
-    int64_t spad_offset;
     if (is_mvin) { // MVIN
       rs1 = rewriter.create<LLVM::PtrToIntOp>(loc, rewriter.getI64Type(), SrcPtr);
       spad_addr = rewriter.create<LLVM::PtrToIntOp>(loc, rewriter.getI64Type(), DstPtr);
       tile_shape = dstMemRefType.getShape();
       std::tie(mm_strides, mm_offset) = getStridesAndOffset(srcMemRefType);
-      std::tie(spad_strides, spad_offset) = getStridesAndOffset(dstMemRefType);
       indices = op.getSrcIndices();;
     } else { // MVOUT
       rs1 = rewriter.create<LLVM::PtrToIntOp>(loc, rewriter.getI64Type(), DstPtr);
       spad_addr = rewriter.create<LLVM::PtrToIntOp>(loc, rewriter.getI64Type(), SrcPtr);
       tile_shape = srcMemRefType.getShape();
       std::tie(mm_strides, mm_offset) = getStridesAndOffset(dstMemRefType);
-      std::tie(spad_strides, spad_offset) = getStridesAndOffset(srcMemRefType);
       indices = op.getDstIndices();
     }
     AffineMap index_map;
@@ -188,7 +206,6 @@ struct DmaStartOpLowering : public ConvertOpToLLVMPattern<memref::DmaStartOp> {
       }
     }
     if (index_map) {
-      // SmallVector<int64_t> strides(index_map.getNumDims(), 0);
       mm_strides = SmallVector<int64_t>(index_map.getNumDims(), 0);
       // Ensure the AffineMap has at least one result
       if (index_map.getNumResults() != 1) {
@@ -217,35 +234,17 @@ struct DmaStartOpLowering : public ConvertOpToLLVMPattern<memref::DmaStartOp> {
     }
 
     /* Use subtile size if it has subtile attribute */
-    uint64_t spad_stride = tile_shape[0] * elen / 8;
-    bool lane_split_axis = vlane_stride < subtile_shape[1] ? 0 : 1;
     if (subtile_shape.size()) {
-      spad_stride = tile_shape[lane_split_axis] * elen / 8;
       tile_shape = subtile_shape;
     }
 
     func7 = dmaType;
-    int col_factor = 1;
-    uint64_t tile_row;
-    uint64_t tile_col;
 
     if (elen < 8) {
       if (vlane_stride_byte < 1) {
         vlane_stride_byte = 1;
       }
-      col_factor = 8 / elen;
       elen = 8;
-    }
-
-    if (tile_shape.size() == 2) {
-      tile_row = tile_shape[0];
-      tile_col = tile_shape[1];
-    } else if (tile_shape.size() == 1) {
-      if (is_fine_grained) {
-        tile_col = std::min((tile_shape[0] / col_factor), VECTOR_LANE);
-      } else {
-        tile_col = tile_shape[0];
-      }
     }
 
     char* asmStr = getAsmString(func7);
@@ -275,17 +274,16 @@ struct DmaStartOpLowering : public ConvertOpToLLVMPattern<memref::DmaStartOp> {
       return failure();
     }
 
-    int64_t max_tensor_dim = 4;
     // config1
     char* configAsmStr = getAsmString(func7);
 
     // expand vlane_split_axis to 4D
-    int64_t expanding_dim = max_tensor_dim - tile_shape.size();
+    int64_t expanding_dim = MAX_TENSOR_DIM - tile_shape.size();
     vlane_split_axis += expanding_dim;
     // config_rs1 = 1st dim << 48 | 2nd dim << 32 | 3rd dim << 16 | 4th dim size
     // config_rs2 = vlane_stride << 32 | config_type << 17  | vlane_split_axis << 14 | element size
-    SmallVector<int64_t> sub_tensor_shape(max_tensor_dim, 1);
-    for (int i = 0; i < tile_shape.size(); i++) {
+    SmallVector<int64_t> sub_tensor_shape(MAX_TENSOR_DIM, 1);
+    for (int i = 0; i < static_cast<int>(tile_shape.size()); i++) {
       sub_tensor_shape[expanding_dim + i] = tile_shape[i];
     }
     Value config_rs1 = rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(sub_tensor_shape[0]));
@@ -312,8 +310,8 @@ struct DmaStartOpLowering : public ConvertOpToLLVMPattern<memref::DmaStartOp> {
     char* config2AsmStr = getAsmString(CONFIG2);
     // config_rs1 = 1st dim stride << 32 | 2nd dim stride
     // config_rs2 = 3rd dim stride << 32 | 4th dim stride
-    SmallVector<int64_t> mm_strides_4d(max_tensor_dim, 1);
-    for (int i = 0; i < mm_strides.size(); i++) {
+    SmallVector<int64_t> mm_strides_4d(MAX_TENSOR_DIM, 1);
+    for (int i = 0; i < static_cast<int>(mm_strides.size()); i++) {
       mm_strides_4d[expanding_dim + i] = mm_strides[i];
     }
     config_rs1 = rewriter.create<LLVM::ShlOp>(loc, rewriter.getI64Type(), rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(mm_strides_4d[0])), shift32);
@@ -335,8 +333,8 @@ struct DmaStartOpLowering : public ConvertOpToLLVMPattern<memref::DmaStartOp> {
     char* config3AsmStr = getAsmString(CONFIG3);
     // config_rs1 = 1st dim spad_stride << 32 | 2nd dim spad_stride
     // config_rs2 = 3rd dim spad_stride << 32 | 4th dim spad_stride
-    SmallVector<int64_t> spad_strides_4d(max_tensor_dim, 1);
-    for (int i = 0; i < spad_strides.size(); i++) {
+    SmallVector<int64_t> spad_strides_4d(MAX_TENSOR_DIM, 1);
+    for (int i = 0; i < static_cast<int>(spad_strides.size()); i++) {
       spad_strides_4d[expanding_dim + i] = spad_strides[i];
     }
     config_rs1 = rewriter.create<LLVM::ShlOp>(loc, rewriter.getI64Type(), rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(spad_strides_4d[0])), shift32);
