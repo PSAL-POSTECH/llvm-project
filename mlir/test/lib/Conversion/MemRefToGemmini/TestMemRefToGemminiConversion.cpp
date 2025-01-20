@@ -310,7 +310,7 @@ struct DmaStartOpLowering : public ConvertOpToLLVMPattern<memref::DmaStartOp> {
     char* config2AsmStr = getAsmString(CONFIG2);
     // config_rs1 = 1st dim stride << 32 | 2nd dim stride
     // config_rs2 = 3rd dim stride << 32 | 4th dim stride
-    SmallVector<int64_t> mm_strides_4d(MAX_TENSOR_DIM, 1);
+    SmallVector<int64_t> mm_strides_4d(MAX_TENSOR_DIM, 0);
     for (int i = 0; i < static_cast<int>(mm_strides.size()); i++) {
       mm_strides_4d[expanding_dim + i] = mm_strides[i];
     }
@@ -333,7 +333,7 @@ struct DmaStartOpLowering : public ConvertOpToLLVMPattern<memref::DmaStartOp> {
     char* config3AsmStr = getAsmString(CONFIG3);
     // config_rs1 = 1st dim spad_stride << 32 | 2nd dim spad_stride
     // config_rs2 = 3rd dim spad_stride << 32 | 4th dim spad_stride
-    SmallVector<int64_t> spad_strides_4d(MAX_TENSOR_DIM, 1);
+    SmallVector<int64_t> spad_strides_4d(MAX_TENSOR_DIM, 0);
     for (int i = 0; i < static_cast<int>(spad_strides.size()); i++) {
       spad_strides_4d[expanding_dim + i] = spad_strides[i];
     }
