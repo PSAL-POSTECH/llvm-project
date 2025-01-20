@@ -37,7 +37,7 @@ void setLoopUpperBound(mlir::affine::AffineForOp forOp, int64_t newUpperBound) {
   forOp.setUpperBoundMap(newBoundMap);
 }
 
-std::pair<Value, bool> getDramMemRef(mlir::affine::AffineDmaStartOp dmaOp) {
+std::pair<Value, bool> getDramMemRef(mlir::memref::DmaStartOp dmaOp) {
   auto dst_space = dmaOp.getDstMemorySpace();
   auto src_space = dmaOp.getSrcMemorySpace();
   Value dram_memref;
@@ -239,7 +239,7 @@ void TestLoopPadding::runOnOperation() {
 
     // Step 3: traverse dmaOp to store original affineExpr which are used to get orignal stride
     std::unordered_map<const void*, mlir::AffineExpr> dmaOpExpr;
-    function.walk([&](mlir::affine::AffineDmaStartOp dmaOp) {
+    function.walk([&](mlir::memref::DmaStartOp dmaOp) {
       for (auto operand : dmaOp.getOperands()) {
         auto applyOp = operand.getDefiningOp<mlir::affine::AffineApplyOp>();
         if (!applyOp) {
@@ -252,7 +252,7 @@ void TestLoopPadding::runOnOperation() {
     });
     std::vector<Value> memRefSet;
     //llvm::errs() << "=============updated axis===========\n";
-    function.walk([&](mlir::affine::AffineDmaStartOp dmaOp) {
+    function.walk([&](mlir::memref::DmaStartOp dmaOp) {
       auto result = getDramMemRef(dmaOp);
       Value dram_memref = result.first;
       Value fifthOperand = dmaOp.getStride();
@@ -559,7 +559,7 @@ void TestLoopPadding::analysisDMAStartNode(
   func::FuncOp function, std::vector<MemRefAffineMapForOps>& targetBuffer)
 {
   // Analysis pre-padding info
-  function.walk([&](mlir::affine::AffineDmaStartOp dmaOp) {
+  function.walk([&](mlir::memref::DmaStartOp dmaOp) {
     auto result = getDramMemRef(dmaOp);
     Value dram_memref = result.first;
     bool is_write = result.second;
