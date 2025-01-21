@@ -2,6 +2,7 @@
 #include "mlir/Conversion/LLVMCommon/ConversionTarget.h"
 #include "mlir/Conversion/LLVMCommon/TypeConverter.h"
 #include "mlir/Conversion/LLVMCommon/Pattern.h"
+#include "mlir/Dialect/Affine/Utils.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Interfaces/FunctionInterfaces.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
@@ -51,8 +52,8 @@ struct DmaFineGrained : public PassWrapper<DmaFineGrained, OperationPass<func::F
                           llvm::cl::ZeroOrMore};
   void runOnOperation() override;
   llvm::SmallVector<mlir::Attribute, 2> getSubtileSize(mlir::Operation *operation);
+  llvm::SmallVector<mlir::Attribute> getSramStride(mlir::Operation *operation);
   int getAsyncValue(mlir::Operation *operation);
-  int is_transpose(mlir::Operation *operation);
 };
 
 } // namespace
@@ -76,7 +77,6 @@ void DmaFineGrained::runOnOperation() {
   int64_t vectorlane = systolicSize;
   builder.setInsertionPointToStart(&func.front());
   Value zeroIndex = builder.create<arith::ConstantIndexOp>(func.getLoc(), 0);
-  auto c_set = builder.create<arith::ConstantIndexOp>(func.getLoc(), 2147483650);
   auto tagMemRefType = MemRefType::get({tileSizeN / vectorlane, 1, tileSizeM / vectorlane}, builder.getIntegerType(32));
   auto BtagMemRefType = MemRefType::get({tileSizeN / vectorlane, tileSizeM / vectorlane}, builder.getIntegerType(32));
   auto XtagMemRef = builder.create<memref::AllocOp>(func.getLoc(), tagMemRefType);
@@ -105,16 +105,16 @@ void DmaFineGrained::runOnOperation() {
   }
 
   // inner loop fine-grained dma
-  SmallVector<affine::AffineDmaStartOp, 2> dmaOps;
-  func.walk([&](affine::AffineDmaStartOp dmaStartOp) {
+  SmallVector<memref::DmaStartOp, 2> dmaOps;
+  func.walk([&](memref::DmaStartOp dmaStartOp) {
     dmaOps.push_back(dmaStartOp);
   });
 
   // check Bias is moved to Output buffer
   bool is_bias = false;
-  affine::AffineDmaStartOp mvin_bias;
-  affine::AffineDmaStartOp mvin_input;
-  affine::AffineDmaStartOp mvin_weight;
+  memref::DmaStartOp mvin_bias;
+  memref::DmaStartOp mvin_input;
+  memref::DmaStartOp mvin_weight;
 
   for(auto dmaOp : dmaOps) {
     Value numElements = dmaOp.getNumElements();
@@ -143,6 +143,8 @@ void DmaFineGrained::runOnOperation() {
   AffineMap tag_idx_map = AffineMap::get(1, 0, builder.getAffineDimExpr(0).floorDiv(vectorlane));
   llvm::SmallVector<mlir::Attribute, 2> dma1Subtile = getSubtileSize(mvin_input);
   llvm::SmallVector<mlir::Attribute, 2> dma2Subtile = getSubtileSize(mvin_weight);
+  llvm::SmallVector<mlir::Attribute> dma1SramStrides = getSramStride(mvin_input);
+  llvm::SmallVector<mlir::Attribute> dma2SramStrides = getSramStride(mvin_weight);
   int dma1Async = getAsyncValue(mvin_input);
   int dma2Async = getAsyncValue(mvin_weight);
 
@@ -179,22 +181,30 @@ void DmaFineGrained::runOnOperation() {
     dma1Attr.set("subtile_size", builder.getArrayAttr(dma1Subtile));
   if (dma2Subtile.size())
     dma2Attr.set("subtile_size", builder.getArrayAttr(dma2Subtile));
+  if (dma1SramStrides.size())
+    dma1Attr.set("sram_stride", builder.getArrayAttr(dma1SramStrides));
+  if (dma2SramStrides.size())
+    dma2Attr.set("sram_stride", builder.getArrayAttr(dma2SramStrides));
   dma1Attr.set("async", builder.getIntegerAttr(builder.getI1Type(), dma1Async));
   dma2Attr.set("async", builder.getIntegerAttr(builder.getI1Type(), dma2Async));
-  dma1Attr.set("transpose", builder.getIntegerAttr(builder.getI1Type(), is_transpose(mvin_input)));
-  dma2Attr.set("transpose", builder.getIntegerAttr(builder.getI1Type(), is_transpose(mvin_weight)));
+  dma1Attr.set("fine_grained", builder.getIntegerAttr(builder.getI1Type(), 1));
+  dma2Attr.set("fine_grained", builder.getIntegerAttr(builder.getI1Type(), 1));
 
   if (is_bias) {
     // BIAS MVIN
     // reset builder location
     llvm::SmallVector<mlir::Attribute, 2> dmaSubtile = getSubtileSize(mvin_bias);
+    llvm::SmallVector<mlir::Attribute> dmaSramStrides = getSramStride(mvin_bias);
     int dmaAsync = getAsyncValue(mvin_bias);
     NamedAttrList dmaAttr;
     if (dmaSubtile.size()) {
       dmaAttr.set("subtile_size", builder.getArrayAttr(dmaSubtile));
     }
+    if (dmaSramStrides.size()) {
+      dmaAttr.set("sram_stride", builder.getArrayAttr(dmaSramStrides));
+    }
     dmaAttr.set("async", builder.getBoolAttr(dmaAsync));
-    dmaAttr.set("transpose", builder.getBoolAttr(is_transpose(mvin_bias)));
+    dmaAttr.set("fine_grained", builder.getBoolAttr(true));
 
     auto loc = mvin_bias.getLoc();
     builder.setInsertionPoint(mvin_bias);
@@ -221,9 +231,6 @@ void DmaFineGrained::runOnOperation() {
     }
     new_idx = builder.create<affine::AffineApplyOp>(loc, sum_map, ValueRange{new_idx, srcIndices[0]});
     src_indices.push_back(new_idx);
-    auto num_elt_per_stride = mvin_bias.getNumElementsPerStride();
-    uint64_t chunk_size = getConstantIntValue(num_elt_per_stride);
-    auto new_set = builder.create<arith::ConstantIndexOp>(loc, 2147483648 + chunk_size);
     AffineMap spad_map_m = AffineMap::get(2, 0, builder.getAffineDimExpr(0) * (tileSizeM / vectorlane) + builder.getAffineDimExpr(1));
     auto dst_idx = builder.create<affine::AffineApplyOp>(loc, spad_map_m, ValueRange{j, i});
 
@@ -234,13 +241,16 @@ void DmaFineGrained::runOnOperation() {
     auto src_map = builder.getMultiDimIdentityMap(src_indices.size());
     auto dst_map = builder.getMultiDimIdentityMap(dst_indices.size());
     auto tag_map = builder.getMultiDimIdentityMap(tag_indices.size());
+    auto maybeExpandedSrcMap = affine::expandAffineMap(builder, loc, src_map, src_indices);
+    auto maybeExpandedDstMap = affine::expandAffineMap(builder, loc, dst_map, dst_indices);
+    auto maybeExpandedTagMap = affine::expandAffineMap(builder, loc, tag_map, tag_indices);
 
     // Insert the first dma_start operation
-    builder.create<affine::AffineDmaStartOp>(
-        loc, mvin_bias.getSrcMemRef(), src_map, src_indices,
-        mvin_bias.getDstMemRef(), dst_map, dst_indices,
-        BtagMemRef, tag_map, tag_indices,
-        mvin_bias.getNumElements(), mvin_bias.getStride(), new_set, dmaAttr);
+    builder.create<memref::DmaStartOp>(
+        loc, mvin_bias.getSrcMemRef(), *maybeExpandedSrcMap, mvin_bias.getDstMemRef(),
+        *maybeExpandedDstMap, mvin_bias.getNumElements(), BtagMemRef,
+        *maybeExpandedTagMap, mvin_bias.getStride(), mvin_bias.getNumElementsPerStride(),
+        dmaAttr);
     mvin_bias.erase();
     src_indices.clear();
     dst_indices.clear();
@@ -280,9 +290,6 @@ void DmaFineGrained::runOnOperation() {
   new_idx = builder.create<affine::AffineApplyOp>(loc, sum_map, ValueRange{new_idx, srcIndices[0]});
   // update srcIndices
   src_indices.push_back(new_idx);
-  auto num_elt_per_stride = mvin_input.getNumElementsPerStride();
-  uint64_t chunk_size = getConstantIntValue(num_elt_per_stride);
-  auto new_set = builder.create<arith::ConstantIndexOp>(loc, 2147483648 + chunk_size);
   // affine_map<(d0, d1) -> (d0 * (tileSizeM / vectorlane) + d1)>
   AffineMap spad_map_m = AffineMap::get(2, 0, builder.getAffineDimExpr(0) * (tileSizeM / vectorlane) + builder.getAffineDimExpr(1));
   auto dst_idx = builder.create<affine::AffineApplyOp>(loc, spad_map_m, ValueRange{k, i});
@@ -294,13 +301,16 @@ void DmaFineGrained::runOnOperation() {
   auto src_map = builder.getMultiDimIdentityMap(src_indices.size());
   auto dst_map = builder.getMultiDimIdentityMap(dst_indices.size());
   auto tag_map = builder.getMultiDimIdentityMap(tag_indices.size());
+  auto maybeExpandedSrcMap = affine::expandAffineMap(builder, loc, src_map, src_indices);
+  auto maybeExpandedDstMap = affine::expandAffineMap(builder, loc, dst_map, dst_indices);
+  auto maybeExpandedTagMap = affine::expandAffineMap(builder, loc, tag_map, tag_indices);
 
   // Insert the first dma_start operation
-  builder.create<affine::AffineDmaStartOp>(
-      loc, mvin_input.getSrcMemRef(), src_map, src_indices,
-      mvin_input.getDstMemRef(), dst_map, dst_indices,
-      XtagMemRef, tag_map, tag_indices,
-      mvin_input.getNumElements(), mvin_input.getStride(), new_set, dma1Attr);
+  builder.create<memref::DmaStartOp>(
+      loc, mvin_input.getSrcMemRef(), *maybeExpandedSrcMap, mvin_input.getDstMemRef(),
+      *maybeExpandedDstMap, mvin_input.getNumElements(), XtagMemRef,
+      *maybeExpandedTagMap, mvin_input.getStride(), mvin_input.getNumElementsPerStride(),
+      dma1Attr);
 
   // Insert the second dma_start operation
   srcIndices = mvin_weight.getSrcIndices();
@@ -319,9 +329,6 @@ void DmaFineGrained::runOnOperation() {
   src_indices.clear();
   src_indices.push_back(new_idx);
 
-  num_elt_per_stride = mvin_weight.getNumElementsPerStride();
-  chunk_size = getConstantIntValue(num_elt_per_stride);
-  new_set = builder.create<arith::ConstantIndexOp>(loc, 2147483648 + chunk_size);
   AffineMap spad_map_k = AffineMap::get(2, 0, builder.getAffineDimExpr(0) * (tileSizeK / vectorlane) + builder.getAffineDimExpr(1));
 
   dst_idx = builder.create<affine::AffineApplyOp>(loc, spad_map_k, ValueRange{j, k});
@@ -335,11 +342,14 @@ void DmaFineGrained::runOnOperation() {
   src_map = builder.getMultiDimIdentityMap(src_indices.size());
   dst_map = builder.getMultiDimIdentityMap(dst_indices.size());
   tag_map = builder.getMultiDimIdentityMap(tag_indices.size());
-  builder.create<affine::AffineDmaStartOp>(
-      loc, mvin_weight.getSrcMemRef(), src_map, src_indices,
-      mvin_weight.getDstMemRef(), dst_map, dst_indices,
-      WtagMemRef, tag_map, tag_indices,
-      mvin_weight.getNumElements(), mvin_weight.getStride(), new_set, dma2Attr);
+  maybeExpandedSrcMap = affine::expandAffineMap(builder, loc, src_map, src_indices);
+  maybeExpandedDstMap = affine::expandAffineMap(builder, loc, dst_map, dst_indices);
+  maybeExpandedTagMap = affine::expandAffineMap(builder, loc, tag_map, tag_indices);
+  builder.create<memref::DmaStartOp>(
+      loc, mvin_weight.getSrcMemRef(), *maybeExpandedSrcMap, mvin_weight.getDstMemRef(),
+      *maybeExpandedDstMap, mvin_weight.getNumElements(), WtagMemRef,
+      *maybeExpandedTagMap, mvin_weight.getStride(), mvin_weight.getNumElementsPerStride(),
+      dma2Attr);
 
   // Erase the original dma_start operations
   mvin_input.erase();
@@ -377,15 +387,24 @@ int DmaFineGrained::getAsyncValue(mlir::Operation *operation) {
     return 1;
 }
 
-int DmaFineGrained::is_transpose(mlir::Operation *operation) {
-  auto attr = operation->getAttr("transpose");
-  if (!attr)
-    return 0;
+llvm::SmallVector<mlir::Attribute> DmaFineGrained::getSramStride(mlir::Operation *operation) {
+  llvm::SmallVector<mlir::Attribute> sram_stride;
+  auto attr = operation->getAttr("sram_stride");
+  if (!attr) {
+    return sram_stride; // Return empty SmallVector
+  }
 
-  if (auto intAttr = llvm::dyn_cast<mlir::IntegerAttr>(attr))
-    return intAttr.getInt(); // Treat non-zero as true
-  else
-    return 1;
+  if (auto arrayAttr = llvm::dyn_cast<mlir::ArrayAttr>(attr)) {
+    for (auto element : arrayAttr) {
+      // Assume the elements are integers
+      if (auto intAttr = llvm::dyn_cast<mlir::IntegerAttr>(element)) {
+        sram_stride.push_back(intAttr);
+      } else {
+        llvm::errs() << "Unsupported element type in 'sram_stride'.\n";
+      }
+    }
+  }
+  return sram_stride;
 }
 
 namespace mlir {

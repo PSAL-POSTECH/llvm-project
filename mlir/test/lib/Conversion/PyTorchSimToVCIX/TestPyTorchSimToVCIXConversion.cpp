@@ -16,6 +16,7 @@
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/LLVMIR/VCIXDialect.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
+#include "mlir/Dialect/Affine/Utils.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
@@ -31,7 +32,7 @@ namespace {
 int SYSTOLIC_SIZE = 128;
 int VLEN = 128;
 
-std::pair<Value, bool> getDramMemRef(mlir::affine::AffineDmaStartOp dmaOp) {
+std::pair<Value, bool> getDramMemRef(mlir::memref::DmaStartOp dmaOp) {
   auto dst_space = dmaOp.getDstMemorySpace();
   auto src_space = dmaOp.getSrcMemorySpace();
   Value dram_memref;
@@ -49,7 +50,7 @@ std::pair<Value, bool> getDramMemRef(mlir::affine::AffineDmaStartOp dmaOp) {
   return std::make_pair(dram_memref, is_write);
 }
 
-std::pair<Value, bool> getSramMemRef(mlir::affine::AffineDmaStartOp dmaOp) {
+std::pair<Value, bool> getSramMemRef(mlir::memref::DmaStartOp dmaOp) {
   auto dst_space = dmaOp.getDstMemorySpace();
   auto src_space = dmaOp.getSrcMemorySpace();
   Value sram_memref;
@@ -243,7 +244,7 @@ struct MatmulOpLowering : public OpRewritePattern<linalg::MatmulOp> {
     mlir::Value numElements = rewriter.create<mlir::arith::ConstantIndexOp>(loc, 1);
     // Search outer K loop
     op->getParentRegion()->getParentRegion()->walk([&](mlir::Operation *nestedOp) {
-      if (auto dmaStartOp = llvm::dyn_cast<affine::AffineDmaStartOp>(nestedOp)) { // Replace DMAStartOp with actual `dma_start` op type
+      if (auto dmaStartOp = llvm::dyn_cast<memref::DmaStartOp>(nestedOp)) { // Replace DMAStartOp with actual `dma_start` op type
         auto result = getDramMemRef(dmaStartOp);
         auto sramRef = getSramMemRef(dmaStartOp);
         bool sramUsedInMatmul = false;
@@ -283,14 +284,17 @@ struct MatmulOpLowering : public OpRewritePattern<linalg::MatmulOp> {
     }
     auto ATagMap = rewriter.getMultiDimIdentityMap(llvm::dyn_cast<MemRefType>(ADmaTag.getType()).getRank());
     auto BTagMap = rewriter.getMultiDimIdentityMap(llvm::dyn_cast<MemRefType>(BDmaTag.getType()).getRank());
-    rewriter.create<affine::AffineDmaWaitOp>(loc, ADmaTag, ATagMap, ValueRange{c0, c0, m_idx}, numElements);
-    rewriter.create<affine::AffineDmaWaitOp>(loc, BDmaTag, BTagMap, ValueRange{n_idx, c0, c0}, numElements);
+    auto maybeExpandedSrcMap = affine::expandAffineMap(rewriter, loc, ATagMap, ValueRange{c0, c0, m_idx});
+    auto maybeExpandedDstMap = affine::expandAffineMap(rewriter, loc, BTagMap, ValueRange{n_idx, c0, c0});
+    rewriter.create<memref::DmaWaitOp>(loc, ADmaTag, *maybeExpandedSrcMap, numElements);
+    rewriter.create<memref::DmaWaitOp>(loc, BDmaTag, *maybeExpandedDstMap, numElements);
     if (BiasDmaTag) {
       /* Bias could be 1D or 2D */
       Value first_index = BiasDMAIndices[0].getDefiningOp<mlir::arith::ConstantIndexOp>() ? c0 : n_idx;
       Value third_index = BiasDMAIndices[0].getDefiningOp<mlir::arith::ConstantIndexOp>() ? c0 : m_idx;
       auto BiasTagMap = rewriter.getMultiDimIdentityMap(llvm::dyn_cast<MemRefType>(BiasDmaTag.getType()).getRank());
-      rewriter.create<affine::AffineDmaWaitOp>(loc, BiasDmaTag, BiasTagMap, ValueRange{first_index, third_index}, numElements);
+      auto maybeExpandedBiasMap = affine::expandAffineMap(rewriter, loc, BiasTagMap, ValueRange{first_index, third_index});
+      rewriter.create<memref::DmaWaitOp>(loc, BiasDmaTag, *maybeExpandedBiasMap, numElements);
     }
 
     // For vpush weight loop part

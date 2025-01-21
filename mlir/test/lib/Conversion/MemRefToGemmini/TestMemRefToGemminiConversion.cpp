@@ -93,6 +93,17 @@ int getAsyncValue(mlir::Operation *operation) {
     return 1;
 }
 
+int is_fine_grained(mlir::Operation *operation) {
+  auto attr = operation->getAttr("fine_grained");
+  if (!attr)
+    return 0;
+
+  if (auto intAttr = llvm::dyn_cast<mlir::IntegerAttr>(attr))
+    return intAttr.getInt(); // Treat non-zero as true
+  else
+    return 1;
+}
+
 llvm::SmallVector<int64_t> getSramStride(mlir::Operation *operation) {
   llvm::SmallVector<int64_t> sram_stride;
   auto attr = operation->getAttr("sram_stride");
@@ -199,12 +210,24 @@ struct DmaStartOpLowering : public ConvertOpToLLVMPattern<memref::DmaStartOp> {
       std::tie(mm_strides, mm_offset) = getStridesAndOffset(dstMemRefType);
       indices = op.getDstIndices();
     }
+
     AffineMap index_map;
+    ValueRange parentIndices;
     for (auto index : indices) {
       if (auto applyOp = index.getDefiningOp<affine::AffineApplyOp>()) {
         index_map = applyOp.getAffineMap();
+        parentIndices = applyOp.getOperands();
       }
     }
+    if (is_fine_grained(op)) { // fine-grained case has more than one parent
+      index_map = AffineMap();
+      for (auto parentIndex : parentIndices) {
+        if (auto applyOp = parentIndex.getDefiningOp<affine::AffineApplyOp>()) {
+          index_map = applyOp.getAffineMap();
+        }
+      }
+    }
+
     if (index_map) {
       mm_strides = SmallVector<int64_t>(index_map.getNumDims(), 0);
       // Ensure the AffineMap has at least one result
