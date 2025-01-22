@@ -426,7 +426,9 @@ struct TestPyTorchSimToVCIX
     VLEN = vlen;
     patterns.add<MatmulOpLowering, MathExpToVCIX>(ctx);
     LLVMConversionTarget target(getContext());
-    (void)applyPatternsAndFoldGreedily(getOperation(), std::move(patterns));
+    if (failed(applyPartialConversion(getOperation(), target, std::move(patterns)))) {
+      signalPassFailure();
+    }
   }
 
 
