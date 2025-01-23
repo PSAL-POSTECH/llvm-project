@@ -425,7 +425,10 @@ struct TestPyTorchSimToVCIX
     SYSTOLIC_SIZE = systolicSize;
     VLEN = vlen;
     patterns.add<MatmulOpLowering, MathExpToVCIX>(ctx);
-    LLVMConversionTarget target(getContext());
+    ConversionTarget target(getContext());
+    target.addIllegalOp<linalg::MatmulOp>();
+    target.addIllegalOp<math::ExpOp>();
+    target.markUnknownOpDynamicallyLegal([](Operation *) { return true; });
     if (failed(applyPartialConversion(getOperation(), target, std::move(patterns)))) {
       signalPassFailure();
     }
