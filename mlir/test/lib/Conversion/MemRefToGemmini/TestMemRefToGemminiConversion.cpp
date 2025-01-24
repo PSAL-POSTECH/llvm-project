@@ -301,7 +301,8 @@ struct DmaStartOpLowering : public ConvertOpToLLVMPattern<memref::DmaStartOp> {
 
     // expand vlane_split_axis to 4D
     int64_t expanding_dim = MAX_TENSOR_DIM - tile_shape.size();
-    vlane_split_axis += expanding_dim;
+    int64_t mm_expanding_dim = MAX_TENSOR_DIM - mm_strides.size();
+    vlane_split_axis += mm_expanding_dim;
     // config_rs1 = 1st dim << 48 | 2nd dim << 32 | 3rd dim << 16 | 4th dim size
     // config_rs2 = vlane_stride << 32 | config_type << 17  | vlane_split_axis << 14 | element size
     SmallVector<int64_t> sub_tensor_shape(MAX_TENSOR_DIM, 1);
@@ -331,7 +332,7 @@ struct DmaStartOpLowering : public ConvertOpToLLVMPattern<memref::DmaStartOp> {
     // config_rs2 = 3rd dim stride << 32 | 4th dim stride
     SmallVector<int64_t> mm_strides_4d(MAX_TENSOR_DIM, 0);
     for (int i = 0; i < static_cast<int>(mm_strides.size()); i++) {
-      mm_strides_4d[expanding_dim + i] = mm_strides[i];
+      mm_strides_4d[mm_expanding_dim + i] = mm_strides[i];
     }
     config_rs1 = rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(
       (mm_strides_4d[0]<<shift32) | (mm_strides_4d[1]&0xFFFFFFFF)
