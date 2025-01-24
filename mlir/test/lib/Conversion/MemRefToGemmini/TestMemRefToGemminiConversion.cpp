@@ -237,7 +237,6 @@ struct DmaStartOpLowering : public ConvertOpToLLVMPattern<memref::DmaStartOp> {
 
       // Extract the single result expression
       mlir::AffineExpr resultExpr = index_map.getResult(0);
-
       // Traverse the result expression to calculate strides
       resultExpr.walk([&](mlir::AffineExpr subExpr) {
         if (auto dimExpr = subExpr.dyn_cast<mlir::AffineDimExpr>()) {
@@ -272,11 +271,11 @@ struct DmaStartOpLowering : public ConvertOpToLLVMPattern<memref::DmaStartOp> {
 
     char* asmStr = getAsmString(func7);
     // constants for shifting
-    Value shift14 = rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(14));
-    Value shift17 = rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(17));
-    Value shift16 = rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(16));
-    Value shift32 = rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(32));
-    Value shift48 = rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(48));
+    uint64_t shift14 = 14;
+    uint64_t shift16 = 16;
+    uint64_t shift17 = 17;
+    uint64_t shift32 = 32;
+    uint64_t shift48 = 48;
 
     // encoding rs2
     // rs2 = spad_addr
@@ -309,15 +308,12 @@ struct DmaStartOpLowering : public ConvertOpToLLVMPattern<memref::DmaStartOp> {
     for (int i = 0; i < static_cast<int>(tile_shape.size()); i++) {
       sub_tensor_shape[expanding_dim + i] = tile_shape[i];
     }
-    Value config_rs1 = rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(sub_tensor_shape[0]));
-    config_rs1 = rewriter.create<LLVM::ShlOp>(loc, rewriter.getI64Type(), config_rs1, shift48);
-    config_rs1 = rewriter.create<LLVM::OrOp>(loc, config_rs1, rewriter.create<LLVM::ShlOp>(loc, rewriter.getI64Type(), rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(sub_tensor_shape[1])), shift32));
-    config_rs1 = rewriter.create<LLVM::OrOp>(loc, config_rs1, rewriter.create<LLVM::ShlOp>(loc, rewriter.getI64Type(), rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(sub_tensor_shape[2])), shift16));
-    config_rs1 = rewriter.create<LLVM::OrOp>(loc, config_rs1, rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(sub_tensor_shape[3])));
-    Value config_rs2 = rewriter.create<LLVM::ShlOp>(loc, rewriter.getI64Type(), rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(vlane_stride)), shift32);
-    config_rs2 = rewriter.create<LLVM::OrOp>(loc, config_rs2, rewriter.create<LLVM::ShlOp>(loc, rewriter.getI64Type(), rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(config_type)), shift17));
-    config_rs2 = rewriter.create<LLVM::OrOp>(loc, config_rs2, rewriter.create<LLVM::ShlOp>(loc, rewriter.getI64Type(), rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(vlane_split_axis)), shift14));
-    config_rs2 = rewriter.create<LLVM::OrOp>(loc, config_rs2, rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(int(elen/8)))); // element size [bytes]
+    Value config_rs1 = rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr((
+      ((sub_tensor_shape[0]&0xFFFF)<<shift48) | ((sub_tensor_shape[1]&0xFFFF)<<shift32) | ((sub_tensor_shape[2]&0xFFFF)<<shift16) | ((sub_tensor_shape[3])&0xFFFF))
+    ));
+    Value config_rs2 = rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(
+      (vlane_stride<<shift32)| ((config_type&0x3)<<shift17) | ((vlane_split_axis&0x3)<<shift14) | (int(elen/8))
+    ));
     rewriter.create<LLVM::InlineAsmOp>(
         loc,
         /*resultTypes=*/TypeRange(),
@@ -337,10 +333,12 @@ struct DmaStartOpLowering : public ConvertOpToLLVMPattern<memref::DmaStartOp> {
     for (int i = 0; i < static_cast<int>(mm_strides.size()); i++) {
       mm_strides_4d[expanding_dim + i] = mm_strides[i];
     }
-    config_rs1 = rewriter.create<LLVM::ShlOp>(loc, rewriter.getI64Type(), rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(mm_strides_4d[0])), shift32);
-    config_rs1 = rewriter.create<LLVM::OrOp>(loc, config_rs1, rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(mm_strides_4d[1])));
-    config_rs2 = rewriter.create<LLVM::ShlOp>(loc, rewriter.getI64Type(), rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(mm_strides_4d[2])), shift32);
-    config_rs2 = rewriter.create<LLVM::OrOp>(loc, config_rs2, rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(mm_strides_4d[3])));
+    config_rs1 = rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(
+      (mm_strides_4d[0]<<shift32) | (mm_strides_4d[1]&0xFFFFFFFF)
+    ));
+    config_rs2 = rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(
+      (mm_strides_4d[2]<<shift32) | (mm_strides_4d[3]&0xFFFFFFFF)
+    ));
     rewriter.create<LLVM::InlineAsmOp>(
         loc,
         /*resultTypes=*/TypeRange(),
@@ -360,10 +358,12 @@ struct DmaStartOpLowering : public ConvertOpToLLVMPattern<memref::DmaStartOp> {
     for (int i = 0; i < static_cast<int>(spad_strides.size()); i++) {
       spad_strides_4d[expanding_dim + i] = spad_strides[i];
     }
-    config_rs1 = rewriter.create<LLVM::ShlOp>(loc, rewriter.getI64Type(), rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(spad_strides_4d[0])), shift32);
-    config_rs1 = rewriter.create<LLVM::OrOp>(loc, config_rs1, rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(spad_strides_4d[1])));
-    config_rs2 = rewriter.create<LLVM::ShlOp>(loc, rewriter.getI64Type(), rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(spad_strides_4d[2])), shift32);
-    config_rs2 = rewriter.create<LLVM::OrOp>(loc, config_rs2, rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(spad_strides_4d[3])));
+    config_rs1 = rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(
+      (spad_strides_4d[0]<<shift32) | (spad_strides_4d[1]&0xFFFFFFFF)
+    ));
+    config_rs2 = rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(
+      (spad_strides_4d[2]<<shift32) | (spad_strides_4d[3]&0xFFFFFFFF)
+    ));
     rewriter.create<LLVM::InlineAsmOp>(
         loc,
         /*resultTypes=*/TypeRange(),
