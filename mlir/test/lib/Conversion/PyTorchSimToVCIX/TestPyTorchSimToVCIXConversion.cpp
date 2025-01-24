@@ -360,6 +360,9 @@ struct MathExpToVCIX: public OpRewritePattern<math::ExpOp> {
     Attribute zeroImmAttr = rewriter.getI32IntegerAttr(0);
     Attribute opcodeAttr = rewriter.getI64IntegerAttr(0b000011);
     Value rvl = nullptr;
+    VectorType vt = cast<VectorType>(opType);
+    unsigned totalEltCount = vt.getShape()[0];
+    const unsigned eltCount = legalType.getShape()[0];
     if (legalType.isScalable())
       // Use arbitrary runtime vector length when vector type is scalable.
       // Proper conversion pass should take it from the IR.
@@ -370,7 +373,6 @@ struct MathExpToVCIX: public OpRewritePattern<math::ExpOp> {
       res = rewriter.create<vcix::BinaryImmOp>(loc, legalType, opcodeAttr, vec,
                                                 zeroImmAttr, rvl);
     } else {
-      const unsigned eltCount = legalType.getShape()[0];
       Type eltTy = legalType.getElementType();
       Value zero = rewriter.create<arith::ConstantOp>(
           loc, eltTy, rewriter.getZeroAttr(eltTy));
@@ -385,7 +387,7 @@ struct MathExpToVCIX: public OpRewritePattern<math::ExpOp> {
                                                           i * eltCount);
         }
       } else { // Fixed-length vector > VLEN
-        for (unsigned i = 0; i < n; ++i) {
+        for (unsigned i = 0; i < totalEltCount/eltCount; i++) {
           Value extracted = rewriter.create<vector::ExtractStridedSliceOp>(
               loc, vec, i * eltCount, eltCount, 1);
           Value v = rewriter.create<vcix::BinaryImmOp>(loc, legalType, opcodeAttr,
