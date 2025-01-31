@@ -301,7 +301,7 @@ struct DmaStartOpLowering : public ConvertOpToLLVMPattern<memref::DmaStartOp> {
 
     // expand vlane_split_axis to 4D
     int64_t expanding_dim = MAX_TENSOR_DIM - tile_shape.size();
-    int64_t mm_expanding_dim = MAX_TENSOR_DIM - mm_strides.size();
+    int64_t mm_expanding_dim = mm_strides.size() == 0 ? MAX_TENSOR_DIM - 1 : MAX_TENSOR_DIM - mm_strides.size();
     vlane_split_axis += mm_expanding_dim;
     // config_rs1 = 1st dim << 48 | 2nd dim << 32 | 3rd dim << 16 | 4th dim size
     // config_rs2 = vlane_stride << 32 | config_type << 17  | vlane_split_axis << 14 | element size
