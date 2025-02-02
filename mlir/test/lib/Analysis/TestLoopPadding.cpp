@@ -584,7 +584,6 @@ void TestLoopPadding::analysisDMAStartNode(
         }
       }
     }
-
     for (auto operand : dmaOp.getOperands()) {
       if (auto applyOp = operand.getDefiningOp<mlir::affine::AffineApplyOp>()) {
         bool nested = false;
@@ -594,7 +593,12 @@ void TestLoopPadding::analysisDMAStartNode(
             nested = true;
             auto info = MemRefAffineMapForOps(dram_memref, nestedApplyOp, is_write, padding_type);
             targetBuffer.push_back(info);
-            break;
+          } else if (auto blockArg = llvm::dyn_cast<mlir::BlockArgument>(operand)) {
+            auto definingOp = blockArg.getOwner()->getParentOp();
+            if (auto affineForOp = llvm::dyn_cast<mlir::affine::AffineForOp>(definingOp)) {
+              auto info = MemRefAffineMapForOps(dram_memref, affineForOp, is_write, padding_type);
+              targetBuffer.push_back(info);
+            }
           }
         }
         if (!nested) {
