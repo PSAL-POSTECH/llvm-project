@@ -246,10 +246,10 @@ void TestTileOperationGraph::printOperation(Operation &op, TOGNode *node) {
     return; // Compute node
   }
 
-  if (name == "affine.dma_wait") {
+  if (name == "memref.dma_wait") {
     std::string address = "arg";
     std::vector<std::string> tag_index_list;
-    auto dma_op = dyn_cast<affine::AffineDmaWaitOp>(op);
+    auto dma_op = dyn_cast<memref::DmaWaitOp>(op);
     auto tag_memref = dma_op.getTagMemRef();
     auto tag_range = dma_op.getTagIndices();
 
