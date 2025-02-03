@@ -149,8 +149,8 @@ void TestTileOperationGraph::printOperation(Operation &op, TOGNode *node) {
     }
   }
 
-  if (name == "affine.dma_start") {
-    auto dma_op = dyn_cast<affine::AffineDmaStartOp>(op);
+  if (name == "memref.dma_start") {
+    auto dma_op = dyn_cast<memref::DmaStartOp>(op);
     std::vector<int> tile_size, tile_stride, stride_list;
     std::string address = "arg";
     int element_size = 0;
@@ -171,12 +171,12 @@ void TestTileOperationGraph::printOperation(Operation &op, TOGNode *node) {
 
     if (dst_space == 0 && src_space == 1) {
       is_write = true;
-      tile_memref_type = dma_op.getSrcMemRefType();
+      tile_memref_type = llvm::cast<MemRefType>(dma_op.getSrcMemRef().getType());
       dram_memref = dma_op.getDstMemRef();
       dram_indices = dma_op.getDstIndices();
     } else if (dst_space == 1 && src_space == 0) {
       is_write = false;
-      tile_memref_type = dma_op.getDstMemRefType();
+      tile_memref_type = llvm::cast<MemRefType>(dma_op.getDstMemRef().getType());
       dram_memref = dma_op.getSrcMemRef();
       dram_indices = dma_op.getSrcIndices();
     } else {
