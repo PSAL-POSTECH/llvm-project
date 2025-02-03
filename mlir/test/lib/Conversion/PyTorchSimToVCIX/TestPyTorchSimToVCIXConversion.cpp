@@ -277,7 +277,6 @@ struct MatmulOpLowering : public OpRewritePattern<linalg::MatmulOp> {
         /* Only wait operand dma */
         if (!sramUsedInMatmul)
           return WalkResult::advance();
-
         auto blockArg = mlir::cast<mlir::BlockArgument>(result.first);
         if (!blockArg)
           return WalkResult::advance();
@@ -297,19 +296,24 @@ struct MatmulOpLowering : public OpRewritePattern<linalg::MatmulOp> {
       op.emitError () << "Failed to locate dma_start for retrieving tag.";
       return failure();
     }
-    auto ATagMap = rewriter.getMultiDimIdentityMap(llvm::dyn_cast<MemRefType>(ADmaTag.getType()).getRank());
-    auto BTagMap = rewriter.getMultiDimIdentityMap(llvm::dyn_cast<MemRefType>(BDmaTag.getType()).getRank());
-    auto maybeExpandedSrcMap = affine::expandAffineMap(rewriter, loc, ATagMap, ValueRange{c0, c0, m_idx});
-    auto maybeExpandedDstMap = affine::expandAffineMap(rewriter, loc, BTagMap, ValueRange{n_idx, c0, c0});
-    rewriter.create<memref::DmaWaitOp>(loc, ADmaTag, *maybeExpandedSrcMap, numElements);
-    rewriter.create<memref::DmaWaitOp>(loc, BDmaTag, *maybeExpandedDstMap, numElements);
+    mlir::AffineExpr ATagExpr = rewriter.getAffineDimExpr(0) * 1 + rewriter.getAffineDimExpr(1) * (K/SYSTOLIC_SIZE);
+    mlir::AffineExpr BTagExpr = rewriter.getAffineDimExpr(0) * (K/SYSTOLIC_SIZE) + rewriter.getAffineDimExpr(1) * 1;
+    auto ATagMap = mlir::AffineMap::get(2, 0, ATagExpr);
+    auto BTagMap = mlir::AffineMap::get(2, 0, BTagExpr);
+    //auto maybeExpandedSrcMap = affine::expandAffineMap(rewriter, loc, ATagMap, ValueRange{k_idx, m_idx});
+    //auto maybeExpandedDstMap = affine::expandAffineMap(rewriter, loc, BTagMap, ValueRange{n_idx, k_idx});
+    auto ATagIdx = rewriter.create<affine::AffineApplyOp>(loc, ATagMap, ValueRange{k_idx, m_idx});
+    auto BTagIdx = rewriter.create<affine::AffineApplyOp>(loc, BTagMap, ValueRange{n_idx, k_idx});
+    rewriter.create<memref::DmaWaitOp>(loc, ADmaTag, ValueRange{ATagIdx}, numElements);
+    rewriter.create<memref::DmaWaitOp>(loc, BDmaTag, ValueRange{BTagIdx}, numElements);
     if (BiasDmaTag) {
       /* Bias could be 1D or 2D */
       Value first_index = BiasDMAIndices[0].getDefiningOp<mlir::arith::ConstantIndexOp>() ? c0 : n_idx;
       Value third_index = BiasDMAIndices[0].getDefiningOp<mlir::arith::ConstantIndexOp>() ? c0 : m_idx;
-      auto BiasTagMap = rewriter.getMultiDimIdentityMap(llvm::dyn_cast<MemRefType>(BiasDmaTag.getType()).getRank());
-      auto maybeExpandedBiasMap = affine::expandAffineMap(rewriter, loc, BiasTagMap, ValueRange{first_index, third_index});
-      rewriter.create<memref::DmaWaitOp>(loc, BiasDmaTag, *maybeExpandedBiasMap, numElements);
+      mlir::AffineExpr BiasTagExpr = rewriter.getAffineDimExpr(0) * (M/SYSTOLIC_SIZE) + rewriter.getAffineDimExpr(1) * 1;
+      auto BiasTagMap = mlir::AffineMap::get(2, 0, BiasTagExpr);
+      auto BiasTagIdx = rewriter.create<affine::AffineApplyOp>(loc, BiasTagMap, ValueRange{first_index, third_index});
+      rewriter.create<memref::DmaWaitOp>(loc, BiasDmaTag, ValueRange{BiasTagIdx}, numElements);
     }
 
     // For vpush weight loop part
