@@ -72,6 +72,7 @@ struct TestTileOperationGraph
                         llvm::DenseMap<void *, std::string> &loop_var_name);
   llvm::SmallVector<mlir::Attribute, 2> getSubtileSize(mlir::Operation *operation);
   int getAsyncValue(mlir::Operation *operation);
+  std::vector<int> collectCoefficientsFromAffineExpr(mlir::AffineExpr expr);
   int nr_loop = 0;
   llvm::DenseMap<void*, std::string> loop_var_name;
 };
@@ -102,6 +103,35 @@ void TestTileOperationGraph::getAffineForBounds(affine::AffineForOp &op, int &st
 
   // Modify step size
   op.setStep(end);
+}
+
+std::vector<int> TestTileOperationGraph::collectCoefficientsFromAffineExpr(mlir::AffineExpr expr) {
+  std::vector<int> coefficients;
+
+  std::function<void(mlir::AffineExpr)> collectCoefficients = [&](mlir::AffineExpr expr) {
+    if (auto binExpr = llvm::dyn_cast<mlir::AffineBinaryOpExpr>(expr)) {
+      if (binExpr.getKind() == mlir::AffineExprKind::Mul) {
+        if (auto lhs = llvm::dyn_cast<mlir::AffineConstantExpr>(binExpr.getLHS())) {
+          if (auto rhs = llvm::dyn_cast<mlir::AffineDimExpr>(binExpr.getRHS())) {
+            coefficients.push_back(lhs.getValue());
+          }
+        } else if (auto rhs = llvm::dyn_cast<mlir::AffineConstantExpr>(binExpr.getRHS())) {
+          if (auto lhs = llvm::dyn_cast<mlir::AffineDimExpr>(binExpr.getLHS())) {
+            coefficients.push_back(rhs.getValue());
+          }
+        }
+      } else if (binExpr.getKind() == mlir::AffineExprKind::Add) {
+        // Add: Recursively collect both sides
+        collectCoefficients(binExpr.getLHS());
+        collectCoefficients(binExpr.getRHS());
+      }
+    } else if (auto dimExpr = llvm::dyn_cast<mlir::AffineDimExpr>(expr)) {
+      coefficients.push_back(1);
+    }
+  };
+
+  collectCoefficients(expr);
+ return coefficients;
 }
 
 void TestTileOperationGraph::printOperation(Operation &op, TOGNode *node) {
@@ -163,6 +193,7 @@ void TestTileOperationGraph::printOperation(Operation &op, TOGNode *node) {
     Value dram_memref;
     std::vector<std::string> loop_index_list;
     std::vector<std::string> tag_index_list;
+    std::vector<int> tag_stride_list;
     std::map<std::string, int> loop_index_map;
     llvm::SmallVector<int64_t, 2> dmaSubtileValues;
     for (auto attr : getSubtileSize(dma_op))
@@ -218,27 +249,46 @@ void TestTileOperationGraph::printOperation(Operation &op, TOGNode *node) {
 
     auto tag_range = dma_op.getTagIndices();
     for (auto tag_idx : tag_range) {
-      if (auto blockArg = dyn_cast<BlockArgument>(tag_idx)) {
-        tag_index_list.push_back(loop_var_name.at(blockArg.getAsOpaquePointer()));
-      } else if (auto constOp = tag_idx.getDefiningOp<arith::ConstantIndexOp>()) {
+      if (auto constOp = tag_idx.getDefiningOp<arith::ConstantIndexOp>()) {
         auto constant = static_cast<int>(constOp.value());
         tag_index_list.push_back(std::to_string(constant));
       } else if (auto applyOp = tag_idx.getDefiningOp<affine::AffineApplyOp>()) {
         for (auto operand : applyOp.getOperands()) {
           if (auto blockArg = dyn_cast<BlockArgument>(operand)) {
             tag_index_list.push_back(loop_var_name.at(blockArg.getAsOpaquePointer()));
+          } else if (auto nestedApplyOp = operand.getDefiningOp<affine::AffineApplyOp>()) {
+            for (auto nestedOperand : nestedApplyOp.getOperands()) {
+              if (auto blockArg = dyn_cast<BlockArgument>(nestedOperand)) {
+                tag_index_list.push_back(loop_var_name.at(blockArg.getAsOpaquePointer()));
+              } else if (auto constOp = nestedOperand.getDefiningOp<arith::ConstantIndexOp>()) {
+                auto constant = static_cast<int>(constOp.value());
+                tag_index_list.push_back(std::to_string(constant));
+              } else {
+                nestedApplyOp.emitError() << "tag index apply op is not valid!\n";
+              }
+            }
+          } else if (auto constOp = operand.getDefiningOp<arith::ConstantIndexOp>()) {
+            auto constant = static_cast<int>(constOp.value());
+            tag_index_list.push_back(std::to_string(constant));
           } else {
-            op.emitError() << "tag index apply op is not valid!\n";
+            applyOp.emitError() << "tag index apply op is not valid!\n";
           }
         }
+        mlir::AffineMap map = applyOp.getAffineMap();
+        tag_stride_list = collectCoefficientsFromAffineExpr(map.getResult(0));
       }
     }
     if (tag_index_list.size() == 0) {
       tag_index_list.push_back("0");
     }
 
+    if (tag_stride_list.size() == 0) {
+      tag_stride_list.push_back(1);
+    }
+
     TOGDMANode *tog_dma = new TOGDMANode("DMANode", address, stride_list, tile_size,
-                                         element_size, is_write, dmaAsync, tag_index_list, loop_index_list);
+                                         element_size, is_write, dmaAsync, tag_index_list,
+                                         tag_stride_list, loop_index_list);
     tog_dma->setOp(&op);
     /* Link child and parent */
     node->addChild(tog_dma);
@@ -249,16 +299,25 @@ void TestTileOperationGraph::printOperation(Operation &op, TOGNode *node) {
   if (name == "memref.dma_wait") {
     std::string address = "arg";
     std::vector<std::string> tag_index_list;
+    std::vector<int> tag_stride_list;
     auto dma_op = dyn_cast<memref::DmaWaitOp>(op);
     auto tag_memref = dma_op.getTagMemRef();
     auto tag_range = dma_op.getTagIndices();
 
     for (auto tag_idx : tag_range) {
-      if (auto blockArg = dyn_cast<BlockArgument>(tag_idx)) {
-        tag_index_list.push_back(loop_var_name.at(blockArg.getAsOpaquePointer()));
-      } else if (auto constOp = tag_idx.getDefiningOp<arith::ConstantIndexOp>()) {
-        auto constant = static_cast<int>(constOp.value());
-        tag_index_list.push_back(std::to_string(constant));
+      if (auto applyOp = tag_idx.getDefiningOp<mlir::affine::AffineApplyOp>()) {
+        for (mlir::Value operand : applyOp.getMapOperands()) {
+          if (auto blockArg = llvm::dyn_cast<mlir::BlockArgument>(operand)) {
+            tag_index_list.push_back(loop_var_name.at(blockArg.getAsOpaquePointer()));
+          } else if (auto constOp = operand.getDefiningOp<arith::ConstantIndexOp>()) {
+            auto constant = static_cast<int>(constOp.value());
+            tag_index_list.push_back(std::to_string(constant));
+          } else {
+            applyOp.emitError() << "Unexpected tag affine map\n";
+          }
+        }
+        mlir::AffineMap map = applyOp.getAffineMap();
+        tag_stride_list = collectCoefficientsFromAffineExpr(map.getResult(0));
       } else {
         dma_op.emitError() << "Unexpected tag indices in the dma.wait\n";
       }
@@ -284,8 +343,11 @@ void TestTileOperationGraph::printOperation(Operation &op, TOGNode *node) {
         }
       }
     }
+    if (tag_stride_list.size() == 0) {
+      tag_stride_list.push_back(1);
+    }
 
-    TOGDMAWaitNode *tog_dma_wait = new TOGDMAWaitNode("DMAWaitNode", tag_index_list, address);
+    TOGDMAWaitNode *tog_dma_wait = new TOGDMAWaitNode("DMAWaitNode", tag_index_list, tag_stride_list, address);
     tog_dma_wait->setOp(&op);
     /* Link child and parent */
     node->addChild(tog_dma_wait);

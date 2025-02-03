@@ -178,16 +178,17 @@ class TOGDMANode : public TOGNode {
   bool is_write;
   bool is_async;
   std::vector<std::string> tag_idx_list;
+  std::vector<int> tag_stride_list;
   std::vector<std::string> loop_idx_list;
 
  public:
   TOGDMANode(const std::string &name, const std::string &addr,
              const std::vector<int> &strides, const std::vector<int> &sizes,
              int elemSize, bool is_write, bool is_async, std::vector<std::string> &tag_idx_list,
-             std::vector<std::string> &idx_list)
+             std::vector<int> &tag_stride_list, std::vector<std::string> &idx_list)
       : TOGNode(name), base_addr(addr), stride_list(strides), tile_size(sizes),
         element_size(elemSize), is_write(is_write), is_async(is_async),
-        tag_idx_list(tag_idx_list), loop_idx_list(idx_list) {}
+        tag_idx_list(tag_idx_list), tag_stride_list(tag_stride_list), loop_idx_list(idx_list) {}
   std::string getBaseAddr() const { return base_addr; }
   std::vector<int> getStrideList() const { return stride_list; }
   std::vector<int> getTileSize() const { return tile_size; }
@@ -217,6 +218,10 @@ class TOGDMANode : public TOGNode {
     printLoopStringInfo(name, this->tag_idx_list);
     std::cout << ",\n";
 
+    name = std::string("tag_stride_list");
+    printLoopInfo(name, this->tag_stride_list);
+    std::cout << ",\n";
+
     name = std::string("loop_idx_list");
     printLoopStringInfo(name, this->loop_idx_list);
     std::cout << ",\n";
@@ -234,10 +239,11 @@ class TOGDMANode : public TOGNode {
 
 class TOGDMAWaitNode : public TOGNode {
   std::vector<std::string> tag_idx_list;
+  std::vector<int> tag_stride_list;
   std::string base_addr;
  public:
-  TOGDMAWaitNode(const std::string &name, std::vector<std::string> &idx_list, std::string &addr)
-      : TOGNode(name), tag_idx_list(idx_list), base_addr(addr) {}
+  TOGDMAWaitNode(const std::string &name, std::vector<std::string> &idx_list, std::vector<int> &tag_stride_list, std::string &addr)
+      : TOGNode(name), tag_idx_list(idx_list), tag_stride_list(tag_stride_list), base_addr(addr) {}
   void display() const override {
     TOGNode::display();
     std::cout << ",\n";
@@ -245,6 +251,10 @@ class TOGDMAWaitNode : public TOGNode {
 
     auto name = std::string("tag_idx_list");
     printLoopStringInfo(name, this->tag_idx_list);
+    std::cout << ",\n";
+
+    name = std::string("tag_stride_list");
+    printLoopInfo(name, this->tag_stride_list);
     std::cout << "}\n";
   }
   NodeKind getKind() const override { return DMAWaitNodeKind; }
