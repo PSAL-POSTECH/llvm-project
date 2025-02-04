@@ -92,8 +92,8 @@ void DmaFineGrained::runOnOperation() {
   bool is_bmm = false, is_conv2d = false;
   if (loopDepth == 4) { // bmm has 4 loops (b, m, n, k)
     is_bmm = true;
-  } else if (loopDepth > 5) { // conv2d has 7 loops (b, kh, kw, oh, ow, oc, ic)
-    is_conv2d = true; // batch is not implemented yet
+  } else if (loopDepth == 7) { // conv2d has 7 loops (b, kh, kw, oh, ow, oc, ic)
+    is_conv2d = true;
   }
 
   // inner loop fine-grained dma
@@ -144,6 +144,7 @@ void DmaFineGrained::runOnOperation() {
   NamedAttrList dma2Attr;
 
   int64_t subTileSizeH, subTileSizeM, subTileSizeN, subTileSizeK;
+  bool is_3d_subtile = dma1Subtile.size() == 3;
 
   // Sanity check
   if (dma1Subtile.size() > 0 && dma2Subtile.size() > 0) {
@@ -262,7 +263,7 @@ void DmaFineGrained::runOnOperation() {
   loopM->setAttr("inner_loop", builder.getBoolAttr(true));
   builder.setInsertionPointToStart(loopM.getBody());
   i = loopM.getInductionVar();
-  if (is_conv2d) {
+  if (is_3d_subtile) {
     auto loopC = builder.create<affine::AffineForOp>(loc, 0, tileSizeH, subTileSizeH);
     loopC->setAttr("inner_loop", builder.getBoolAttr(true));
     builder.setInsertionPointToStart(loopC.getBody());
@@ -279,8 +280,10 @@ void DmaFineGrained::runOnOperation() {
   }
   if (is_bmm) {
     new_src_indices = {zeroIndex, i, k}; // other approach is make sub map using only i, k
-  } else if (is_conv2d) {
+  } else if (is_3d_subtile) {
     new_src_indices = {c, i, k};
+  } else if (is_conv2d) {
+    new_src_indices = {zeroIndex, zeroIndex, i, k};
   } else {
     new_src_indices = {i, k};
   }
@@ -295,7 +298,7 @@ void DmaFineGrained::runOnOperation() {
   int64_t tag_k_stride = (tileSizeM / subTileSizeM);
   int64_t spad_k_stride = (tileSizeH * tileSizeM / vectorlane);
   int64_t spad_c_stride = tileSizeK;
-  if (is_conv2d) {
+  if (is_3d_subtile) {
     int64_t tag_i_stride = (tileSizeH / subTileSizeH);
     new_spad_map = AffineMap::get(3, 0, builder.getAffineDimExpr(0) * spad_c_stride + builder.getAffineDimExpr(1) * spad_k_stride + builder.getAffineDimExpr(2));
     new_dst_indices = {c, k, i};
@@ -324,6 +327,8 @@ void DmaFineGrained::runOnOperation() {
     }
   }
   if (is_bmm) {
+    new_src_indices = {zeroIndex, k, j};
+  } else if (is_3d_subtile) {
     new_src_indices = {zeroIndex, k, j};
   } else if (is_conv2d) {
     new_src_indices = {zeroIndex, k, j};
