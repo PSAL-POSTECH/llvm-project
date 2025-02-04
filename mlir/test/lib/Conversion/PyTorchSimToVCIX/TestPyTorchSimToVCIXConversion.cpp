@@ -99,6 +99,21 @@ static std::pair<unsigned, VectorType> legalizeVectorType(const Type &type) {
   return {n, VectorType::get({eltCount >> (n - 1)}, eltTy, {true})};
 }
 
+bool traverseMMOperands(Value op_val, Value input) {
+  bool found = false;
+  if (op_val == input) {
+    return true;
+  }
+  auto operation = op_val.getDefiningOp();
+  for (auto operand : operation->getOperands()) {
+    found = found | traverseMMOperands(operand, input);
+    if (operand == input) {
+      return true;
+    }
+  }
+  return found;
+}
+
 struct MatmulOpLowering : public OpRewritePattern<linalg::MatmulOp> {
   using OpRewritePattern::OpRewritePattern;
 
@@ -250,7 +265,7 @@ struct MatmulOpLowering : public OpRewritePattern<linalg::MatmulOp> {
         bool sramUsedInMatmul = false;
 
         for (auto operand : op->getOperands()) {
-          if (operand == sramRef.first) {
+          if (traverseMMOperands(operand, sramRef.first)) { // for CONV2D reshape op, we need to traverse operands
             sramUsedInMatmul = true;
             break;
           }

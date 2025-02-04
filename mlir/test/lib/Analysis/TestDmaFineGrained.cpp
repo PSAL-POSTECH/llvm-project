@@ -228,19 +228,19 @@ void DmaFineGrained::runOnOperation() {
     new_idx = builder.create<affine::AffineApplyOp>(loc, sum_map, ValueRange{new_idx, srcIndices[0]});
     src_indices.push_back(new_idx);
     AffineMap spad_map_m = AffineMap::get(2, 0, builder.getAffineDimExpr(0) * (tileSizeM / vectorlane) + builder.getAffineDimExpr(1));
+    AffineMap new_tag_map = AffineMap::get(2, 0, builder.getAffineDimExpr(0) * (tileSizeM / subTileSizeM) + builder.getAffineDimExpr(1));
+    new_map_indices = {builder.create<affine::AffineApplyOp>(loc, tag_idx_map, j), builder.create<affine::AffineApplyOp>(loc, tag_idx_map, i)};
     auto dst_idx = builder.create<affine::AffineApplyOp>(loc, spad_map_m, ValueRange{j, i});
 
     dst_indices.push_back(zeroIndex);
     dst_indices.push_back(dst_idx);
-    tag_indices.push_back(builder.create<affine::AffineApplyOp>(loc, tag_idx_map, j));
-    tag_indices.push_back(builder.create<affine::AffineApplyOp>(loc, tag_idx_map, i));
+    tag_indices.push_back(builder.create<affine::AffineApplyOp>(loc, new_tag_map, new_map_indices));
     auto src_map = builder.getMultiDimIdentityMap(src_indices.size());
     auto dst_map = builder.getMultiDimIdentityMap(dst_indices.size());
     auto tag_map = builder.getMultiDimIdentityMap(tag_indices.size());
     auto maybeExpandedSrcMap = affine::expandAffineMap(builder, loc, src_map, src_indices);
     auto maybeExpandedDstMap = affine::expandAffineMap(builder, loc, dst_map, dst_indices);
     auto maybeExpandedTagMap = affine::expandAffineMap(builder, loc, tag_map, tag_indices);
-
     // Insert the first dma_start operation
     builder.create<memref::DmaStartOp>(
         loc, mvin_bias.getSrcMemRef(), *maybeExpandedSrcMap, mvin_bias.getDstMemRef(),
@@ -295,11 +295,12 @@ void DmaFineGrained::runOnOperation() {
   src_indices.push_back(new_idx);
   AffineMap spad_map_m;
   AffineMap new_tag_map;
-  int64_t tag_i_stride = (tileSizeH / subTileSizeH);
+  int64_t tag_k_stride = (tileSizeM / subTileSizeM);
   if (is_conv2d) {
+    int64_t tag_i_stride = (tileSizeH / subTileSizeH);
     spad_map_m = AffineMap::get(3, 0, builder.getAffineDimExpr(0) + builder.getAffineDimExpr(1) * (tileSizeM / vectorlane) + builder.getAffineDimExpr(2));
-    new_dst_indices = {h, k, i};
-    int64_t tag_k_stride = (tileSizeH / subTileSizeH) * (tileSizeM / subTileSizeM);
+    new_dst_indices = {h, k, i}; // FIXME: check the order of indices
+    tag_k_stride *= tag_i_stride;
     new_tag_map = AffineMap::get(3, 0 , builder.getAffineDimExpr(0) * tag_k_stride + builder.getAffineDimExpr(1) * tag_i_stride + builder.getAffineDimExpr(2));
     new_map_indices = {builder.create<affine::AffineApplyOp>(loc, tag_idx_map, k), builder.create<affine::AffineApplyOp>(loc, tag_idx_map, i), builder.create<affine::AffineApplyOp>(loc, tag_idx_map, h)};
     dst_indices.push_back(zeroIndex);
@@ -307,7 +308,7 @@ void DmaFineGrained::runOnOperation() {
     // affine_map<(d0, d1) -> (d0 * (tileSizeM / vectorlane) + d1)>
     spad_map_m = AffineMap::get(2, 0, builder.getAffineDimExpr(0) * (tileSizeM / vectorlane) + builder.getAffineDimExpr(1));
     new_dst_indices = {k, i};
-    new_tag_map = AffineMap::get(2, 0 , builder.getAffineDimExpr(0) * tag_i_stride + builder.getAffineDimExpr(1));
+    new_tag_map = AffineMap::get(2, 0 , builder.getAffineDimExpr(0) * tag_k_stride + builder.getAffineDimExpr(1));
     new_map_indices = {builder.create<affine::AffineApplyOp>(loc, tag_idx_map, k), builder.create<affine::AffineApplyOp>(loc, tag_idx_map, i)};
   }
   auto dst_idx = builder.create<affine::AffineApplyOp>(loc, spad_map_m, new_dst_indices);
