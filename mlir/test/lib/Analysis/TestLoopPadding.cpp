@@ -306,26 +306,6 @@ void TestLoopPadding::runOnOperation() {
         AffineExpr newExpr = updateAffineExprWithBounds(expr, index_pos, upperBound, paddedUpperBound, context);
         map = updateAffineMapWithNewExpr(map, newExpr, expr_idx, context, forOp);
         applyOp.setMap(map);
-
-        /* Update stride info by finding updated coeff */
-        auto oldCoeff = collectCoefficientsFromAffineExpr(expr);
-        auto newCoeff = collectCoefficientsFromAffineExpr(newExpr);
-        for (size_t i=0; i<oldCoeff.size();i++) {
-          if (oldCoeff[i].first == strideVal.value()) {
-            mm_stride = newCoeff[i].first;
-            break;
-          }
-        }
-        //llvm::errs() << "old_expr: " << expr << " new_expr: " << newExpr << " " << mm_stride << " " << strideVal.value() <<"\n";
-        //llvm::errs() << "index_pos: " << index_pos << " upper: " << upperBound << " paddUpper: " << paddedUpperBound << "\n";
-        if (strideVal && mm_stride != -1) {
-          OpBuilder builder(strideVal);
-          Value newStrideConstant = builder.create<arith::ConstantIndexOp>(strideVal.getLoc(), mm_stride);
-          dmaOp.setOperand(dmaOp.getNumOperands() - 2, newStrideConstant);
-          if (strideVal.use_empty()) {
-            strideVal.erase();
-          }
-        }
       }
     });
   });
@@ -593,13 +573,14 @@ void TestLoopPadding::analysisDMAStartNode(
             nested = true;
             auto info = MemRefAffineMapForOps(dram_memref, nestedApplyOp, is_write, padding_type);
             targetBuffer.push_back(info);
-          } else if (auto blockArg = llvm::dyn_cast<mlir::BlockArgument>(operand)) {
-            auto definingOp = blockArg.getOwner()->getParentOp();
-            if (auto affineForOp = llvm::dyn_cast<mlir::affine::AffineForOp>(definingOp)) {
-              auto info = MemRefAffineMapForOps(dram_memref, affineForOp, is_write, padding_type);
-              targetBuffer.push_back(info);
-            }
           }
+          //} else if (auto blockArg = llvm::dyn_cast<mlir::BlockArgument>(operand)) {
+          //  auto definingOp = blockArg.getOwner()->getParentOp();
+          //  if (auto affineForOp = llvm::dyn_cast<mlir::affine::AffineForOp>(definingOp)) {
+          //    auto info = MemRefAffineMapForOps(dram_memref, affineForOp, is_write, padding_type);
+          //    targetBuffer.push_back(info);
+          //  }
+          //}
         }
         if (!nested) {
           auto info = MemRefAffineMapForOps(dram_memref, applyOp, is_write, padding_type);
@@ -773,14 +754,24 @@ void TestLoopPadding::createValidationWrapperFunction(mlir::ModuleOp module, mli
     }
     if (mapOperands.size()) {
       for (int i=0; i<(int)preAffineMap.size(); i++) {
-        auto preApplyOp = builder.create<affine::AffineApplyOp>(last.getLoc(), preAffineMap.at(i), mapOperands);
+        auto newMapOperands = mapOperands;
+        /* Handle fake dim case */
+        if (postAffineMap.at(i).getNumDims() != mapOperands.size()) {
+          int fakeDimNum = postAffineMap.at(i).getNumDims() - mapOperands.size();
+          auto fakeDim = builder.create<mlir::arith::ConstantIndexOp>(loc, 1);
+          for (int i=0; i<fakeDimNum; i++) {
+            newMapOperands.push_back(fakeDim);
+          }
+        }
+
+        auto preApplyOp = builder.create<affine::AffineApplyOp>(last.getLoc(), preAffineMap.at(i), newMapOperands);
         mlir::Value preResultIndex = preApplyOp.getResult();
         auto loadedValue = builder.create<affine::AffineLoadOp>(preApplyOp.getLoc(), argValue, preResultIndex);
 
         /* Get Global */
         auto loadedMemRef = builder.create<mlir::memref::GetGlobalOp>(
           loadedValue.getLoc(), globalMemRefOp.getType(), globalMemRefOp.getName());
-        auto postApplyOp = builder.create<affine::AffineApplyOp>(loadedValue.getLoc(), postAffineMap.at(i), mapOperands);
+        auto postApplyOp = builder.create<affine::AffineApplyOp>(loadedValue.getLoc(), postAffineMap.at(i), newMapOperands);
         mlir::Value postResultIndex = postApplyOp.getResult();
         builder.create<affine::AffineStoreOp>(postApplyOp.getLoc(), loadedValue, loadedMemRef, postResultIndex);
       }
@@ -836,13 +827,23 @@ void TestLoopPadding::createValidationWrapperFunction(mlir::ModuleOp module, mli
     }
     if (mapOperands.size()) {
       /* Get Global */
-      for (int i=0; i<(int)preAffineMap.size(); i++) {
+      for (int i=0; i<(int)postAffineMap.size(); i++) {
+        auto newMapOperands = mapOperands;
+        /* Handle fake dim case */
+        if (postAffineMap.at(i).getNumDims() != mapOperands.size()) {
+          int fakeDimNum = postAffineMap.at(i).getNumDims() - mapOperands.size();
+          auto fakeDim = builder.create<mlir::arith::ConstantIndexOp>(loc, 1);
+          for (int i=0; i<fakeDimNum; i++) {
+            newMapOperands.push_back(fakeDim);
+          }
+        }
+
         auto loadedMemRef = builder.create<mlir::memref::GetGlobalOp>(
           loc, globalMemRefOp.getType(), globalMemRefOp.getName());
-        auto postApplyOp = builder.create<affine::AffineApplyOp>(loadedMemRef.getLoc(), postAffineMap.at(i), mapOperands);
+        auto postApplyOp = builder.create<affine::AffineApplyOp>(loadedMemRef.getLoc(), postAffineMap.at(i), newMapOperands);
         mlir::Value postResultIndex = postApplyOp.getResult();
         auto loadedValue = builder.create<affine::AffineLoadOp>(postApplyOp.getLoc(), loadedMemRef, postResultIndex);
-        auto preApplyOp = builder.create<affine::AffineApplyOp>(loadedValue.getLoc(), preAffineMap.at(i), mapOperands);
+        auto preApplyOp = builder.create<affine::AffineApplyOp>(loadedValue.getLoc(), preAffineMap.at(i), newMapOperands);
         mlir::Value preResultIndex = preApplyOp.getResult();
         builder.create<affine::AffineStoreOp>(preApplyOp.getLoc(), loadedValue, argValue, preResultIndex);
       }
