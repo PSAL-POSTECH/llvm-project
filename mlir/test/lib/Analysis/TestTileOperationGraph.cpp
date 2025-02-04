@@ -322,12 +322,10 @@ void TestTileOperationGraph::printOperation(Operation &op, TOGNode *node) {
         dma_op.emitError() << "Unexpected tag indices in the dma.wait\n";
       }
     }
-
     for (auto &use : tag_memref.getUses()) {
       mlir::Operation *userOp = use.getOwner(); // Get the operation that uses tagMemRef
-      if (auto dmaStartOp = llvm::dyn_cast<affine::AffineDmaStartOp>(userOp)) {
+      if (auto dmaStartOp = llvm::dyn_cast<memref::DmaStartOp>(userOp)) {
         Value dram_memref;
-        std::vector<std::string> loop_index_list;
         auto dst_space = dmaStartOp.getDstMemorySpace();
         auto src_space = dmaStartOp.getSrcMemorySpace();
 
