@@ -263,8 +263,7 @@ struct TestLoopPadding
                                        affine::AffineForOp& forOp);
                                        // Function to check if a loop is already registered
   void analysisDMAStartNode(func::FuncOp function, std::vector<MemRefAffineMapForOps>& targetBuffer);
-  void createTimingWrapperFunction(mlir::ModuleOp module, mlir::OpBuilder builder, mlir::FunctionType kernelFuncType);
-  void createValidationWrapperFunction(mlir::ModuleOp module, mlir::OpBuilder builder, mlir::FunctionType kernelFuncType);
+  void createWrapperFunction(mlir::ModuleOp module, mlir::OpBuilder builder, mlir::FunctionType kernelFuncType, bool timing_mode);
   int getPaddingType(mlir::Operation *operation);
   std::vector<std::tuple<int64_t, int64_t, Value>> loopInfoMap;
   std::vector<MemRefAffineMapForOps> prePaddingInfo;
@@ -417,10 +416,7 @@ void TestLoopPadding::runOnOperation() {
   // Create padding wrapper function
   mlir::OpBuilder builder(module.getContext());
   // FIXME. I want to share wrapper. But validiation binary failed to provide functionality when padding is applied.
-  if (timing_mode)
-    createTimingWrapperFunction(module, builder, prevkernelFuncType);
-  else
-    createValidationWrapperFunction(module, builder, prevkernelFuncType);
+  createWrapperFunction(module, builder, prevkernelFuncType, timing_mode);
   return;
 }
 
@@ -667,7 +663,7 @@ void TestLoopPadding::analysisDMAStartNode(
   });
 }
 
-void TestLoopPadding::createTimingWrapperFunction(mlir::ModuleOp module, mlir::OpBuilder builder, mlir::FunctionType prevKernelFuncType) {
+void TestLoopPadding::createWrapperFunction(mlir::ModuleOp module, mlir::OpBuilder builder, mlir::FunctionType prevKernelFuncType, bool timing_mode) {
   func::FuncOp kernelFunc = module.lookupSymbol<func::FuncOp>("kernel");
   if (!kernelFunc) {
     module.emitError() << "Function 'kernel' not found!\n";
@@ -710,6 +706,34 @@ void TestLoopPadding::createTimingWrapperFunction(mlir::ModuleOp module, mlir::O
   }
   builder.setInsertionPointToStart(entryBlock);
 
+  // Create read padding phase
+  for (size_t i = 0; i < prePaddingInfo.size() && i < postPaddingInfo.size() && !timing_mode; ++i) {
+    auto& preInfo = prePaddingInfo[i];
+    auto& postInfo = postPaddingInfo[i];
+
+    mlir::SmallVector<mlir::Value, 2> mapOperands;
+    std::vector<AffineMap> preAffineMap = preInfo.getAffineMap();
+    std::vector<AffineMap> postAffineMap = postInfo.getAffineMap();
+    builder.setInsertionPointToEnd(entryBlock);
+    mlir::Value preMemRef = preInfo.getMemRef();
+    auto blockArg = mlir::cast<mlir::BlockArgument>(preMemRef);
+    unsigned int argIdx = blockArg.getArgNumber();
+    mlir::Value argValue = wrapperFunc.getArgument(argIdx);
+
+    if (!padded_buffer[argIdx].has_value())
+      continue;
+    mlir::memref::AllocOp allocatedBuffer = padded_buffer[argIdx].value();
+
+    for (size_t i=0; i<preInfo.getDimInfo().size(); i++) {
+      auto& preDimInfo = preInfo.getDimInfo().at(i);
+      auto& postDimInfo = postInfo.getDimInfo().at(i);
+      mlir::Value preIndex, postIndex;
+      std::tie(preIndex, postIndex) = preDimInfo.createLoops(builder, postDimInfo);
+      auto loadedValue = builder.create<affine::AffineLoadOp>(builder.getUnknownLoc(), argValue, preIndex);
+      builder.create<affine::AffineStoreOp>(builder.getUnknownLoc(), loadedValue, allocatedBuffer.getMemref(), postIndex);
+    }
+  }
+
   // Prepare the arguments of the wrapper to be passed to the 'kernel' function
   llvm::SmallVector<mlir::Value, 4> callArgs;
   callArgs.resize(kernelFunc.getNumArguments());
@@ -726,119 +750,8 @@ void TestLoopPadding::createTimingWrapperFunction(mlir::ModuleOp module, mlir::O
   // Create a call to the 'kernel' function inside the wrapper
   builder.create<mlir::func::CallOp>(module.getLoc(), kernelFunc, callArgs);
 
-  // Add a return operation to the wrapper function
-  builder.setInsertionPointToEnd(entryBlock);
-  builder.create<mlir::func::ReturnOp>(module.getLoc());
-}
-
-void TestLoopPadding::createValidationWrapperFunction(mlir::ModuleOp module, mlir::OpBuilder builder, mlir::FunctionType prevKernelFuncType) {
-  func::FuncOp kernelFunc = module.lookupSymbol<func::FuncOp>("kernel");
-  if (!kernelFunc) {
-    module.emitError() << "Function 'kernel' not found!\n";
-    return;
-  }
-  std::vector<std::optional<mlir::memref::GlobalOp>> padded_buffer;
-  std::set<void*> usedMemRefs;
-  padded_buffer.resize(kernelFunc.getNumArguments());
-  affine::AffineForOp last;
-
-  // Declare global buffers
-  builder.setInsertionPointToEnd(module.getBody());
-  for (size_t i = 0; i < prePaddingInfo.size() && i < postPaddingInfo.size(); ++i) {
-    auto& postInfo = postPaddingInfo[i];
-    auto& preInfo = prePaddingInfo[i];
-
-    mlir::Value postMemRef = postInfo.getMemRef();
-    auto blockArg = mlir::cast<mlir::BlockArgument>(postMemRef);
-    unsigned int argIdx = blockArg.getArgNumber();
-
-    if (preInfo.areLoopRangesEqual(postInfo)) {
-      continue;
-    }
-    if (usedMemRefs.find(postMemRef.getAsOpaquePointer()) == usedMemRefs.end()) {
-      std::string paddedBufName = std::string("_padding_buffer") + std::to_string(i);
-      mlir::MemRefType paddedMemRefType = mlir::dyn_cast<mlir::MemRefType>(postMemRef.getType());
-      int padding_type = postInfo.getPaddingType();
-      float initial_value;
-      if (padding_type == 0) { // zero padding
-        initial_value = 0;
-      } else if (padding_type == 1) { // negative padding (-inf) for softmax reduction
-        initial_value = -std::numeric_limits<float>::infinity();
-      }
-      auto InitAttr = builder.getFloatAttr(builder.getF32Type(), initial_value);
-      auto shape = paddedMemRefType.getShape();
-      int64_t totalSize = 1;
-      for (int64_t dim : shape)
-        totalSize *= dim;
-      SmallVector<mlir::Attribute> values(totalSize, InitAttr);
-      auto tensorType = mlir::RankedTensorType::get(shape, paddedMemRefType.getElementType());
-      auto denseAttr = mlir::DenseElementsAttr::get(tensorType, values);
-      auto globalMemRefOp = builder.create<mlir::memref::GlobalOp>(
-                              builder.getUnknownLoc(), paddedBufName,
-                              builder.getStringAttr("private"),
-                              paddedMemRefType, denseAttr, false,
-                              builder.getIntegerAttr(builder.getIntegerType(64), 0x1000));
-      padded_buffer[argIdx] = globalMemRefOp;
-      usedMemRefs.insert(postMemRef.getAsOpaquePointer());
-    }
- }
-
-  // Create wrapper function
-  auto wrapperFunc = builder.create<func::FuncOp>(
-      module.getLoc(), "wrapper_kernel", prevKernelFuncType);
-  mlir::Block *entryBlock = wrapperFunc.addEntryBlock();
-  builder.setInsertionPointToStart(entryBlock);
-  // Create read padding phase
-  for (size_t i = 0; i < prePaddingInfo.size() && i < postPaddingInfo.size(); ++i) {
-    auto& preInfo = prePaddingInfo[i];
-    auto& postInfo = postPaddingInfo[i];
-
-    mlir::SmallVector<mlir::Value, 2> mapOperands;
-    std::vector<AffineMap> preAffineMap = preInfo.getAffineMap();
-    std::vector<AffineMap> postAffineMap = postInfo.getAffineMap();
-    builder.setInsertionPointToEnd(entryBlock);
-    mlir::Value preMemRef = preInfo.getMemRef();
-    auto blockArg = mlir::cast<mlir::BlockArgument>(preMemRef);
-    unsigned int argIdx = blockArg.getArgNumber();
-    mlir::Value argValue = wrapperFunc.getArgument(argIdx);
-
-    if (!padded_buffer[argIdx].has_value())
-      continue;
-    // Get Global
-    mlir::memref::GlobalOp globalMemRefOp = padded_buffer[argIdx].value();
-    auto loadedMemRef = builder.create<mlir::memref::GetGlobalOp>(
-      globalMemRefOp.getLoc(), globalMemRefOp.getType(), globalMemRefOp.getName());
-
-    for (size_t i=0; i<preInfo.getDimInfo().size(); i++) {
-      auto& preDimInfo = preInfo.getDimInfo().at(i);
-      auto& postDimInfo = postInfo.getDimInfo().at(i);
-      mlir::Value preIndex, postIndex;
-      std::tie(preIndex, postIndex) = preDimInfo.createLoops(builder, postDimInfo);
-      auto loadedValue = builder.create<affine::AffineLoadOp>(builder.getUnknownLoc(), argValue, preIndex);
-      builder.create<affine::AffineStoreOp>(builder.getUnknownLoc(), loadedValue, loadedMemRef, postIndex);
-    }
-  }
-
-  // Prepare the arguments of the wrapper to be passed to the 'kernel' function
-  llvm::SmallVector<mlir::Value, 4> callArgs;
-  callArgs.resize(kernelFunc.getNumArguments());
-  builder.setInsertionPointToEnd(entryBlock);
-  for (size_t i=0; i<padded_buffer.size(); i++) {
-    if (!padded_buffer[i].has_value()) {
-      callArgs[i] = wrapperFunc.getArgument(i);
-    } else {
-      mlir::memref::GlobalOp globalMemRefOp = padded_buffer[i].value();
-      auto loadedMemRef = builder.create<mlir::memref::GetGlobalOp>(
-            builder.getUnknownLoc(), globalMemRefOp.getType(), globalMemRefOp.getName());
-      callArgs[i] = loadedMemRef;
-    }
-  }
-
-  // Create a call to the 'kernel' function inside the wrapper
-  builder.create<mlir::func::CallOp>(module.getLoc(), kernelFunc, callArgs);
-
   // Create write padding phase
-  for (size_t i = 0; i < prePaddingInfo.size() && i < postPaddingInfo.size(); ++i) {
+  for (size_t i = 0; i < prePaddingInfo.size() && i < postPaddingInfo.size() && !timing_mode; ++i) {
     auto& preInfo = prePaddingInfo[i];
     auto& postInfo = postPaddingInfo[i];
 
@@ -853,16 +766,14 @@ void TestLoopPadding::createValidationWrapperFunction(mlir::ModuleOp module, mli
 
     if (!padded_buffer[argIdx].has_value())
       continue;
-    mlir::memref::GlobalOp globalMemRefOp = padded_buffer[argIdx].value();
-    auto loadedMemRef = builder.create<mlir::memref::GetGlobalOp>(
-      globalMemRefOp.getLoc(), globalMemRefOp.getType(), globalMemRefOp.getName());
+    mlir::memref::AllocOp allocatedBuffer = padded_buffer[argIdx].value();
 
     for (size_t i=0; i<preInfo.getDimInfo().size(); i++) {
       auto& preDimInfo = preInfo.getDimInfo().at(i);
       auto& postDimInfo = postInfo.getDimInfo().at(i);
       mlir::Value preIndex, postIndex;
       std::tie(preIndex, postIndex) = preDimInfo.createLoops(builder, postDimInfo);
-      auto loadedValue = builder.create<affine::AffineLoadOp>(builder.getUnknownLoc(), loadedMemRef, postIndex);
+      auto loadedValue = builder.create<affine::AffineLoadOp>(builder.getUnknownLoc(), allocatedBuffer.getMemref(), postIndex);
       builder.create<affine::AffineStoreOp>(builder.getUnknownLoc(), loadedValue, argValue, preIndex);
     }
   }
