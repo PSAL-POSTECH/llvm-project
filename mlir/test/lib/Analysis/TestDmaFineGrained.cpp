@@ -69,7 +69,7 @@ void DmaFineGrained::runOnOperation() {
   });
   if (!hasMatmul) // only apply to functions with matmul
     return;
-  int64_t tileSizeK, tileSizeN, tileSizeM, tileSizeH;
+  int64_t tileSizeK, tileSizeN, tileSizeM, tileSizeC;
   int64_t vectorlane = systolicSize;
   builder.setInsertionPointToStart(&func.front());
   Value zeroIndex = builder.create<arith::ConstantIndexOp>(func.getLoc(), 0);
@@ -83,9 +83,9 @@ void DmaFineGrained::runOnOperation() {
     } else if (loopDepth == 1) {
       tileSizeN = loop.getStepAsInt(); // Second loop (e.g., %t_n) uses tileSizeN
     } else if (loopDepth == 2) {
-      tileSizeM = loop.getStepAsInt(); // First loop (e.g., %t_m) uses tileSizeM (tileSizeW for CONV2D)
+      tileSizeM = loop.getStepAsInt(); // First loop (e.g., %t_m) uses tileSizeM
     } else if (loopDepth == 3) {
-      tileSizeH = loop.getStepAsInt(); // Fourth loop (e.g., %t_h) uses tileSizeH for CONV2D
+      tileSizeC = loop.getStepAsInt(); // Fourth loop (e.g., %t_h) uses tileSizeC
     }
     loopDepth++;
   });
@@ -117,8 +117,10 @@ void DmaFineGrained::runOnOperation() {
       } else if (traverseOperands(matmulWeight, dmaOp.getDstMemRef())) {
         mvin_weight = dmaOp;
       } else if (traverseOperands(matmulResult, dmaOp.getDstMemRef())) {
-        mvin_bias = dmaOp;
-        is_bias = true;
+        if (getSubtileSize(dmaOp).size() > 1) { // TODO: bias needs subtiling?
+          mvin_bias = dmaOp;
+          is_bias = true;
+        }
       }
     }
   }
@@ -143,11 +145,11 @@ void DmaFineGrained::runOnOperation() {
   NamedAttrList dma1Attr;
   NamedAttrList dma2Attr;
 
-  int64_t subTileSizeH, subTileSizeM, subTileSizeN, subTileSizeK;
+  int64_t subTileSizeC, subTileSizeM, subTileSizeN, subTileSizeK;
   bool is_3d_subtile = dma1Subtile.size() == 3;
 
   // Sanity check
-  if (dma1Subtile.size() > 0 && dma2Subtile.size() > 0) {
+  if (dma1Subtile.size() > 1 && dma2Subtile.size() > 1) {
     if (auto intAttr1 = llvm::dyn_cast<mlir::IntegerAttr>(dma1Subtile.back())) {
       if (auto intAttr2 = llvm::dyn_cast<mlir::IntegerAttr>(dma2Subtile[dma2Subtile.size() - 2]))
         if (intAttr1.getInt() != intAttr2.getInt()) {
@@ -166,7 +168,7 @@ void DmaFineGrained::runOnOperation() {
     mvin_input.emitError() << "subtile_size attribute required for matmul.\n";
   }
   if (dma1Subtile.size() == 3) {
-    subTileSizeH = llvm::dyn_cast<mlir::IntegerAttr>(dma1Subtile[0]).getInt();
+    subTileSizeC = llvm::dyn_cast<mlir::IntegerAttr>(dma1Subtile[0]).getInt();
   } else if (dma1Subtile.size() > 3 || dma2Subtile.size() > 3) {
     mvin_input.emitError() << "4D subtile_size attribute is not supported.\n";
   }
@@ -264,7 +266,7 @@ void DmaFineGrained::runOnOperation() {
   builder.setInsertionPointToStart(loopM.getBody());
   i = loopM.getInductionVar();
   if (is_3d_subtile) {
-    auto loopC = builder.create<affine::AffineForOp>(loc, 0, tileSizeH, subTileSizeH);
+    auto loopC = builder.create<affine::AffineForOp>(loc, 0, tileSizeC, subTileSizeC);
     loopC->setAttr("inner_loop", builder.getBoolAttr(true));
     builder.setInsertionPointToStart(loopC.getBody());
     c = loopC.getInductionVar();
@@ -296,10 +298,10 @@ void DmaFineGrained::runOnOperation() {
   AffineMap new_spad_map;
   AffineMap new_tag_map;
   int64_t tag_k_stride = (tileSizeM / subTileSizeM);
-  int64_t spad_k_stride = (tileSizeH * tileSizeM / vectorlane);
+  int64_t spad_k_stride = (tileSizeC * tileSizeM / vectorlane);
   int64_t spad_c_stride = tileSizeK;
   if (is_3d_subtile) {
-    int64_t tag_i_stride = (tileSizeH / subTileSizeH);
+    int64_t tag_i_stride = (tileSizeC / subTileSizeC);
     new_spad_map = AffineMap::get(3, 0, builder.getAffineDimExpr(0) * spad_c_stride + builder.getAffineDimExpr(1) * spad_k_stride + builder.getAffineDimExpr(2));
     new_dst_indices = {c, k, i};
     tag_k_stride *= tag_i_stride;
