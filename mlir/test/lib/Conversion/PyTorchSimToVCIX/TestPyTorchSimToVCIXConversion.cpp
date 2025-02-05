@@ -257,6 +257,7 @@ struct MatmulOpLowering : public OpRewritePattern<linalg::MatmulOp> {
     mlir::Value BiasDmaTag;
     ValueRange BiasDMAIndices;
     mlir::Value numElements = rewriter.create<mlir::arith::ConstantIndexOp>(loc, 1);
+    mlir::Value OuterKLoopVar;
     // Search outer K loop
     op->getParentRegion()->getParentRegion()->walk([&](mlir::Operation *nestedOp) {
       if (auto dmaStartOp = llvm::dyn_cast<memref::DmaStartOp>(nestedOp)) { // Replace DMAStartOp with actual `dma_start` op type
@@ -289,6 +290,12 @@ struct MatmulOpLowering : public OpRewritePattern<linalg::MatmulOp> {
           BiasDMAIndices = dmaStartOp.getTagIndices();
         }
       }
+      if (auto forOp = llvm::dyn_cast<affine::AffineForOp>(nestedOp)) {
+        auto accum_attr = forOp->getAttrOfType<BoolAttr>("accumulation_loop");
+        if (accum_attr) {
+          OuterKLoopVar = forOp.getInductionVar();
+        }
+      }
       return WalkResult::advance();
     });
 
@@ -296,14 +303,15 @@ struct MatmulOpLowering : public OpRewritePattern<linalg::MatmulOp> {
       op.emitError () << "Failed to locate dma_start for retrieving tag.";
       return failure();
     }
-    mlir::AffineExpr ATagExpr = rewriter.getAffineDimExpr(0) * 1 + rewriter.getAffineDimExpr(1) * (K/SYSTOLIC_SIZE);
-    mlir::AffineExpr BTagExpr = rewriter.getAffineDimExpr(0) * (K/SYSTOLIC_SIZE) + rewriter.getAffineDimExpr(1) * 1;
-    auto ATagMap = mlir::AffineMap::get(2, 0, ATagExpr);
-    auto BTagMap = mlir::AffineMap::get(2, 0, BTagExpr);
+    // Notice that A, B is dependent to accumlation axis
+    mlir::AffineExpr ATagExpr = rewriter.getAffineDimExpr(0) * -1 + rewriter.getAffineDimExpr(1) * 1 + rewriter.getAffineDimExpr(2) * (K/SYSTOLIC_SIZE);
+    mlir::AffineExpr BTagExpr = rewriter.getAffineDimExpr(0) * -1 + rewriter.getAffineDimExpr(1) * (K/SYSTOLIC_SIZE) + rewriter.getAffineDimExpr(2) * 2;
+    auto ATagMap = mlir::AffineMap::get(3, 0, ATagExpr);
+    auto BTagMap = mlir::AffineMap::get(3, 0, BTagExpr);
     //auto maybeExpandedSrcMap = affine::expandAffineMap(rewriter, loc, ATagMap, ValueRange{k_idx, m_idx});
     //auto maybeExpandedDstMap = affine::expandAffineMap(rewriter, loc, BTagMap, ValueRange{n_idx, k_idx});
-    auto ATagIdx = rewriter.create<affine::AffineApplyOp>(loc, ATagMap, ValueRange{k_idx, m_idx});
-    auto BTagIdx = rewriter.create<affine::AffineApplyOp>(loc, BTagMap, ValueRange{n_idx, k_idx});
+    auto ATagIdx = rewriter.create<affine::AffineApplyOp>(loc, ATagMap, ValueRange{OuterKLoopVar, k_idx, m_idx});
+    auto BTagIdx = rewriter.create<affine::AffineApplyOp>(loc, BTagMap, ValueRange{OuterKLoopVar, n_idx, k_idx});
     rewriter.create<memref::DmaWaitOp>(loc, ADmaTag, ValueRange{ATagIdx}, numElements);
     rewriter.create<memref::DmaWaitOp>(loc, BDmaTag, ValueRange{BTagIdx}, numElements);
     if (BiasDmaTag) {
