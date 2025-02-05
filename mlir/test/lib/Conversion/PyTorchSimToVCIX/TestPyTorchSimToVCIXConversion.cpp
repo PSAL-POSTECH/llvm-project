@@ -94,7 +94,7 @@ static std::pair<unsigned, VectorType> legalizeVectorType(const Type &type) {
     if (n == 1)
       return {n, vt};
     else
-      return {n, VectorType::get({eltCount >> (n - 2)}, eltTy)};
+      return {n, VectorType::get({VLEN / (sew / 8)}, eltTy)}; // max eltcount = VLEN / element size [byte]
   }
   return {n, VectorType::get({eltCount >> (n - 1)}, eltTy, {true})};
 }
