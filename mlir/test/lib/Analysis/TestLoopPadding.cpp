@@ -704,8 +704,22 @@ void TestLoopPadding::createWrapperFunction(mlir::ModuleOp module, mlir::OpBuild
       mlir::MemRefType paddedMemRefType = mlir::dyn_cast<mlir::MemRefType>(postMemRef.getType());
       Type elementType = paddedMemRefType.getElementType();
       Value zeroValue;
+      int padding_type = postInfo.getPaddingType();
+      float initial_value;
+      if (padding_type == 0) { // zero padding
+        initial_value = 0.0;
+      } else if (padding_type == 1) { // negative padding (-inf) for softmax reduction
+        if (elementType.isF32())
+          initial_value = -std::numeric_limits<float>::infinity();
+        else if (elementType.isInteger(32))
+          initial_value = std::numeric_limits<int32_t>::min();
+        else
+          wrapperFunc.emitError("Unsupported padding dtype");
+      } else {
+        wrapperFunc.emitError("Unsupported padding type");
+      }
       if (elementType.isF32()) {
-        zeroValue = builder.create<arith::ConstantOp>(wrapperFunc.getLoc(), elementType, builder.getF32FloatAttr(0.0));
+        zeroValue = builder.create<arith::ConstantOp>(wrapperFunc.getLoc(), elementType, builder.getF32FloatAttr(initial_value));
       } else if (elementType.isInteger(32)) {
         zeroValue = builder.create<arith::ConstantOp>(wrapperFunc.getLoc(), elementType, builder.getIntegerAttr(elementType, 0));
       } else {
