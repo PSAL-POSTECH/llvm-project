@@ -726,7 +726,7 @@ void TestLoopPadding::createWrapperFunction(mlir::ModuleOp module, mlir::OpBuild
       }
       auto allocOp = builder.create<mlir::memref::AllocOp>(
         builder.getUnknownLoc(), paddedMemRefType);
-      if (!timing_mode)
+      if (!timing_mode && padding_type)
         builder.create<mlir::linalg::FillOp>(wrapperFunc.getLoc(), ValueRange{zeroValue}, ValueRange{allocOp});
       padded_buffer[argIdx] = allocOp;
       usedMemRefs.insert(postMemRef.getAsOpaquePointer());
