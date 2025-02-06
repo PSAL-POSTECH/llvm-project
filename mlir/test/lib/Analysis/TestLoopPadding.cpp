@@ -669,7 +669,7 @@ void TestLoopPadding::createWrapperFunction(mlir::ModuleOp module, mlir::OpBuild
     module.emitError() << "Function 'kernel' not found!\n";
     return;
   }
-  std::vector<std::optional<mlir::memref::AllocOp>> padded_buffer;
+  std::vector<std::optional<mlir::memref::ReallocOp>> padded_buffer;
   std::set<void*> usedMemRefs;
   padded_buffer.resize(kernelFunc.getNumArguments());
   affine::AffineForOp last;
@@ -694,11 +694,25 @@ void TestLoopPadding::createWrapperFunction(mlir::ModuleOp module, mlir::OpBuild
       continue;
     }
 
+    Value indexZero = builder.create<arith::ConstantOp>(wrapperFunc.getLoc(), builder.getIndexType(), builder.getIntegerAttr(builder.getIndexType(), 0));
     if (usedMemRefs.find(postMemRef.getAsOpaquePointer()) == usedMemRefs.end()) {
       std::string paddedBufName = std::string("_padding_buffer") + std::to_string(i);
       mlir::MemRefType paddedMemRefType = mlir::dyn_cast<mlir::MemRefType>(postMemRef.getType());
-      auto allocOp = builder.create<mlir::memref::AllocOp>(
-        builder.getUnknownLoc(), paddedMemRefType);
+      Type elementType = paddedMemRefType.getElementType();
+      Value zeroValue;
+      if (elementType.isF32()) {
+        zeroValue = builder.create<arith::ConstantOp>(wrapperFunc.getLoc(), elementType, builder.getF32FloatAttr(0.0));
+      } else if (elementType.isInteger(32)) {
+        zeroValue = builder.create<arith::ConstantOp>(wrapperFunc.getLoc(), elementType, builder.getIntegerAttr(elementType, 0));
+      } else {
+        wrapperFunc.emitError("Unsupported padding type");
+      }
+      auto srcAllocOp = builder.create<mlir::memref::AllocOp>(
+        builder.getUnknownLoc(), MemRefType::get({1}, elementType));
+      builder.create<memref::StoreOp>(srcAllocOp.getLoc(), zeroValue, srcAllocOp, ValueRange{indexZero});
+
+      auto allocOp = builder.create<mlir::memref::ReallocOp>(
+        srcAllocOp.getLoc(), paddedMemRefType, srcAllocOp);
 
       padded_buffer[argIdx] = allocOp;
       usedMemRefs.insert(postMemRef.getAsOpaquePointer());
@@ -722,7 +736,7 @@ void TestLoopPadding::createWrapperFunction(mlir::ModuleOp module, mlir::OpBuild
 
     if (!padded_buffer[argIdx].has_value())
       continue;
-    mlir::memref::AllocOp allocatedBuffer = padded_buffer[argIdx].value();
+    mlir::memref::ReallocOp allocatedBuffer = padded_buffer[argIdx].value();
 
     for (size_t i=0; i<preInfo.getDimInfo().size(); i++) {
       auto& preDimInfo = preInfo.getDimInfo().at(i);
@@ -730,7 +744,7 @@ void TestLoopPadding::createWrapperFunction(mlir::ModuleOp module, mlir::OpBuild
       mlir::Value preIndex, postIndex;
       std::tie(preIndex, postIndex) = preDimInfo.createLoops(builder, postDimInfo);
       auto loadedValue = builder.create<affine::AffineLoadOp>(builder.getUnknownLoc(), argValue, preIndex);
-      builder.create<affine::AffineStoreOp>(builder.getUnknownLoc(), loadedValue, allocatedBuffer.getMemref(), postIndex);
+      builder.create<affine::AffineStoreOp>(builder.getUnknownLoc(), loadedValue, allocatedBuffer.getResult(), postIndex);
     }
   }
 
@@ -742,8 +756,8 @@ void TestLoopPadding::createWrapperFunction(mlir::ModuleOp module, mlir::OpBuild
     if (!padded_buffer[i].has_value()) {
       callArgs[i] = wrapperFunc.getArgument(i);
     } else {
-      mlir::memref::AllocOp allocatedBuffer = padded_buffer[i].value();
-      callArgs[i] = allocatedBuffer.getMemref();
+      mlir::memref::ReallocOp allocatedBuffer = padded_buffer[i].value();
+      callArgs[i] = allocatedBuffer.getResult();
     }
   }
 
@@ -766,14 +780,14 @@ void TestLoopPadding::createWrapperFunction(mlir::ModuleOp module, mlir::OpBuild
 
     if (!padded_buffer[argIdx].has_value())
       continue;
-    mlir::memref::AllocOp allocatedBuffer = padded_buffer[argIdx].value();
+    mlir::memref::ReallocOp allocatedBuffer = padded_buffer[argIdx].value();
 
     for (size_t i=0; i<preInfo.getDimInfo().size(); i++) {
       auto& preDimInfo = preInfo.getDimInfo().at(i);
       auto& postDimInfo = postInfo.getDimInfo().at(i);
       mlir::Value preIndex, postIndex;
       std::tie(preIndex, postIndex) = preDimInfo.createLoops(builder, postDimInfo);
-      auto loadedValue = builder.create<affine::AffineLoadOp>(builder.getUnknownLoc(), allocatedBuffer.getMemref(), postIndex);
+      auto loadedValue = builder.create<affine::AffineLoadOp>(builder.getUnknownLoc(), allocatedBuffer.getResult(), postIndex);
       builder.create<affine::AffineStoreOp>(builder.getUnknownLoc(), loadedValue, argValue, preIndex);
     }
   }
