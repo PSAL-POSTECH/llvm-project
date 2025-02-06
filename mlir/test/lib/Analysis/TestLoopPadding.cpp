@@ -153,7 +153,10 @@ public:
   }
   bool isEqual(const MapDimInfo &other) const {
     if (type==MapDimType::LOOP_VAR) {
-      return loopRange != other.loopRange;
+      bool listSame = std::get<0>(loopRange) == std::get<0>(other.loopRange);
+      listSame &= std::get<1>(loopRange) == std::get<1>(other.loopRange);
+      listSame &= std::get<2>(loopRange) == std::get<2>(other.loopRange);
+      return listSame;
     }
 
     if (affineMap != other.affineMap)
