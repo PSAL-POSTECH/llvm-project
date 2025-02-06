@@ -698,7 +698,6 @@ void TestLoopPadding::createWrapperFunction(mlir::ModuleOp module, mlir::OpBuild
       continue;
     }
 
-    Value indexZero = builder.create<arith::ConstantOp>(wrapperFunc.getLoc(), builder.getIndexType(), builder.getIntegerAttr(builder.getIndexType(), 0));
     if (usedMemRefs.find(postMemRef.getAsOpaquePointer()) == usedMemRefs.end()) {
       std::string paddedBufName = std::string("_padding_buffer") + std::to_string(i);
       mlir::MemRefType paddedMemRefType = mlir::dyn_cast<mlir::MemRefType>(postMemRef.getType());
@@ -727,7 +726,8 @@ void TestLoopPadding::createWrapperFunction(mlir::ModuleOp module, mlir::OpBuild
       }
       auto allocOp = builder.create<mlir::memref::AllocOp>(
         builder.getUnknownLoc(), paddedMemRefType);
-      auto paddedAllocOp = builder.create<mlir::linalg::FillOp>(wrapperFunc.getLoc(), ValueRange{zeroValue}, ValueRange{allocOp});
+      if (!timing_mode)
+        builder.create<mlir::linalg::FillOp>(wrapperFunc.getLoc(), ValueRange{zeroValue}, ValueRange{allocOp});
       padded_buffer[argIdx] = allocOp;
       usedMemRefs.insert(postMemRef.getAsOpaquePointer());
     }
