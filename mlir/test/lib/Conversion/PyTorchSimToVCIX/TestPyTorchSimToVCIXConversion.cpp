@@ -167,12 +167,6 @@ struct MatmulOpLowering : public OpRewritePattern<linalg::MatmulOp> {
     int K = memRefTypeA.getShape()[1];
     int N = memRefTypeB.getShape()[1];
 
-    // Ensure the dimensions are multiples of SYSTOLIC_SIZE
-    if (M % SYSTOLIC_SIZE != 0 || N % SYSTOLIC_SIZE != 0 || K % SYSTOLIC_SIZE != 0) {
-      op.emitError() << "M, N, and K must be multiples of SYSTOLIC_SIZE";
-      return failure();
-    }
-
     if (memRefTypeB.getShape()[0] != K) {
       op.emitError() << "K dimension mismatch: A(" << K << ") != B(" << memRefTypeB.getShape()[0] << ")";
       return failure();
@@ -276,7 +270,7 @@ struct MatmulOpLowering : public OpRewritePattern<linalg::MatmulOp> {
       return failure();
     }
 
-    if (N != SYSTOLIC_SIZE) {
+    if (N > SYSTOLIC_SIZE) {
       // N Loop
       auto inner_loop = rewriter.create<affine::AffineForOp>(loc, 0, N/SYSTOLIC_SIZE, 1);
       inner_loop->setAttr("inner_loop", rewriter.getBoolAttr(true));
@@ -286,7 +280,7 @@ struct MatmulOpLowering : public OpRewritePattern<linalg::MatmulOp> {
       n_idx = c0;
     }
 
-    if (K != SYSTOLIC_SIZE) {
+    if (K > SYSTOLIC_SIZE) {
       // K Loop
       auto inner_loop = rewriter.create<affine::AffineForOp>(loc, 0, K/SYSTOLIC_SIZE, 1);
       inner_loop->setAttr("inner_loop", rewriter.getBoolAttr(true));
@@ -296,7 +290,7 @@ struct MatmulOpLowering : public OpRewritePattern<linalg::MatmulOp> {
       k_idx = c0;
     }
 
-    if (M != SYSTOLIC_SIZE) {
+    if (M > SYSTOLIC_SIZE) {
       // M Loop
       auto inner_loop = rewriter.create<affine::AffineForOp>(loc, 0, M/SYSTOLIC_SIZE, 1);
       inner_loop->setAttr("inner_loop", rewriter.getBoolAttr(true));
@@ -329,7 +323,8 @@ struct MatmulOpLowering : public OpRewritePattern<linalg::MatmulOp> {
     }
 
     // For vpush weight loop part
-    for (int i=0; i<SYSTOLIC_SIZE; i+=nr_element) { // KxN
+    int64_t K_LOOP = K > SYSTOLIC_SIZE ? SYSTOLIC_SIZE : K;
+    for (int i=0; i<K_LOOP; i+=nr_element) { // KxN
       Value i_val = rewriter.create<mlir::arith::ConstantIndexOp>(rewriter.getUnknownLoc(), i);
       Value spad_idx = rewriter.create<affine::AffineApplyOp>(loc, spadIdxMapAttr,
                                                       ValueRange{n_idx, k_idx, i_val, K_val, SYSTOLIC_SIZE_val});
@@ -339,7 +334,8 @@ struct MatmulOpLowering : public OpRewritePattern<linalg::MatmulOp> {
     }
 
     // For vpush input loop part
-    for (int i=0; i<SYSTOLIC_SIZE; i+=nr_element) { // MxK
+    int64_t M_LOOP = M > SYSTOLIC_SIZE ? SYSTOLIC_SIZE : M;
+    for (int i=0; i<M_LOOP; i+=nr_element) { // MxK
       Value i_val = rewriter.create<mlir::arith::ConstantIndexOp>(rewriter.getUnknownLoc(), i);
       Value spad_idx = rewriter.create<affine::AffineApplyOp>(loc, spadIdxMapAttr,
                                                       ValueRange{k_idx, m_idx, i_val, M_val, SYSTOLIC_SIZE_val});
@@ -351,7 +347,7 @@ struct MatmulOpLowering : public OpRewritePattern<linalg::MatmulOp> {
     // Compute instruction
     rewriter.create<vcix::UnaryNoDestImmOp>(loc, compute_opcode, zeroImmAttr, compute_cycle, zeroImmAttr, sew, lmul, rvl);
     // For vpop loop part
-    for (int i=0; i<SYSTOLIC_SIZE; i+=nr_element) { // MxN
+    for (int i=0; i<M_LOOP; i+=nr_element) { // MxN
       Value i_val = rewriter.create<mlir::arith::ConstantIndexOp>(rewriter.getUnknownLoc(), i);
       Value spad_idx = rewriter.create<affine::AffineApplyOp>(loc, spadIdxMapAttr,
                                                       ValueRange{n_idx, m_idx, i_val, M_val, SYSTOLIC_SIZE_val});

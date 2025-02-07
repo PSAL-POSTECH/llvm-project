@@ -209,11 +209,11 @@ void DmaFineGrained::runOnOperation() {
 
     auto loc = mvin_bias.getLoc();
     builder.setInsertionPoint(mvin_bias);
-    auto loopN = builder.create<affine::AffineForOp>(loc, 0, tileSizeN, subTileSizeM);
+    auto loopN = builder.create<affine::AffineForOp>(loc, 0, tileSizeN, subTileSizeN);
     loopN->setAttr("inner_loop", builder.getBoolAttr(true));
     builder.setInsertionPointToStart(loopN.getBody());
     j = loopN.getInductionVar();
-    auto loopM = builder.create<affine::AffineForOp>(loc, 0, tileSizeM, subTileSizeN);
+    auto loopM = builder.create<affine::AffineForOp>(loc, 0, tileSizeM, subTileSizeM);
     loopM->setAttr("inner_loop", builder.getBoolAttr(true));
     builder.setInsertionPointToStart(loopM.getBody());
     i = loopM.getInductionVar();
