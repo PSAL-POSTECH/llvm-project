@@ -167,6 +167,20 @@ struct MatmulOpLowering : public OpRewritePattern<linalg::MatmulOp> {
     int K = memRefTypeA.getShape()[1];
     int N = memRefTypeB.getShape()[1];
 
+    // Ensure the dimensions are multiples of SYSTOLIC_SIZE
+    if ((M > SYSTOLIC_SIZE && (M % SYSTOLIC_SIZE != 0))) {
+      op.emitError() << "M must be multiples of SYSTOLIC_SIZE";
+      return failure();
+    }
+    if ((N > SYSTOLIC_SIZE && (N % SYSTOLIC_SIZE != 0))) {
+      op.emitError() << "N must be multiples of SYSTOLIC_SIZE";
+      return failure();
+    }
+    if ((K > SYSTOLIC_SIZE && (K % SYSTOLIC_SIZE != 0))) {
+      op.emitError() << "K must be multiples of SYSTOLIC_SIZE";
+      return failure();
+    }
+
     if (memRefTypeB.getShape()[0] != K) {
       op.emitError() << "K dimension mismatch: A(" << K << ") != B(" << memRefTypeB.getShape()[0] << ")";
       return failure();
@@ -288,6 +302,7 @@ struct MatmulOpLowering : public OpRewritePattern<linalg::MatmulOp> {
       n_idx = c0;
     }
 
+    Value zero_vector;
     if (K > SYSTOLIC_SIZE) {
       // K Loop
       auto inner_loop = rewriter.create<affine::AffineForOp>(loc, 0, K/SYSTOLIC_SIZE, 1);
@@ -296,6 +311,9 @@ struct MatmulOpLowering : public OpRewritePattern<linalg::MatmulOp> {
       k_idx = inner_loop.getInductionVar();
     } else {
       k_idx = c0;
+      SmallVector<mlir::Attribute> values(nr_element, rewriter.getFloatAttr(rewriter.getF32Type(), 0.0));
+      auto denseAttr = mlir::DenseElementsAttr::get(vectorType, values);
+      zero_vector = rewriter.create<arith::ConstantOp>(loc, denseAttr);
     }
 
     if (M > SYSTOLIC_SIZE) {
@@ -346,13 +364,17 @@ struct MatmulOpLowering : public OpRewritePattern<linalg::MatmulOp> {
     }
 
     // For vpush weight loop part
-    int64_t K_LOOP = K > SYSTOLIC_SIZE ? SYSTOLIC_SIZE : K;
-    for (int i=0; i<K_LOOP; i+=nr_element) { // KxN
-      Value i_val = rewriter.create<mlir::arith::ConstantIndexOp>(rewriter.getUnknownLoc(), i);
-      Value spad_idx = rewriter.create<affine::AffineApplyOp>(loc, spadIdxMapAttr,
-                                                      ValueRange{n_idx, k_idx, i_val, K_val, SYSTOLIC_SIZE_val});
-      auto weight_vector = rewriter.create<vector::TransferReadOp>(
-                                          loc, vectorType, B1D, ValueRange{spad_idx});
+    for (int i=0; i<SYSTOLIC_SIZE; i+=nr_element) { // KxN
+      Value weight_vector;
+      if (i < K) {
+        Value i_val = rewriter.create<mlir::arith::ConstantIndexOp>(rewriter.getUnknownLoc(), i);
+        Value spad_idx = rewriter.create<affine::AffineApplyOp>(loc, spadIdxMapAttr,
+                                                        ValueRange{n_idx, k_idx, i_val, K_val, SYSTOLIC_SIZE_val});
+        weight_vector = rewriter.create<vector::TransferReadOp>(
+                                            loc, vectorType, B1D, ValueRange{spad_idx});
+      } else {
+        weight_vector = zero_vector;
+      }
       rewriter.create<vcix::BinaryNoDestImmOp>(weight_vector.getLoc(), vwpush_opcode, weight_vector, zeroImmAttr, zeroImmAttr, rvl);
     }
 
