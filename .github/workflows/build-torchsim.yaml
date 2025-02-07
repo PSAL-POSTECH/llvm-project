@@ -40,6 +40,7 @@ jobs:
         uses: actions/create-release@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GIT_ACCESS_TOKEN }}
+          ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION: true
         with:
           tag_name: ${{ github.ref }}
           release_name: Release ${{ github.ref }}
@@ -50,6 +51,7 @@ jobs:
         uses: actions/upload-release-asset@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GIT_ACCESS_TOKEN }}
+          ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION: true
         with:
           upload_url: ${{ steps.create_release.outputs.upload_url }}
           asset_path: ./riscv-llvm-release.tar.gz
