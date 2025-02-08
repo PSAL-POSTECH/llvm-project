@@ -212,6 +212,8 @@ struct MatmulOpLowering : public OpRewritePattern<linalg::MatmulOp> {
     Attribute sew = rewriter.getI64IntegerAttr(elen);
     Attribute lmul = rewriter.getI64IntegerAttr(0); // 0: m1, 1: m2, 2: m4, 3: m8, 5: mf8, 6: mf4, 7: mf2
     auto vectorType = VectorType::get({nr_element}, elementTypeA);
+    int nr_m_element = std::max(std::min(M, nr_element), 2); // required 2 elements for vector load/store
+    auto vectorMType = VectorType::get({nr_m_element}, elementTypeA);
     Value n_idx;
     Value k_idx;
     Value m_idx;
@@ -385,7 +387,7 @@ struct MatmulOpLowering : public OpRewritePattern<linalg::MatmulOp> {
       Value spad_idx = rewriter.create<affine::AffineApplyOp>(loc, spadIdxMapAttr,
                                                       ValueRange{k_idx, m_idx, i_val, M_val, SYSTOLIC_SIZE_val});
       auto input_vector = rewriter.create<vector::TransferReadOp>(
-                                          loc, vectorType, A1D, ValueRange{spad_idx});
+                                          loc, vectorMType, A1D, ValueRange{spad_idx});
       rewriter.create<vcix::BinaryNoDestImmOp>(input_vector.getLoc(), vipush_opcode, input_vector, zeroImmAttr, zeroImmAttr, rvl);
     }
 
@@ -396,9 +398,9 @@ struct MatmulOpLowering : public OpRewritePattern<linalg::MatmulOp> {
       Value i_val = rewriter.create<mlir::arith::ConstantIndexOp>(rewriter.getUnknownLoc(), i);
       Value spad_idx = rewriter.create<affine::AffineApplyOp>(loc, spadIdxMapAttr,
                                                       ValueRange{n_idx, m_idx, i_val, M_val, SYSTOLIC_SIZE_val});
-      Value vpop = rewriter.create<vcix::UnaryImmOp>(loc, vectorType, vpop_opcode, zeroImmAttr, zeroImmAttr, rvl);
+      Value vpop = rewriter.create<vcix::UnaryImmOp>(loc, vectorMType, vpop_opcode, zeroImmAttr, zeroImmAttr, rvl);
       auto prev_output = rewriter.create<vector::TransferReadOp>(
-                                          vpop.getLoc(), vectorType, C1D, ValueRange{spad_idx});
+                                          vpop.getLoc(), vectorMType, C1D, ValueRange{spad_idx});
       VectorType vt = cast<VectorType>(prev_output.getType());
       if (vt.getElementType().isInteger()) {
         auto output_vector = rewriter.create<arith::AddIOp>(loc, prev_output, vpop);
