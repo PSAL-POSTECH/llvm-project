@@ -88,7 +88,7 @@ void DmaFineGrained::runOnOperation() {
   });
 
   // Retrieve tile info
-  tileSizeK = accumulationLoops.back().getStepAsInt();
+  tileSizeK = accumulationLoops.front().getStepAsInt();
   tileSizeN = outerLoops.at(0).getStepAsInt();
   tileSizeM = outerLoops.at(1).getStepAsInt();
   if (outerLoops.size() >= 3)
@@ -315,7 +315,11 @@ void DmaFineGrained::runOnOperation() {
     dst_indices.push_back(zeroIndex);
   } else {
     // affine_map<(d0, d1) -> (d0 * (tileSizeM / vectorlane) + d1)>
-    new_spad_map = AffineMap::get(2, 0, builder.getAffineDimExpr(0) * (tileSizeM / vectorlane) + builder.getAffineDimExpr(1));
+    spad_k_stride = (tileSizeM / vectorlane);
+    if (spad_k_stride == 0)
+      new_spad_map = AffineMap::get(2, 0, builder.getAffineDimExpr(0).floorDiv(vectorlane / tileSizeM) + builder.getAffineDimExpr(1));
+    else
+      new_spad_map = AffineMap::get(2, 0, builder.getAffineDimExpr(0) * spad_k_stride + builder.getAffineDimExpr(1));
     new_dst_indices = {k, i};
     new_tag_map = AffineMap::get(2, 0 , builder.getAffineDimExpr(0) * tag_k_stride + builder.getAffineDimExpr(1));
     new_tag_indices = {builder.create<affine::AffineApplyOp>(loc, tag_idx_map, k), builder.create<affine::AffineApplyOp>(loc, tag_idx_map, i)};
@@ -347,9 +351,14 @@ void DmaFineGrained::runOnOperation() {
   src_indices.clear();
   src_indices.push_back(dram_idx);
 
-  AffineMap spad_map_k = AffineMap::get(2, 0, builder.getAffineDimExpr(0) * (tileSizeK / vectorlane) + builder.getAffineDimExpr(1));
+  int64_t spad_j_stride = (tileSizeK / vectorlane);
+  if (spad_j_stride == 0)
+    //map<(d0, d1) -> (d0 floordiv (vectorlane / tileSizeK) + d1)>
+    new_spad_map = AffineMap::get(2, 0, builder.getAffineDimExpr(0).floorDiv(vectorlane / tileSizeK) + builder.getAffineDimExpr(1));
+  else
+    new_spad_map = AffineMap::get(2, 0, builder.getAffineDimExpr(0) * (tileSizeK / vectorlane) + builder.getAffineDimExpr(1));
 
-  dst_idx = builder.create<affine::AffineApplyOp>(loc, spad_map_k, ValueRange{j, k});
+  dst_idx = builder.create<affine::AffineApplyOp>(loc, new_spad_map, ValueRange{j, k});
   dst_indices.clear();
   dst_indices.push_back(zeroIndex);
   dst_indices.push_back(dst_idx);
