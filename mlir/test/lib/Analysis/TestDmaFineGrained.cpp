@@ -238,7 +238,7 @@ void DmaFineGrained::runOnOperation() {
     dram_idx = builder.create<affine::AffineApplyOp>(loc, sum_map, ValueRange{dram_idx, srcIndices[0]});
     src_indices.push_back(dram_idx);
     AffineMap new_spad_map = AffineMap::get(2, 0, builder.getAffineDimExpr(0) * (tileSizeM / vectorlane) + builder.getAffineDimExpr(1));
-    AffineMap new_tag_map = AffineMap::get(2, 0, builder.getAffineDimExpr(0) * ((tileSizeM+vectorlane-1) / subTileSizeM) + builder.getAffineDimExpr(1));
+    AffineMap new_tag_map = AffineMap::get(2, 0, builder.getAffineDimExpr(0) * ((tileSizeM+subTileSizeM-1) / subTileSizeM) + builder.getAffineDimExpr(1));
     new_tag_indices = {builder.create<affine::AffineApplyOp>(loc, tag_idx_map, j), builder.create<affine::AffineApplyOp>(loc, tag_idx_map, i)};
     auto dst_idx = builder.create<affine::AffineApplyOp>(loc, new_spad_map, ValueRange{j, i});
 

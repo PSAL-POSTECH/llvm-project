@@ -253,7 +253,7 @@ struct MatmulOpLowering : public OpRewritePattern<linalg::MatmulOp> {
       affineForOp = llvm::dyn_cast_or_null<affine::AffineForOp>(affineForOp->getParentOp());
     }
     // Assume last accumulation loop is K loop
-    KStep = accumulationLoops.front().getStep().getZExtValue();
+    KStep = accumulationLoops.back().getStep().getZExtValue();
 
     affineForOp->walk([&](mlir::Operation *nestedOp) {
       if (auto dmaStartOp = llvm::dyn_cast<memref::DmaStartOp>(nestedOp)) { // Replace DMAStartOp with actual `dma_start` op type
