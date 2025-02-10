@@ -240,10 +240,12 @@ class TOGDMANode : public TOGNode {
 class TOGDMAWaitNode : public TOGNode {
   std::vector<std::string> tag_idx_list;
   std::vector<int> tag_stride_list;
+  std::vector<int> tag_divider_list;
   std::string base_addr;
  public:
-  TOGDMAWaitNode(const std::string &name, std::vector<std::string> &idx_list, std::vector<int> &tag_stride_list, std::string &addr)
-      : TOGNode(name), tag_idx_list(idx_list), tag_stride_list(tag_stride_list), base_addr(addr) {}
+  TOGDMAWaitNode(const std::string &name, std::vector<std::string> &idx_list, std::vector<int> &tag_stride_list,
+    std::vector<int> &tag_divider_list, std::string &addr)
+      : TOGNode(name), tag_idx_list(idx_list), tag_stride_list(tag_stride_list), tag_divider_list(tag_divider_list), base_addr(addr) {}
   void display() const override {
     TOGNode::display();
     std::cout << ",\n";
@@ -255,6 +257,10 @@ class TOGDMAWaitNode : public TOGNode {
 
     name = std::string("tag_stride_list");
     printLoopInfo(name, this->tag_stride_list);
+    std::cout << ",\n";
+
+    name = std::string("tag_divider_list");
+    printLoopInfo(name, this->tag_divider_list);
     std::cout << "}\n";
   }
   NodeKind getKind() const override { return DMAWaitNodeKind; }

@@ -73,6 +73,7 @@ struct TestTileOperationGraph
   llvm::SmallVector<mlir::Attribute, 2> getSubtileSize(mlir::Operation *operation);
   int getAsyncValue(mlir::Operation *operation);
   std::vector<int> collectCoefficientsFromAffineExpr(mlir::AffineExpr expr);
+  std::vector<int> collectDividersFromAffineExpr(mlir::AffineExpr expr);
   int nr_loop = 0;
   llvm::DenseMap<void*, std::string> loop_var_name;
 };
@@ -114,16 +115,27 @@ std::vector<int> TestTileOperationGraph::collectCoefficientsFromAffineExpr(mlir:
         if (auto lhs = llvm::dyn_cast<mlir::AffineConstantExpr>(binExpr.getLHS())) {
           if (auto rhs = llvm::dyn_cast<mlir::AffineDimExpr>(binExpr.getRHS())) {
             coefficients.push_back(lhs.getValue());
+          } else if (auto rhs = llvm::dyn_cast<mlir::AffineBinaryOpExpr>(binExpr.getRHS())) {
+            if (rhs.getKind() == mlir::AffineExprKind::FloorDiv)
+              coefficients.push_back(lhs.getValue());
           }
         } else if (auto rhs = llvm::dyn_cast<mlir::AffineConstantExpr>(binExpr.getRHS())) {
           if (auto lhs = llvm::dyn_cast<mlir::AffineDimExpr>(binExpr.getLHS())) {
             coefficients.push_back(rhs.getValue());
+          } else if (auto lhs = llvm::dyn_cast<mlir::AffineBinaryOpExpr>(binExpr.getLHS())) {
+            if (lhs.getKind() == mlir::AffineExprKind::FloorDiv)
+              coefficients.push_back(rhs.getValue());
           }
         }
       } else if (binExpr.getKind() == mlir::AffineExprKind::Add) {
         // Add: Recursively collect both sides
         collectCoefficients(binExpr.getLHS());
         collectCoefficients(binExpr.getRHS());
+      } else if (binExpr.getKind() == mlir::AffineExprKind::FloorDiv) {
+        if (auto rhs = llvm::dyn_cast<mlir::AffineConstantExpr>(binExpr.getRHS())) {
+          int div = rhs.getValue();
+          coefficients.push_back(div);
+        }
       }
     } else if (auto dimExpr = llvm::dyn_cast<mlir::AffineDimExpr>(expr)) {
       coefficients.push_back(1);
@@ -132,6 +144,47 @@ std::vector<int> TestTileOperationGraph::collectCoefficientsFromAffineExpr(mlir:
 
   collectCoefficients(expr);
  return coefficients;
+}
+
+
+std::vector<int> TestTileOperationGraph::collectDividersFromAffineExpr(mlir::AffineExpr expr) {
+  std::vector<int> dividers;
+
+  std::function<void(mlir::AffineExpr)> collectDividers = [&](mlir::AffineExpr expr) {
+    if (auto binExpr = llvm::dyn_cast<mlir::AffineBinaryOpExpr>(expr)) {
+      if (binExpr.getKind() == mlir::AffineExprKind::Mul) {
+        if (auto lhs = llvm::dyn_cast<mlir::AffineConstantExpr>(binExpr.getLHS())) {
+          if (auto rhs = llvm::dyn_cast<mlir::AffineDimExpr>(binExpr.getRHS())) {
+            dividers.push_back(1);
+          } else if (auto rhs = llvm::dyn_cast<mlir::AffineBinaryOpExpr>(binExpr.getRHS())) {
+            if (rhs.getKind() == mlir::AffineExprKind::FloorDiv)
+              collectDividers(rhs);
+          }
+        } else if (auto rhs = llvm::dyn_cast<mlir::AffineConstantExpr>(binExpr.getRHS())) {
+          if (auto lhs = llvm::dyn_cast<mlir::AffineDimExpr>(binExpr.getLHS())) {
+            dividers.push_back(1);
+          } else if (auto lhs = llvm::dyn_cast<mlir::AffineBinaryOpExpr>(binExpr.getLHS())) {
+            if (lhs.getKind() == mlir::AffineExprKind::FloorDiv)
+              collectDividers(lhs);
+          }
+        }
+      } else if (binExpr.getKind() == mlir::AffineExprKind::Add) {
+        // Add: Recursively collect both sides
+        collectDividers(binExpr.getLHS());
+        collectDividers(binExpr.getRHS());
+      } else if (binExpr.getKind() == mlir::AffineExprKind::FloorDiv) {
+        if (auto rhs = llvm::dyn_cast<mlir::AffineConstantExpr>(binExpr.getRHS())) {
+          int div = rhs.getValue();
+          dividers.push_back(div);
+        }
+      }
+    } else if (auto dimExpr = llvm::dyn_cast<mlir::AffineDimExpr>(expr)) {
+      dividers.push_back(1);
+    }
+  };
+
+  collectDividers(expr);
+ return dividers;
 }
 
 void TestTileOperationGraph::printOperation(Operation &op, TOGNode *node) {
@@ -152,6 +205,9 @@ void TestTileOperationGraph::printOperation(Operation &op, TOGNode *node) {
       loop_type = "accumulation_loop";
     } else if (innerLoopAttr && innerLoopAttr.getValue()) {
       loop_type = "inner_loop";
+    } else {
+      for_op.emitError("Loop attribute is required");
+      return;
     }
 
     if ((outerLoopAttr && outerLoopAttr.getValue()) || (outerLoopAttr2 && outerLoopAttr2.getValue()) || (innerLoopAttr && innerLoopAttr.getValue())) {
@@ -300,6 +356,7 @@ void TestTileOperationGraph::printOperation(Operation &op, TOGNode *node) {
     std::string address = "arg";
     std::vector<std::string> tag_index_list;
     std::vector<int> tag_stride_list;
+    std::vector<int> tag_divider_list;
     auto dma_op = dyn_cast<memref::DmaWaitOp>(op);
     auto tag_memref = dma_op.getTagMemRef();
     auto tag_range = dma_op.getTagIndices();
@@ -318,6 +375,7 @@ void TestTileOperationGraph::printOperation(Operation &op, TOGNode *node) {
         }
         mlir::AffineMap map = applyOp.getAffineMap();
         tag_stride_list = collectCoefficientsFromAffineExpr(map.getResult(0));
+        tag_divider_list = collectDividersFromAffineExpr(map.getResult(0));
       } else {
         dma_op.emitError() << "Unexpected tag indices in the dma.wait\n";
       }
@@ -343,9 +401,10 @@ void TestTileOperationGraph::printOperation(Operation &op, TOGNode *node) {
     }
     if (tag_stride_list.size() == 0) {
       tag_stride_list.push_back(1);
+      tag_divider_list.push_back(1);
     }
 
-    TOGDMAWaitNode *tog_dma_wait = new TOGDMAWaitNode("DMAWaitNode", tag_index_list, tag_stride_list, address);
+    TOGDMAWaitNode *tog_dma_wait = new TOGDMAWaitNode("DMAWaitNode", tag_index_list, tag_stride_list, tag_divider_list, address);
     tog_dma_wait->setOp(&op);
     /* Link child and parent */
     node->addChild(tog_dma_wait);
