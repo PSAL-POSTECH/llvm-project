@@ -377,6 +377,53 @@ void TestLoopPadding::runOnOperation() {
             if (loopVar == forOp.getInductionVar()) {
               isAffected = true;
               break;
+            } else if (auto nestedApplyOp = loopVar.getDefiningOp<mlir::affine::AffineApplyOp>()) {
+              /* This is for handling convolution case */
+              AffineMap nestedMap = nestedApplyOp.getAffineMap();
+              std::vector<mlir::affine::AffineForOp> forOps;
+              for (unsigned j=0; j<nestedMap.getNumDims(); j++) {
+                Value nestedLoopVar = nestedApplyOp.getOperand(j);
+                if (auto blockArg = llvm::dyn_cast_or_null<mlir::BlockArgument>(nestedLoopVar)) {
+                  if (auto defForOp = llvm::dyn_cast_or_null<affine::AffineForOp>(blockArg.getOwner()->getParentOp())) {
+                    forOps.push_back(defForOp);
+                    if (defForOp.getInductionVar() == forOp.getInductionVar())
+                      isAffected = true;
+                  }
+                }
+              }
+              if (forOps.size() != nestedMap.getNumDims())
+                isAffected = false;
+
+              if (isAffected) {
+                int64_t size = 1;
+                int64_t newSize = 1;
+                for (unsigned j=0; j<nestedMap.getNumDims();j++) {
+                  int64_t coeff = getCoefficientFromDim(nestedMap.getResult(0), j);
+                  if (forOps.at(j) == forOp) {
+                    size += coeff * (upperBound-1);
+                    newSize += coeff * (paddedUpperBound-1);
+                  } else {
+                    int64_t upper = getLoopUpperBound(forOps.at(j));
+                    size += coeff * (upper-1);
+                    newSize += coeff * (upper-1);
+                  }
+                }
+                if (std::find(memRefSet.begin(), memRefSet.end(), dram_memref) == memRefSet.end()) {
+                  // Padding memref and update the function signature to match the new padded memref types
+                  modifyMemrefWithPadding(dram_memref, size, newSize);
+                  updateFunctionSignatureWithMemRef(function, dram_memref);
+                  memRefSet.push_back(dram_memref);
+                }
+                int expr_idx = 0;
+                auto index_pos = i;
+                AffineExpr expr = dmaOpExpr[dmaOp.getAsOpaquePointer()];
+
+                /* Update affine expression */
+                AffineExpr newExpr = updateAffineExprWithBounds(expr, index_pos, size, newSize, context);
+                map = updateAffineMapWithNewExpr(map, newExpr, expr_idx, context, forOp);
+                applyOp.setMap(map);
+                return;
+              }
             }
           }
         } else if (operand.getAsOpaquePointer() == forOp.getInductionVar().getAsOpaquePointer()){
