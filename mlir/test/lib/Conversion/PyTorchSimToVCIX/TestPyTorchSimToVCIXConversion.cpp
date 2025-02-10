@@ -105,10 +105,12 @@ bool traverseMMOperands(Value op_val, Value input) {
     return true;
   }
   auto operation = op_val.getDefiningOp();
-  for (auto operand : operation->getOperands()) {
-    found = found | traverseMMOperands(operand, input);
-    if (operand == input) {
-      return true;
+  if (operation) {
+    for (auto operand : operation->getOperands()) {
+      found = found | traverseMMOperands(operand, input);
+      if (operand == input) {
+        return true;
+      }
     }
   }
   return found;
@@ -141,19 +143,6 @@ struct MatmulOpLowering : public OpRewritePattern<linalg::MatmulOp> {
       op.emitError () << "expected MemRefType inputs";
       return failure(true);
     }
-
-    // Allocate a memref for the reshape shape memref<1xi64>
-    Value shapeMemRef = rewriter.create<memref::AllocOp>(loc, MemRefType::get({1}, rewriter.getI64Type()));
-
-    auto reshapedTypeA = MemRefType::get({memRefTypeA.getNumElements()}, memRefTypeA.getElementType(), {}, memRefTypeA.getMemorySpaceAsInt());
-    auto reshapedTypeB = MemRefType::get({memRefTypeB.getNumElements()}, memRefTypeB.getElementType(), {}, memRefTypeB.getMemorySpaceAsInt());
-    auto reshapedTypeC = MemRefType::get({memRefTypeC.getNumElements()}, memRefTypeC.getElementType(), {}, memRefTypeC.getMemorySpaceAsInt());
-
-    // Reshape A, B and C
-    Value A1D = rewriter.create<memref::ReshapeOp>(loc, reshapedTypeA, A, shapeMemRef);
-    Value B1D = rewriter.create<memref::ReshapeOp>(loc, reshapedTypeB, B, shapeMemRef);
-    Value C1D = rewriter.create<memref::ReshapeOp>(loc, reshapedTypeC, C, shapeMemRef);
-
     elementTypeA = memRefTypeA.getElementType();
     elementTypeB = memRefTypeB.getElementType();
     elementTypeC = memRefTypeC.getElementType();
@@ -220,6 +209,7 @@ struct MatmulOpLowering : public OpRewritePattern<linalg::MatmulOp> {
 
     Value M_val = rewriter.create<mlir::arith::ConstantIndexOp>(rewriter.getUnknownLoc(), M);
     Value K_val = rewriter.create<mlir::arith::ConstantIndexOp>(rewriter.getUnknownLoc(), K);
+    Value N_val = rewriter.create<mlir::arith::ConstantIndexOp>(rewriter.getUnknownLoc(), N);
     Value SYSTOLIC_SIZE_val = rewriter.create<mlir::arith::ConstantIndexOp>(rewriter.getUnknownLoc(), SYSTOLIC_SIZE);
 
     auto spadIdxMap = AffineMap::get(
@@ -229,7 +219,19 @@ struct MatmulOpLowering : public OpRewritePattern<linalg::MatmulOp> {
       rewriter.getAffineDimExpr(2), // This represents `n_idx * K + k_idx * SYSTOLIC_SIZE + i`
       rewriter.getContext()
     );
+    auto spadXIdxMap = AffineMap::get(
+      /*dimCount=*/1, /*symbolCount=*/1,
+      rewriter.getAffineDimExpr(0).floorDiv(rewriter.getAffineSymbolExpr(0)),
+      rewriter.getContext()
+    );
+    auto spadYIdxMap = AffineMap::get(
+      /*dimCount=*/1, /*symbolCount=*/1,
+      rewriter.getAffineDimExpr(0) % rewriter.getAffineSymbolExpr(0),
+      rewriter.getContext()
+    );
     auto spadIdxMapAttr = mlir::AffineMapAttr::get(spadIdxMap);
+    auto spadXIdxMapAttr = mlir::AffineMapAttr::get(spadXIdxMap);
+    auto spadYIdxMapAttr = mlir::AffineMapAttr::get(spadYIdxMap);
 
     // Put dma wait operation
     mlir::Value ADmaTag;
@@ -372,8 +374,10 @@ struct MatmulOpLowering : public OpRewritePattern<linalg::MatmulOp> {
         Value i_val = rewriter.create<mlir::arith::ConstantIndexOp>(rewriter.getUnknownLoc(), i);
         Value spad_idx = rewriter.create<affine::AffineApplyOp>(loc, spadIdxMapAttr,
                                                         ValueRange{n_idx, k_idx, i_val, K_val, SYSTOLIC_SIZE_val});
+        Value w_x_idx = rewriter.create<affine::AffineApplyOp>(loc, spadXIdxMapAttr, ValueRange{spad_idx, N_val});
+        Value w_y_idx = rewriter.create<affine::AffineApplyOp>(loc, spadYIdxMapAttr, ValueRange{spad_idx, N_val});
         weight_vector = rewriter.create<vector::TransferReadOp>(
-                                            loc, vectorType, B1D, ValueRange{spad_idx});
+                                            loc, vectorType, B, ValueRange{w_x_idx, w_y_idx});
       } else {
         weight_vector = zero_vector;
       }
@@ -386,8 +390,10 @@ struct MatmulOpLowering : public OpRewritePattern<linalg::MatmulOp> {
       Value i_val = rewriter.create<mlir::arith::ConstantIndexOp>(rewriter.getUnknownLoc(), i);
       Value spad_idx = rewriter.create<affine::AffineApplyOp>(loc, spadIdxMapAttr,
                                                       ValueRange{k_idx, m_idx, i_val, M_val, SYSTOLIC_SIZE_val});
+      Value x_idx = rewriter.create<affine::AffineApplyOp>(loc, spadXIdxMapAttr, ValueRange{spad_idx, K_val});
+      Value y_idx = rewriter.create<affine::AffineApplyOp>(loc, spadYIdxMapAttr, ValueRange{spad_idx, K_val});
       auto input_vector = rewriter.create<vector::TransferReadOp>(
-                                          loc, vectorMType, A1D, ValueRange{spad_idx});
+                                          loc, vectorMType, A, ValueRange{x_idx, y_idx});
       rewriter.create<vcix::BinaryNoDestImmOp>(input_vector.getLoc(), vipush_opcode, input_vector, zeroImmAttr, zeroImmAttr, rvl);
     }
 
@@ -399,16 +405,18 @@ struct MatmulOpLowering : public OpRewritePattern<linalg::MatmulOp> {
       Value spad_idx = rewriter.create<affine::AffineApplyOp>(loc, spadIdxMapAttr,
                                                       ValueRange{n_idx, m_idx, i_val, M_val, SYSTOLIC_SIZE_val});
       Value vpop = rewriter.create<vcix::UnaryImmOp>(loc, vectorMType, vpop_opcode, zeroImmAttr, zeroImmAttr, rvl);
+      Value x_idx = rewriter.create<affine::AffineApplyOp>(loc, spadXIdxMapAttr, ValueRange{spad_idx, N_val});
+      Value y_idx = rewriter.create<affine::AffineApplyOp>(loc, spadYIdxMapAttr, ValueRange{spad_idx, N_val});
       auto prev_output = rewriter.create<vector::TransferReadOp>(
-                                          vpop.getLoc(), vectorMType, C1D, ValueRange{spad_idx});
+                                          vpop.getLoc(), vectorMType, C, ValueRange{x_idx, y_idx});
       VectorType vt = cast<VectorType>(prev_output.getType());
       if (vt.getElementType().isInteger()) {
         auto output_vector = rewriter.create<arith::AddIOp>(loc, prev_output, vpop);
-        rewriter.create<vector::TransferWriteOp>(output_vector.getLoc(), output_vector, C1D, ValueRange{spad_idx});
+        rewriter.create<vector::TransferWriteOp>(output_vector.getLoc(), output_vector, C, ValueRange{x_idx, y_idx});
       }
       else if (vt.getElementType().isIntOrFloat())  {
         auto output_vector = rewriter.create<arith::AddFOp>(loc, prev_output, vpop);
-        rewriter.create<vector::TransferWriteOp>(output_vector.getLoc(), output_vector, C1D, ValueRange{spad_idx});
+        rewriter.create<vector::TransferWriteOp>(output_vector.getLoc(), output_vector, C, ValueRange{x_idx, y_idx});
       } else {
         op.emitError () << "expected same type";
         return failure();
