@@ -32,6 +32,13 @@ namespace {
 int SYSTOLIC_SIZE = 128;
 int VLEN = 128;
 
+int64_t getLoopUpperBound(mlir::affine::AffineForOp forOp) {
+  if (auto constantOp = forOp.getUpperBoundMap().getSingleConstantResult()) {
+    return constantOp;
+  }
+  return -1;  // This is an example, handle dynamic cases as needed
+}
+
 std::pair<Value, bool> getDramMemRef(mlir::memref::DmaStartOp dmaOp) {
   auto dst_space = dmaOp.getDstMemorySpace();
   auto src_space = dmaOp.getSrcMemorySpace();
@@ -245,6 +252,7 @@ struct MatmulOpLowering : public OpRewritePattern<linalg::MatmulOp> {
     int NStep = SYSTOLIC_SIZE;
     std::vector<affine::AffineForOp> accumulationLoops;
     std::vector<affine::AffineForOp> outerLoops;
+    std::vector<affine::AffineForOp> innerLoops;
 
     // Find accumulation loops and set last outerloop
     auto affineForOp = llvm::dyn_cast_or_null<affine::AffineForOp>(op->getParentRegion()->getParentOp());
@@ -254,6 +262,9 @@ struct MatmulOpLowering : public OpRewritePattern<linalg::MatmulOp> {
       }
       if (auto attr = affineForOp->getAttrOfType<BoolAttr>("outer_loop")) {
         outerLoops.insert(outerLoops.begin(), affineForOp);
+      }
+      if (auto attr = affineForOp->getAttrOfType<BoolAttr>("inner_loop")) {
+        innerLoops.insert(innerLoops.begin(), affineForOp);
       }
       affineForOp = llvm::dyn_cast_or_null<affine::AffineForOp>(affineForOp->getParentOp());
     }
@@ -343,24 +354,53 @@ struct MatmulOpLowering : public OpRewritePattern<linalg::MatmulOp> {
     // Notice that A, B is dependent to accumlation axis
     mlir::AffineExpr ATagExpr = rewriter.getAffineDimExpr(0) * -1;
     mlir::AffineExpr BTagExpr = rewriter.getAffineDimExpr(0) * -1;
+    llvm::SmallVector<mlir::Value, 4> ATagOperands = {accumulationLoops.at(0).getInductionVar()};
+    llvm::SmallVector<mlir::Value, 4> BTagOperands = {accumulationLoops.at(0).getInductionVar()};
     for (size_t i = 1; i < numAccumulationLoops; ++i) {
       ATagExpr = ATagExpr + rewriter.getAffineDimExpr(i) * -1;
       BTagExpr = BTagExpr + rewriter.getAffineDimExpr(i) * -1;
-    }
-    ATagExpr = ATagExpr + rewriter.getAffineDimExpr(numAccumulationLoops)*(M/MStep) + rewriter.getAffineDimExpr(numAccumulationLoops+1).floorDiv((MStep+SYSTOLIC_SIZE-1)/SYSTOLIC_SIZE);
-    BTagExpr = BTagExpr + rewriter.getAffineDimExpr(numAccumulationLoops).floorDiv((NStep+SYSTOLIC_SIZE-1)/SYSTOLIC_SIZE)*(K/KStep)+ rewriter.getAffineDimExpr(numAccumulationLoops+1)*1;
-    auto ATagMap = mlir::AffineMap::get(numAccumulationLoops+2, 0, ATagExpr);
-    auto BTagMap = mlir::AffineMap::get(numAccumulationLoops+2, 0, BTagExpr);
-
-    llvm::SmallVector<mlir::Value, 4> ATagOperands;
-    llvm::SmallVector<mlir::Value, 4> BTagOperands;
-    for (size_t i = 0; i < numAccumulationLoops; ++i) {
       ATagOperands.push_back(accumulationLoops.at(i).getInductionVar());
       BTagOperands.push_back(accumulationLoops.at(i).getInductionVar());
     }
-    ATagOperands.push_back(c0);
+    int ADimOffset = numAccumulationLoops;
+    int BDimOffset = numAccumulationLoops;
+    if (innerLoops.size()==4) {
+      /* FIXME. this is totally heuristic based lowering... */
+      ADimOffset = innerLoops.size() + numAccumulationLoops;
+      BDimOffset = ADimOffset-2;
+      int64_t oW, kW, iW;
+      oW = getLoopUpperBound(innerLoops.at(1));
+      kW = getLoopUpperBound(innerLoops.at(3));
+      iW = oW + kW - 1;
+      ATagExpr = ATagExpr + \
+        rewriter.getAffineDimExpr(ADimOffset-4)*((K/KStep)*(M/MStep)*iW) + \
+        rewriter.getAffineDimExpr(ADimOffset-3)*((K/KStep)*(M/MStep)) + \
+        rewriter.getAffineDimExpr(ADimOffset-2)*((K/KStep)*(M/MStep)*iW) + \
+        rewriter.getAffineDimExpr(ADimOffset-1)*((K/KStep)*(M/MStep));
+      BTagExpr = BTagExpr + \
+        rewriter.getAffineDimExpr(BDimOffset-2)*((N/NStep)*(K/KStep)*kW) + \
+        rewriter.getAffineDimExpr(BDimOffset-1)*((N/NStep)*(K/KStep));
+      /* Add Operands */
+      ATagOperands.push_back(innerLoops.at(0).getInductionVar());
+      ATagOperands.push_back(innerLoops.at(1).getInductionVar());
+      ATagOperands.push_back(innerLoops.at(2).getInductionVar());
+      ATagOperands.push_back(innerLoops.at(3).getInductionVar());
+
+      BTagOperands.push_back(innerLoops.at(2).getInductionVar());
+      BTagOperands.push_back(innerLoops.at(3).getInductionVar());
+    }
+    ATagExpr = ATagExpr + rewriter.getAffineDimExpr(ADimOffset)*(M/MStep) + \
+      rewriter.getAffineDimExpr(ADimOffset+1).floorDiv((MStep+SYSTOLIC_SIZE-1)/SYSTOLIC_SIZE);
+    BTagExpr = BTagExpr + rewriter.getAffineDimExpr(BDimOffset).floorDiv((NStep+SYSTOLIC_SIZE-1)/SYSTOLIC_SIZE)*(K/KStep) + \
+      rewriter.getAffineDimExpr(BDimOffset+1)*1;
+    ATagExpr.dump();
+    BTagExpr.dump();
+    auto ATagMap = mlir::AffineMap::get(ADimOffset+2, 0, ATagExpr);
+    auto BTagMap = mlir::AffineMap::get(BDimOffset+2, 0, BTagExpr);
+
+    ATagOperands.push_back(c0);    //K_idx, m_idx
     ATagOperands.push_back(m_idx);
-    BTagOperands.push_back(n_idx);
+    BTagOperands.push_back(n_idx); //N_idx, K_Idx
     BTagOperands.push_back(c0);
     auto ATagIdx = rewriter.create<affine::AffineApplyOp>(loc, ATagMap, ATagOperands);
     auto BTagIdx = rewriter.create<affine::AffineApplyOp>(loc, BTagMap, BTagOperands);
