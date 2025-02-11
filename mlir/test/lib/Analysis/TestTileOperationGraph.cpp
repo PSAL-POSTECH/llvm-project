@@ -190,7 +190,7 @@ std::vector<int> TestTileOperationGraph::collectDividersFromAffineExpr(mlir::Aff
 void TestTileOperationGraph::printOperation(Operation &op, TOGNode *node) {
   StringRef name = op.getName().getStringRef();
   if (name == "affine.yield" || name == "affine.apply" || name == "memref.get_global" || \
-      name == "affine.vector_load")
+      name == "affine.vector_load" || name == "memref.reinterpret_cast" || name == "arith.constant")
     return;
 
   if (name == "affine.for") {
