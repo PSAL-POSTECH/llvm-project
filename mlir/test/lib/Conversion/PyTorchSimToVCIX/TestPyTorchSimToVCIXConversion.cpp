@@ -247,9 +247,9 @@ struct MatmulOpLowering : public OpRewritePattern<linalg::MatmulOp> {
     ValueRange BiasDMAIndices;
     mlir::Value numElements = rewriter.create<mlir::arith::ConstantIndexOp>(loc, 1);
     mlir::Value OuterKLoopVar;
-    int KStep = SYSTOLIC_SIZE;
-    int MStep = SYSTOLIC_SIZE;
-    int NStep = SYSTOLIC_SIZE;
+    int KStep = K > SYSTOLIC_SIZE ? SYSTOLIC_SIZE : K;
+    int MStep = M > SYSTOLIC_SIZE ? SYSTOLIC_SIZE : M;
+    int NStep = N > SYSTOLIC_SIZE ? SYSTOLIC_SIZE : N;
     std::vector<affine::AffineForOp> accumulationLoops;
     std::vector<affine::AffineForOp> outerLoops;
     std::vector<affine::AffineForOp> innerLoops;
@@ -272,8 +272,6 @@ struct MatmulOpLowering : public OpRewritePattern<linalg::MatmulOp> {
     assert(outerLoops.size()>=2);
     // Assume last accumulation loop is K loop
     KStep = accumulationLoops.back().getStep().getZExtValue();
-    NStep = outerLoops.at(outerLoops.size()-1).getStep().getZExtValue();
-    MStep = outerLoops.at(outerLoops.size()-2).getStep().getZExtValue();
 
     // Set Last outer loop
     affineForOp = outerLoops.back();
@@ -392,9 +390,7 @@ struct MatmulOpLowering : public OpRewritePattern<linalg::MatmulOp> {
     ATagExpr = ATagExpr + rewriter.getAffineDimExpr(ADimOffset)*(M/MStep) + \
       rewriter.getAffineDimExpr(ADimOffset+1).floorDiv((MStep+SYSTOLIC_SIZE-1)/SYSTOLIC_SIZE);
     BTagExpr = BTagExpr + rewriter.getAffineDimExpr(BDimOffset).floorDiv((NStep+SYSTOLIC_SIZE-1)/SYSTOLIC_SIZE)*(K/KStep) + \
-      rewriter.getAffineDimExpr(BDimOffset+1)*1;
-    ATagExpr.dump();
-    BTagExpr.dump();
+      rewriter.getAffineDimExpr(BDimOffset+1).floorDiv((KStep+SYSTOLIC_SIZE-1)/SYSTOLIC_SIZE)*1;
     auto ATagMap = mlir::AffineMap::get(ADimOffset+2, 0, ATagExpr);
     auto BTagMap = mlir::AffineMap::get(BDimOffset+2, 0, BTagExpr);
 
