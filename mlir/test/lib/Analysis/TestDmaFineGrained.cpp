@@ -100,6 +100,9 @@ void DmaFineGrained::runOnOperation() {
     is_bmm = true;
   } else if (loopDepth == 11) { // conv2d has 7 loops (b, kh, kw, oh, ow, oc, ic)
     is_conv2d = true;
+  } else {
+    func.emitError() << "Unsupported loop depth: " << loopDepth;
+    return;
   }
 
   // inner loop fine-grained dma
@@ -303,15 +306,7 @@ void DmaFineGrained::runOnOperation() {
   builder.setInsertionPoint(mvin_input);
 
   if (is_weight_4d_subtile && is_input_4d_subtile && is_conv2d) {
-    // Create 2 nested affine.for loops for KxK CONV kernels
-    auto loopH = builder.create<affine::AffineForOp>(loc, 0, tileSizeH, subTileSizeH);
-    loopH->setAttr("inner_loop", builder.getBoolAttr(true));
-    builder.setInsertionPointToStart(loopH.getBody());
-    h = loopH.getInductionVar();
-    auto loopW = builder.create<affine::AffineForOp>(loc, 0, tileSizeW, subTileSizeW);
-    loopW->setAttr("inner_loop", builder.getBoolAttr(true));
-    builder.setInsertionPointToStart(loopW.getBody());
-    w = loopW.getInductionVar();
+    // Create 4 nested affine.for loops for KxK CONV kernels & HxW Outputs
     auto loopK_H = builder.create<affine::AffineForOp>(loc, 0, tileSizeK_H, subTileSizeK_H);
     loopK_H->setAttr("inner_loop", builder.getBoolAttr(true));
     builder.setInsertionPointToStart(loopK_H.getBody());
@@ -320,6 +315,14 @@ void DmaFineGrained::runOnOperation() {
     loopK_W->setAttr("inner_loop", builder.getBoolAttr(true));
     builder.setInsertionPointToStart(loopK_W.getBody());
     k_w = loopK_W.getInductionVar();
+    auto loopH = builder.create<affine::AffineForOp>(loc, 0, tileSizeH, subTileSizeH);
+    loopH->setAttr("inner_loop", builder.getBoolAttr(true));
+    builder.setInsertionPointToStart(loopH.getBody());
+    h = loopH.getInductionVar();
+    auto loopW = builder.create<affine::AffineForOp>(loc, 0, tileSizeW, subTileSizeW);
+    loopW->setAttr("inner_loop", builder.getBoolAttr(true));
+    builder.setInsertionPointToStart(loopW.getBody());
+    w = loopW.getInductionVar();
   }
   // Create three nested affine.for loops
   auto loopN = builder.create<affine::AffineForOp>(loc, 0, tileSizeN, subTileSizeN);

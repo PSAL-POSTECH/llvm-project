@@ -367,8 +367,8 @@ struct MatmulOpLowering : public OpRewritePattern<linalg::MatmulOp> {
       ADimOffset = innerLoops.size() + numAccumulationLoops;
       BDimOffset = ADimOffset-2;
       int64_t oW, kW, iW;
-      oW = getLoopUpperBound(innerLoops.at(1));
-      kW = getLoopUpperBound(innerLoops.at(3));
+      oW = getLoopUpperBound(innerLoops.at(3));
+      kW = getLoopUpperBound(innerLoops.at(1));
       iW = oW + kW - 1;
       ATagExpr = ATagExpr + \
         rewriter.getAffineDimExpr(ADimOffset-4)*((K/KStep)*(M/MStep)*iW) + \
@@ -384,8 +384,8 @@ struct MatmulOpLowering : public OpRewritePattern<linalg::MatmulOp> {
       ATagOperands.push_back(innerLoops.at(2).getInductionVar());
       ATagOperands.push_back(innerLoops.at(3).getInductionVar());
 
-      BTagOperands.push_back(innerLoops.at(2).getInductionVar());
-      BTagOperands.push_back(innerLoops.at(3).getInductionVar());
+      BTagOperands.push_back(innerLoops.at(0).getInductionVar());
+      BTagOperands.push_back(innerLoops.at(1).getInductionVar());
     }
     ATagExpr = ATagExpr + rewriter.getAffineDimExpr(ADimOffset)*(M/MStep) + \
       rewriter.getAffineDimExpr(ADimOffset+1).floorDiv((MStep+SYSTOLIC_SIZE-1)/SYSTOLIC_SIZE);
