@@ -100,7 +100,7 @@ void DmaFineGrained::runOnOperation() {
     is_bmm = true;
   } else if (loopDepth > 9) { // conv2d has 7 loops (b, kh, kw, oh, ow, oc, ic)
     is_conv2d = true;
-  } else {
+  } else if (loopDepth != 3) {
     func.emitError() << "Unsupported loop depth: " << loopDepth;
     return;
   }
