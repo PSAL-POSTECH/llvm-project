@@ -370,9 +370,27 @@ struct MatmulOpLowering : public OpRewritePattern<linalg::MatmulOp> {
       Value o_w = innerLoops.at(3).getInductionVar();
       // find affine.apply using loop index (k_h, k_w, o_h, o_w)
       int64_t offset_w = 1;
+      int64_t oW, kW;
+      bool tagh = false;
+      bool tagw = false;
+      kW = getLoopUpperBound(innerLoops.at(1));
+      oW = getLoopUpperBound(innerLoops.at(3));
+      int64_t offset_h = 1 + (oW - 1) * offset_w + (kW - 1);
       affineForOp = innerLoops.at(3);
       affineForOp->walk([&](mlir::Operation *nestedOp) {
         if (auto affineApplyOp = llvm::dyn_cast_or_null<affine::AffineApplyOp>(nestedOp)) {
+          if (affineApplyOp.getOperand(0) == o_h && affineApplyOp.getOperand(1) == k_h) {
+            AffineMap map = affineApplyOp.getAffineMap();
+            AffineExpr expr = map.getResult(0);
+            expr.walk([&](AffineExpr subExpr) {
+              if (auto constExpr = subExpr.dyn_cast<AffineConstantExpr>()) {
+                offset_w = constExpr.getValue();
+              }
+            });
+            ATagOperands.push_back(innerLoops.at(0).getInductionVar());
+            ATagOperands.push_back(innerLoops.at(2).getInductionVar());
+            tagh = true;
+          }
           if (affineApplyOp.getOperand(0) == o_w && affineApplyOp.getOperand(1) == k_w) {
             AffineMap map = affineApplyOp.getAffineMap();
             AffineExpr expr = map.getResult(0);
@@ -381,26 +399,25 @@ struct MatmulOpLowering : public OpRewritePattern<linalg::MatmulOp> {
                 offset_w = constExpr.getValue();
               }
             });
+            ATagOperands.push_back(innerLoops.at(1).getInductionVar());
+            ATagOperands.push_back(innerLoops.at(3).getInductionVar());
+            tagw = true;
           }
         }
       });
-      ATagOperands.push_back(innerLoops.at(0).getInductionVar());
-      ATagOperands.push_back(innerLoops.at(1).getInductionVar());
-      ATagOperands.push_back(innerLoops.at(2).getInductionVar());
-      ATagOperands.push_back(innerLoops.at(3).getInductionVar());
       BTagOperands.push_back(innerLoops.at(0).getInductionVar());
       BTagOperands.push_back(innerLoops.at(1).getInductionVar());
       ADimOffset = ATagOperands.size();
       BDimOffset = BTagOperands.size();
-      int64_t oW, kW;
-      kW = getLoopUpperBound(innerLoops.at(1));
-      oW = getLoopUpperBound(innerLoops.at(3));
-      int64_t offset_h = 1 + (oW - 1) * offset_w + (kW - 1);
-      ATagExpr = ATagExpr + \
-        rewriter.getAffineDimExpr(ADimOffset-4)*((K/KStep)*(M/MStep)*offset_h) + \
-        rewriter.getAffineDimExpr(ADimOffset-3)*((K/KStep)*(M/MStep)) + \
-        rewriter.getAffineDimExpr(ADimOffset-2)*((K/KStep)*(M/MStep)*offset_h) + \
-        rewriter.getAffineDimExpr(ADimOffset-1)*((K/KStep)*(M/MStep)*offset_w);
+      if (!tagw) offset_h = 1;
+      if (tagh) {
+        ATagExpr = ATagExpr + rewriter.getAffineDimExpr(ADimOffset-4)*((K/KStep)*(M/MStep)*offset_h) + \
+          rewriter.getAffineDimExpr(ADimOffset-3)*((K/KStep)*(M/MStep)*offset_h);
+      }
+      if (tagw) {
+        ATagExpr = ATagExpr + rewriter.getAffineDimExpr(ADimOffset-2)*((K/KStep)*(M/MStep)) + \
+          rewriter.getAffineDimExpr(ADimOffset-1)*((K/KStep)*(M/MStep)*offset_w);
+      }
       BTagExpr = BTagExpr + \
         rewriter.getAffineDimExpr(BDimOffset-2)*((N/NStep)*(K/KStep)*kW) + \
         rewriter.getAffineDimExpr(BDimOffset-1)*((N/NStep)*(K/KStep));
