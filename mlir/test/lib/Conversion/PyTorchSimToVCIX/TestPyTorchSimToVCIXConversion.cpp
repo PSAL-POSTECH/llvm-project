@@ -338,16 +338,6 @@ struct MatmulOpLowering : public OpRewritePattern<linalg::MatmulOp> {
       zero_vector = rewriter.create<arith::ConstantOp>(loc, denseAttr);
     }
 
-    if (M > SYSTOLIC_SIZE) {
-      // M Loop
-      auto inner_loop = rewriter.create<affine::AffineForOp>(loc, 0, M/SYSTOLIC_SIZE, 1);
-      inner_loop->setAttr("inner_loop", rewriter.getBoolAttr(true));
-      rewriter.setInsertionPointToStart(inner_loop.getBody());
-      m_idx = inner_loop.getInductionVar();
-    } else {
-      m_idx = c0;
-    }
-
     size_t numAccumulationLoops = accumulationLoops.size();
     // Notice that A, B is dependent to accumlation axis
     mlir::AffineExpr ATagExpr = rewriter.getAffineDimExpr(0) * -1;
@@ -362,6 +352,53 @@ struct MatmulOpLowering : public OpRewritePattern<linalg::MatmulOp> {
     }
     int ADimOffset = numAccumulationLoops;
     int BDimOffset = numAccumulationLoops;
+    if (innerLoops.size()==4) { // innerloop : K_H, K_W, O_H, O_W
+      /* FIXME. this is totally heuristic based lowering... */
+      int64_t offset_w = 1;
+      int64_t oW, kW;
+      BTagOperands.push_back(innerLoops.at(0).getInductionVar());
+      BTagOperands.push_back(innerLoops.at(1).getInductionVar());
+      BDimOffset = BTagOperands.size();
+      BTagExpr = BTagExpr + \
+        rewriter.getAffineDimExpr(BDimOffset-2)*((N/NStep)*(K/KStep)*kW) + \
+        rewriter.getAffineDimExpr(BDimOffset-1)*((N/NStep)*(K/KStep));
+    }
+    BTagExpr = BTagExpr + rewriter.getAffineDimExpr(BDimOffset).floorDiv((NStep+SYSTOLIC_SIZE-1)/SYSTOLIC_SIZE)*(K/KStep) + \
+      rewriter.getAffineDimExpr(BDimOffset+1).floorDiv((KStep+SYSTOLIC_SIZE-1)/SYSTOLIC_SIZE)*1;
+    auto BTagMap = mlir::AffineMap::get(BDimOffset+2, 0, BTagExpr);
+
+    BTagOperands.push_back(n_idx); //N_idx, K_Idx
+    BTagOperands.push_back(c0);
+    auto BTagIdx = rewriter.create<affine::AffineApplyOp>(loc, BTagMap, BTagOperands);
+    rewriter.create<memref::DmaWaitOp>(loc, BDmaTag, ValueRange{BTagIdx}, numElements);
+
+    // For vpush weight loop part
+    for (int i=0; i<SYSTOLIC_SIZE; i+=nr_element) { // KxN
+      Value weight_vector;
+      if (i < K) {
+        Value i_val = rewriter.create<mlir::arith::ConstantIndexOp>(rewriter.getUnknownLoc(), i);
+        Value spad_idx = rewriter.create<affine::AffineApplyOp>(loc, spadIdxMapAttr,
+                                                        ValueRange{n_idx, k_idx, i_val, K_val, SYSTOLIC_SIZE_val});
+        Value w_x_idx = rewriter.create<affine::AffineApplyOp>(loc, spadXIdxMapAttr, ValueRange{spad_idx, N_val});
+        Value w_y_idx = rewriter.create<affine::AffineApplyOp>(loc, spadYIdxMapAttr, ValueRange{spad_idx, N_val});
+        weight_vector = rewriter.create<vector::TransferReadOp>(
+                                            loc, vectorType, B, ValueRange{w_x_idx, w_y_idx});
+      } else {
+        weight_vector = zero_vector;
+      }
+      rewriter.create<vcix::BinaryNoDestImmOp>(weight_vector.getLoc(), vwpush_opcode, weight_vector, zeroImmAttr, zeroImmAttr, rvl);
+    }
+
+    if (M > SYSTOLIC_SIZE) {
+      // M Loop
+      auto inner_loop = rewriter.create<affine::AffineForOp>(loc, 0, M/SYSTOLIC_SIZE, 1);
+      inner_loop->setAttr("inner_loop", rewriter.getBoolAttr(true));
+      rewriter.setInsertionPointToStart(inner_loop.getBody());
+      m_idx = inner_loop.getInductionVar();
+    } else {
+      m_idx = c0;
+    }
+
     if (innerLoops.size()==4) { // innerloop : K_H, K_W, O_H, O_W
       /* FIXME. this is totally heuristic based lowering... */
       Value k_h = innerLoops.at(0).getInductionVar();
@@ -405,10 +442,7 @@ struct MatmulOpLowering : public OpRewritePattern<linalg::MatmulOp> {
           }
         }
       });
-      BTagOperands.push_back(innerLoops.at(0).getInductionVar());
-      BTagOperands.push_back(innerLoops.at(1).getInductionVar());
       ADimOffset = ATagOperands.size();
-      BDimOffset = BTagOperands.size();
       if (!tagw) offset_h = 1;
       if (tagh) {
         ATagExpr = ATagExpr + rewriter.getAffineDimExpr(ADimOffset-4)*((K/KStep)*(M/MStep)*offset_h) + \
@@ -418,25 +452,15 @@ struct MatmulOpLowering : public OpRewritePattern<linalg::MatmulOp> {
         ATagExpr = ATagExpr + rewriter.getAffineDimExpr(ADimOffset-2)*((K/KStep)*(M/MStep)) + \
           rewriter.getAffineDimExpr(ADimOffset-1)*((K/KStep)*(M/MStep)*offset_w);
       }
-      BTagExpr = BTagExpr + \
-        rewriter.getAffineDimExpr(BDimOffset-2)*((N/NStep)*(K/KStep)*kW) + \
-        rewriter.getAffineDimExpr(BDimOffset-1)*((N/NStep)*(K/KStep));
     }
     ATagExpr = ATagExpr + rewriter.getAffineDimExpr(ADimOffset)*(M/MStep) + \
       rewriter.getAffineDimExpr(ADimOffset+1).floorDiv((MStep+SYSTOLIC_SIZE-1)/SYSTOLIC_SIZE);
-    BTagExpr = BTagExpr + rewriter.getAffineDimExpr(BDimOffset).floorDiv((NStep+SYSTOLIC_SIZE-1)/SYSTOLIC_SIZE)*(K/KStep) + \
-      rewriter.getAffineDimExpr(BDimOffset+1).floorDiv((KStep+SYSTOLIC_SIZE-1)/SYSTOLIC_SIZE)*1;
     auto ATagMap = mlir::AffineMap::get(ADimOffset+2, 0, ATagExpr);
-    auto BTagMap = mlir::AffineMap::get(BDimOffset+2, 0, BTagExpr);
 
     ATagOperands.push_back(c0);    //K_idx, m_idx
     ATagOperands.push_back(m_idx);
-    BTagOperands.push_back(n_idx); //N_idx, K_Idx
-    BTagOperands.push_back(c0);
     auto ATagIdx = rewriter.create<affine::AffineApplyOp>(loc, ATagMap, ATagOperands);
-    auto BTagIdx = rewriter.create<affine::AffineApplyOp>(loc, BTagMap, BTagOperands);
     rewriter.create<memref::DmaWaitOp>(loc, ADmaTag, ValueRange{ATagIdx}, numElements);
-    rewriter.create<memref::DmaWaitOp>(loc, BDmaTag, ValueRange{BTagIdx}, numElements);
     if (BiasDmaTag) {
       /* Bias could be 1D or 2D */
       Value first_index = BiasDMAIndices[0].getDefiningOp<mlir::arith::ConstantIndexOp>() ? c0 : n_idx;
@@ -447,22 +471,7 @@ struct MatmulOpLowering : public OpRewritePattern<linalg::MatmulOp> {
       rewriter.create<memref::DmaWaitOp>(loc, BiasDmaTag, ValueRange{BiasTagIdx}, numElements);
     }
 
-    // For vpush weight loop part
-    for (int i=0; i<SYSTOLIC_SIZE; i+=nr_element) { // KxN
-      Value weight_vector;
-      if (i < K) {
-        Value i_val = rewriter.create<mlir::arith::ConstantIndexOp>(rewriter.getUnknownLoc(), i);
-        Value spad_idx = rewriter.create<affine::AffineApplyOp>(loc, spadIdxMapAttr,
-                                                        ValueRange{n_idx, k_idx, i_val, K_val, SYSTOLIC_SIZE_val});
-        Value w_x_idx = rewriter.create<affine::AffineApplyOp>(loc, spadXIdxMapAttr, ValueRange{spad_idx, N_val});
-        Value w_y_idx = rewriter.create<affine::AffineApplyOp>(loc, spadYIdxMapAttr, ValueRange{spad_idx, N_val});
-        weight_vector = rewriter.create<vector::TransferReadOp>(
-                                            loc, vectorType, B, ValueRange{w_x_idx, w_y_idx});
-      } else {
-        weight_vector = zero_vector;
-      }
-      rewriter.create<vcix::BinaryNoDestImmOp>(weight_vector.getLoc(), vwpush_opcode, weight_vector, zeroImmAttr, zeroImmAttr, rvl);
-    }
+
 
     // For vpush input loop part
     int64_t M_LOOP = M > SYSTOLIC_SIZE ? SYSTOLIC_SIZE : M;
