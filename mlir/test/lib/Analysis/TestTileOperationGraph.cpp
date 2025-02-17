@@ -417,7 +417,7 @@ void TestTileOperationGraph::printOperation(Operation &op, TOGNode *node) {
     return;
 
   /* Combine compute node */
-  auto type = name == "vcix.i" ? TOGComputeNode::MatmulCompute : TOGComputeNode::VectorCompute;
+  auto type = (name == "vcix.i" || (name == "vcix.iv")) ? TOGComputeNode::MatmulCompute : TOGComputeNode::VectorCompute;
   if (node->getChildren().size()) {
     TOGComputeNode *last_compute_node = dyn_cast<TOGComputeNode>(node->getLastChild());
     if (last_compute_node) {
