@@ -354,8 +354,8 @@ struct MatmulOpLowering : public OpRewritePattern<linalg::MatmulOp> {
     int BDimOffset = numAccumulationLoops;
     if (innerLoops.size()==4) { // innerloop : K_H, K_W, O_H, O_W
       /* FIXME. this is totally heuristic based lowering... */
-      int64_t offset_w = 1;
-      int64_t oW, kW;
+      int64_t kW;
+      kW = getLoopUpperBound(innerLoops.at(1));
       BTagOperands.push_back(innerLoops.at(0).getInductionVar());
       BTagOperands.push_back(innerLoops.at(1).getInductionVar());
       BDimOffset = BTagOperands.size();
