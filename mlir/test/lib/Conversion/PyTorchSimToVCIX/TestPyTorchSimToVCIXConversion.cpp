@@ -194,11 +194,6 @@ struct MatmulOpLowering : public OpRewritePattern<linalg::MatmulOp> {
 
     nr_element = vlen / elen;
 
-    // Constants
-    Value c0 = rewriter.create<arith::ConstantOp>(loc, rewriter.getIndexAttr(0));
-    Value rvl = rewriter.create<arith::ConstantOp>(loc, rewriter.getI64IntegerAttr(nr_element));
-    Attribute compute_cycle = rewriter.getI64IntegerAttr(4); // FIXME: 5 bits bound & hardcoded
-
     // Opcode attribute
     Attribute zeroImmAttr = rewriter.getI64IntegerAttr(0);
     Attribute vipush_opcode =  rewriter.getI64IntegerAttr(0b000000);
@@ -213,11 +208,6 @@ struct MatmulOpLowering : public OpRewritePattern<linalg::MatmulOp> {
     Value n_idx;
     Value k_idx;
     Value m_idx;
-
-    Value M_val = rewriter.create<mlir::arith::ConstantIndexOp>(rewriter.getUnknownLoc(), M);
-    Value K_val = rewriter.create<mlir::arith::ConstantIndexOp>(rewriter.getUnknownLoc(), K);
-    Value N_val = rewriter.create<mlir::arith::ConstantIndexOp>(rewriter.getUnknownLoc(), N);
-    Value SYSTOLIC_SIZE_val = rewriter.create<mlir::arith::ConstantIndexOp>(rewriter.getUnknownLoc(), SYSTOLIC_SIZE);
 
     auto spadIdxMap = AffineMap::get(
       /*dimCount=*/3, /*symbolCount=*/2,
@@ -245,7 +235,6 @@ struct MatmulOpLowering : public OpRewritePattern<linalg::MatmulOp> {
     mlir::Value BDmaTag;
     mlir::Value BiasDmaTag;
     ValueRange BiasDMAIndices;
-    mlir::Value numElements = rewriter.create<mlir::arith::ConstantIndexOp>(loc, 1);
     mlir::Value OuterKLoopVar;
     int KStep = K > SYSTOLIC_SIZE ? SYSTOLIC_SIZE : K;
     int MStep = M > SYSTOLIC_SIZE ? SYSTOLIC_SIZE : M;
@@ -268,10 +257,27 @@ struct MatmulOpLowering : public OpRewritePattern<linalg::MatmulOp> {
       }
       affineForOp = llvm::dyn_cast_or_null<affine::AffineForOp>(affineForOp->getParentOp());
     }
+    bool is_conv2d = (innerLoops.size() == 4);
     assert(accumulationLoops.size()>=1);
     assert(outerLoops.size()>=2);
     // Assume last accumulation loop is K loop
     KStep = accumulationLoops.back().getStep().getZExtValue();
+    affine::AffineForOp tile_k_w_loop, tile_o_h_loop, tile_o_w_loop;
+    if (is_conv2d) {
+      tile_k_w_loop = innerLoops.at(1);
+      tile_o_h_loop = innerLoops.at(2);
+      tile_o_w_loop = innerLoops.at(3);
+      rewriter.setInsertionPoint(&tile_k_w_loop.getBody()->back()); // to reuse CONV kernel
+    }
+    // Constants
+    Value c0 = rewriter.create<arith::ConstantOp>(loc, rewriter.getIndexAttr(0));
+    Value rvl = rewriter.create<arith::ConstantOp>(loc, rewriter.getI64IntegerAttr(nr_element));
+    Attribute compute_cycle = rewriter.getI64IntegerAttr(4); // FIXME: 5 bits bound & hardcoded
+    Value M_val = rewriter.create<mlir::arith::ConstantIndexOp>(rewriter.getUnknownLoc(), M);
+    Value K_val = rewriter.create<mlir::arith::ConstantIndexOp>(rewriter.getUnknownLoc(), K);
+    Value N_val = rewriter.create<mlir::arith::ConstantIndexOp>(rewriter.getUnknownLoc(), N);
+    Value SYSTOLIC_SIZE_val = rewriter.create<mlir::arith::ConstantIndexOp>(rewriter.getUnknownLoc(), SYSTOLIC_SIZE);
+    mlir::Value numElements = rewriter.create<mlir::arith::ConstantIndexOp>(loc, 1);
 
     // Set Last outer loop
     affineForOp = outerLoops.back();
@@ -313,10 +319,10 @@ struct MatmulOpLowering : public OpRewritePattern<linalg::MatmulOp> {
       op.emitError () << "Failed to locate dma_start for retrieving tag.";
       return failure();
     }
-
+    affine::AffineForOp inner_loop;
     if (N > SYSTOLIC_SIZE) {
       // N Loop
-      auto inner_loop = rewriter.create<affine::AffineForOp>(loc, 0, N/SYSTOLIC_SIZE, 1);
+      inner_loop = rewriter.create<affine::AffineForOp>(loc, 0, N/SYSTOLIC_SIZE, 1);
       inner_loop->setAttr("inner_loop", rewriter.getBoolAttr(true));
       rewriter.setInsertionPointToStart(inner_loop.getBody());
       n_idx = inner_loop.getInductionVar();
@@ -327,7 +333,7 @@ struct MatmulOpLowering : public OpRewritePattern<linalg::MatmulOp> {
     Value zero_vector;
     if (K > SYSTOLIC_SIZE) {
       // K Loop
-      auto inner_loop = rewriter.create<affine::AffineForOp>(loc, 0, K/SYSTOLIC_SIZE, 1);
+      inner_loop = rewriter.create<affine::AffineForOp>(loc, 0, K/SYSTOLIC_SIZE, 1);
       inner_loop->setAttr("inner_loop", rewriter.getBoolAttr(true));
       rewriter.setInsertionPointToStart(inner_loop.getBody());
       k_idx = inner_loop.getInductionVar();
@@ -352,7 +358,7 @@ struct MatmulOpLowering : public OpRewritePattern<linalg::MatmulOp> {
     }
     int ADimOffset = numAccumulationLoops;
     int BDimOffset = numAccumulationLoops;
-    if (innerLoops.size()==4) { // innerloop : K_H, K_W, O_H, O_W
+    if (is_conv2d) { // innerloop : K_H, K_W, O_H, O_W
       /* FIXME. this is totally heuristic based lowering... */
       int64_t kW;
       kW = getLoopUpperBound(innerLoops.at(1));
@@ -388,10 +394,19 @@ struct MatmulOpLowering : public OpRewritePattern<linalg::MatmulOp> {
       }
       rewriter.create<vcix::BinaryNoDestImmOp>(weight_vector.getLoc(), vwpush_opcode, weight_vector, zeroImmAttr, zeroImmAttr, rvl);
     }
+    if (is_conv2d && inner_loop) {
+      tile_o_h_loop->moveBefore(inner_loop.getBody(), std::prev(inner_loop.getBody()->end()));
+      rewriter.setInsertionPointToStart(tile_o_h_loop.getBody());
+      tile_o_w_loop->moveBefore(tile_o_h_loop.getBody(), tile_o_h_loop.getBody()->begin());
+      rewriter.setInsertionPoint(&tile_o_w_loop.getBody()->back());
+    } else if (is_conv2d) {
+      tile_o_h_loop->moveBefore(&tile_k_w_loop.getBody()->back());
+      rewriter.setInsertionPoint(&tile_o_w_loop.getBody()->back());
+    }
 
     if (M > SYSTOLIC_SIZE) {
       // M Loop
-      auto inner_loop = rewriter.create<affine::AffineForOp>(loc, 0, M/SYSTOLIC_SIZE, 1);
+      inner_loop = rewriter.create<affine::AffineForOp>(loc, 0, M/SYSTOLIC_SIZE, 1);
       inner_loop->setAttr("inner_loop", rewriter.getBoolAttr(true));
       rewriter.setInsertionPointToStart(inner_loop.getBody());
       m_idx = inner_loop.getInductionVar();
@@ -399,7 +414,7 @@ struct MatmulOpLowering : public OpRewritePattern<linalg::MatmulOp> {
       m_idx = c0;
     }
 
-    if (innerLoops.size()==4) { // innerloop : K_H, K_W, O_H, O_W
+    if (is_conv2d) { // innerloop : K_H, K_W, O_H, O_W
       /* FIXME. this is totally heuristic based lowering... */
       Value k_h = innerLoops.at(0).getInductionVar();
       Value k_w = innerLoops.at(1).getInductionVar();
