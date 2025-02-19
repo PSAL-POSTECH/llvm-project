@@ -63,7 +63,7 @@ void DmaFineGrained::runOnOperation() {
   OpBuilder builder(func.getContext());
   bool hasMatmul = false;
   Value matmulResult, matmulInput, matmulWeight;
-  llvm::ArrayRef<int64_t> input_tile_shape, weight_tile_shape;
+  llvm::ArrayRef<int64_t> input_tile_shape, weight_tile_shape, output_tile_shape;
   func.walk([&](linalg::MatmulOp matmulOp) {
     hasMatmul = true;
     matmulResult = matmulOp.getOutputs()[0];
@@ -72,7 +72,7 @@ void DmaFineGrained::runOnOperation() {
   });
   if (!hasMatmul) // only apply to functions with matmul
     return;
-  int64_t tileSizeK, tileSizeN, tileSizeM, tileSizeK_H, tileSizeK_W, tileSizeH, tileSizeW;
+  int64_t tileSizeK, tileSizeN, tileSizeM, tileSizeK_H, tileSizeK_W, tileSizeH, tileSizeW, tileSizeO_H, tileSizeO_W;
   int64_t vectorlane = systolicSize;
   builder.setInsertionPointToStart(&func.front());
   Value zeroIndex = builder.create<arith::ConstantIndexOp>(func.getLoc(), 0);
@@ -153,7 +153,7 @@ void DmaFineGrained::runOnOperation() {
   NamedAttrList dma1Attr;
   NamedAttrList dma2Attr;
 
-  int64_t subTileSizeM, subTileSizeN, subTileSizeK, subTileSizeK_H, subTileSizeK_W, subTileSizeH, subTileSizeW;
+  int64_t subTileSizeM, subTileSizeN, subTileSizeK, subTileSizeK_H, subTileSizeK_W, subTileSizeH, subTileSizeW, subTileSizeO_H, subTileSizeO_W;
   bool is_weight_4d_subtile = dma2Subtile.size() == 4;
   bool is_input_4d_subtile = dma1Subtile.size() == 4;
 
@@ -240,17 +240,27 @@ void DmaFineGrained::runOnOperation() {
 
     auto loc = mvin_bias.getLoc();
     builder.setInsertionPoint(mvin_bias);
+    auto dstMemRefType = cast<MemRefType>(mvin_bias.getDstMemRef().getType());
+    output_tile_shape = dstMemRefType.getShape();
     if (is_conv2d) {
+      tileSizeO_H = output_tile_shape[0];
+      tileSizeO_W = output_tile_shape[1];
+      subTileSizeO_H = llvm::dyn_cast<mlir::IntegerAttr>(dmaSubtile[0]).getInt();
+      subTileSizeO_W = llvm::dyn_cast<mlir::IntegerAttr>(dmaSubtile[1]).getInt();
       // Create 2 nested affine.for loops for O_H x O_W Outputs
-      auto loopK_H = builder.create<affine::AffineForOp>(loc, 0, tileSizeH, subTileSizeH);
+      auto loopK_H = builder.create<affine::AffineForOp>(loc, 0, tileSizeO_H, subTileSizeO_H);
       loopK_H->setAttr("inner_loop", builder.getBoolAttr(true));
       builder.setInsertionPointToStart(loopK_H.getBody());
       h = loopK_H.getInductionVar();
-      auto loopK_W = builder.create<affine::AffineForOp>(loc, 0, tileSizeW, subTileSizeW);
+      auto loopK_W = builder.create<affine::AffineForOp>(loc, 0, tileSizeO_W, subTileSizeO_W);
       loopK_W->setAttr("inner_loop", builder.getBoolAttr(true));
       builder.setInsertionPointToStart(loopK_W.getBody());
       w = loopK_W.getInductionVar();
     }
+    int64_t tileSizeM = output_tile_shape[output_tile_shape.size() - 2];
+    int64_t tileSizeN = output_tile_shape[output_tile_shape.size() - 1];
+    int64_t subTileSizeM = llvm::dyn_cast<mlir::IntegerAttr>(dmaSubtile[dmaSubtile.size() - 2]).getInt();
+    int64_t subTileSizeN = llvm::dyn_cast<mlir::IntegerAttr>(dmaSubtile.back()).getInt();
     auto loopN = builder.create<affine::AffineForOp>(loc, 0, tileSizeN, subTileSizeN);
     loopN->setAttr("inner_loop", builder.getBoolAttr(true));
     builder.setInsertionPointToStart(loopN.getBody());
@@ -278,10 +288,10 @@ void DmaFineGrained::runOnOperation() {
     if (is_conv2d) {
       dst_indices.push_back(zeroIndex);
       dst_indices.push_back(zeroIndex);
-      new_spad_map = build4DSpadMap(builder, tileSizeW, tileSizeM, tileSizeN);
+      new_spad_map = build4DSpadMap(builder, tileSizeO_W, tileSizeM, tileSizeN);
       new_dst_indices = {h, w, j, i};
-      int64_t tag_w_stride = tag_j_stride * ((tileSizeK+subTileSizeN-1) / subTileSizeN);
-      int64_t tag_h_stride = tag_w_stride * ((tileSizeW+subTileSizeW-1) / subTileSizeW);
+      int64_t tag_w_stride = tag_j_stride * ((tileSizeN+subTileSizeN-1) / subTileSizeN);
+      int64_t tag_h_stride = tag_w_stride * ((tileSizeO_W+subTileSizeO_W-1) / subTileSizeO_W);
       new_tag_map = AffineMap::get(4, 0, builder.getAffineDimExpr(0) * tag_h_stride + builder.getAffineDimExpr(1) * tag_w_stride + builder.getAffineDimExpr(2) * tag_j_stride + builder.getAffineDimExpr(3));
     } else {
       new_spad_map = AffineMap::get(2, 0, buildAffineDimExpr(builder, 0, tileSizeM) + builder.getAffineDimExpr(1));
