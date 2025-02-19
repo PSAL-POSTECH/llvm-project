@@ -394,7 +394,7 @@ struct MatmulOpLowering : public OpRewritePattern<linalg::MatmulOp> {
       }
       rewriter.create<vcix::BinaryNoDestImmOp>(weight_vector.getLoc(), vwpush_opcode, weight_vector, zeroImmAttr, zeroImmAttr, rvl);
     }
-    if (is_conv2d && inner_loop) {
+    if (is_conv2d && inner_loop) { // return to inner loop location
       tile_o_h_loop->moveBefore(inner_loop.getBody(), std::prev(inner_loop.getBody()->end()));
       rewriter.setInsertionPointToStart(tile_o_h_loop.getBody());
       tile_o_w_loop->moveBefore(tile_o_h_loop.getBody(), tile_o_h_loop.getBody()->begin());
@@ -422,26 +422,21 @@ struct MatmulOpLowering : public OpRewritePattern<linalg::MatmulOp> {
       Value o_w = innerLoops.at(3).getInductionVar();
       // find affine.apply using loop index (k_h, k_w, o_h, o_w)
       int64_t offset_w = 1;
-      int64_t oW, kW;
-      bool tagh = false;
-      bool tagw = false;
-      kW = getLoopUpperBound(innerLoops.at(1));
-      oW = getLoopUpperBound(innerLoops.at(3));
-      int64_t offset_h = 1 + (oW - 1) * offset_w + (kW - 1);
+      int64_t offset_h = 1;
+      int64_t coeff_h = 1;
+      int64_t kW = getLoopUpperBound(innerLoops.at(1));
+      int64_t oW = getLoopUpperBound(innerLoops.at(3));
       affineForOp = innerLoops.at(3);
       affineForOp->walk([&](mlir::Operation *nestedOp) {
-        if (auto affineApplyOp = llvm::dyn_cast_or_null<affine::AffineApplyOp>(nestedOp)) {
+        if (auto affineApplyOp = llvm::dyn_cast_or_null<affine::AffineApplyOp>(nestedOp)) { // warning. this part is very heuritic
           if (affineApplyOp.getOperand(0) == o_h && affineApplyOp.getOperand(1) == k_h) {
             AffineMap map = affineApplyOp.getAffineMap();
             AffineExpr expr = map.getResult(0);
             expr.walk([&](AffineExpr subExpr) {
               if (auto constExpr = subExpr.dyn_cast<AffineConstantExpr>()) {
-                offset_w = constExpr.getValue();
+                offset_h = constExpr.getValue();
               }
             });
-            ATagOperands.push_back(innerLoops.at(0).getInductionVar());
-            ATagOperands.push_back(innerLoops.at(2).getInductionVar());
-            tagh = true;
           }
           if (affineApplyOp.getOperand(0) == o_w && affineApplyOp.getOperand(1) == k_w) {
             AffineMap map = affineApplyOp.getAffineMap();
@@ -451,22 +446,19 @@ struct MatmulOpLowering : public OpRewritePattern<linalg::MatmulOp> {
                 offset_w = constExpr.getValue();
               }
             });
-            ATagOperands.push_back(innerLoops.at(1).getInductionVar());
-            ATagOperands.push_back(innerLoops.at(3).getInductionVar());
-            tagw = true;
           }
         }
       });
+      coeff_h = 1 + (oW - 1) * offset_w + (kW - 1);
+      ATagOperands.push_back(innerLoops.at(0).getInductionVar());
+      ATagOperands.push_back(innerLoops.at(2).getInductionVar());
+      ATagOperands.push_back(innerLoops.at(1).getInductionVar());
+      ATagOperands.push_back(innerLoops.at(3).getInductionVar());
       ADimOffset = ATagOperands.size();
-      if (!tagw) offset_h = 1;
-      if (tagh) {
-        ATagExpr = ATagExpr + rewriter.getAffineDimExpr(ADimOffset-4)*((K/KStep)*(M/MStep)*offset_h) + \
-          rewriter.getAffineDimExpr(ADimOffset-3)*((K/KStep)*(M/MStep)*offset_h);
-      }
-      if (tagw) {
-        ATagExpr = ATagExpr + rewriter.getAffineDimExpr(ADimOffset-2)*((K/KStep)*(M/MStep)) + \
-          rewriter.getAffineDimExpr(ADimOffset-1)*((K/KStep)*(M/MStep)*offset_w);
-      }
+        ATagExpr = ATagExpr + rewriter.getAffineDimExpr(ADimOffset-4)*((K/KStep)*(M/MStep)*coeff_h) + \
+                              rewriter.getAffineDimExpr(ADimOffset-3)*((K/KStep)*(M/MStep)*offset_h*coeff_h) + \
+                              rewriter.getAffineDimExpr(ADimOffset-2)*((K/KStep)*(M/MStep)) + \
+                              rewriter.getAffineDimExpr(ADimOffset-1)*((K/KStep)*(M/MStep)*offset_w);
     }
     ATagExpr = ATagExpr + rewriter.getAffineDimExpr(ADimOffset)*(M/MStep) + \
       rewriter.getAffineDimExpr(ADimOffset+1).floorDiv((MStep+SYSTOLIC_SIZE-1)/SYSTOLIC_SIZE);
