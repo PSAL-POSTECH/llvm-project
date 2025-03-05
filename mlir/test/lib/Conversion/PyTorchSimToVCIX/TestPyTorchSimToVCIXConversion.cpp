@@ -605,6 +605,24 @@ struct MathErfToVCIX: public OpRewritePattern<math::ErfOp> {
   }
 };
 
+struct MathTanhToVCIX: public OpRewritePattern<math::TanhOp> {
+  using OpRewritePattern::OpRewritePattern;
+
+  LogicalResult
+  matchAndRewrite(math::TanhOp op, PatternRewriter &rewriter) const override {
+    const Type opType = op.getOperand().getType();
+    auto [n, legalType] = legalizeVectorType(opType);
+    if (!legalType)
+      return rewriter.notifyMatchFailure(op, "cannot legalize type for RVV");
+    Location loc = op.getLoc();
+    Value vec = op.getOperand();
+    uint64_t opcode = 0b000001;
+    Value res = make_sf_vc_v_iv(loc, rewriter, vec, opType, n, legalType, opcode);
+    rewriter.replaceOp(op, res);
+    return success();
+  }
+};
+
 struct TestPyTorchSimToVCIX
     : PassWrapper<TestPyTorchSimToVCIX, OperationPass<ModuleOp>> {
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(TestPyTorchSimToVCIX)
@@ -629,10 +647,12 @@ struct TestPyTorchSimToVCIX
     SYSTOLIC_SIZE = systolicSize;
     VLEN = vlen;
     patterns.add<MatmulOpLowering, MathExpToVCIX, MathErfToVCIX>(ctx);
+    patterns.add<MathTanhToVCIX>(ctx);
     ConversionTarget target(getContext());
     target.addIllegalOp<linalg::MatmulOp>();
     target.addIllegalOp<math::ExpOp>();
     target.addIllegalOp<math::ErfOp>();
+    target.addIllegalOp<math::TanhOp>();
     target.markUnknownOpDynamicallyLegal([](Operation *) { return true; });
     if (failed(applyPartialConversion(getOperation(), target, std::move(patterns)))) {
       signalPassFailure();
