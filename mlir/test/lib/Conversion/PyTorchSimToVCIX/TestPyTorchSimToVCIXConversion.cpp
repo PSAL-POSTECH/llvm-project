@@ -123,6 +123,51 @@ bool traverseMMOperands(Value op_val, Value input) {
   return found;
 }
 
+Value make_sf_vc_v_iv(Location loc, PatternRewriter &rewriter, Value vec, const Type opType,
+                      unsigned n, VectorType legalType, uint64_t opcode) {
+  Attribute zeroImmAttr = rewriter.getI32IntegerAttr(0);
+  Attribute opcodeAttr = rewriter.getI64IntegerAttr(opcode);
+  Value rvl = nullptr;
+  VectorType vt = cast<VectorType>(opType);
+  unsigned totalEltCount = vt.getShape()[0];
+  const unsigned eltCount = legalType.getShape()[0];
+  if (legalType.isScalable())
+    // Use arbitrary runtime vector length when vector type is scalable.
+    // Proper conversion pass should take it from the IR.
+    rvl = rewriter.create<arith::ConstantOp>(loc,
+                                              rewriter.getI64IntegerAttr(9));
+  Value res;
+  if (n == 1) {
+    res = rewriter.create<vcix::BinaryImmOp>(loc, legalType, opcodeAttr, vec,
+                                              zeroImmAttr, rvl);
+  } else {
+    Type eltTy = legalType.getElementType();
+    Value zero = rewriter.create<arith::ConstantOp>(
+        loc, eltTy, rewriter.getZeroAttr(eltTy));
+    res = rewriter.create<vector::BroadcastOp>(loc, opType, zero /*dummy*/);
+    if (legalType.isScalable()) {
+      for (unsigned i = 0; i < n; ++i) {
+        Value extracted = rewriter.create<vector::ScalableExtractOp>(
+            loc, legalType, vec, i * eltCount);
+        Value v = rewriter.create<vcix::BinaryImmOp>(loc, legalType, opcodeAttr,
+                                                      extracted, zeroImmAttr, rvl);
+        res = rewriter.create<vector::ScalableInsertOp>(loc, v, res,
+                                                        i * eltCount);
+      }
+    } else { // Fixed-length vector > VLEN
+      for (unsigned i = 0; i < totalEltCount/eltCount; i++) {
+        Value extracted = rewriter.create<vector::ExtractStridedSliceOp>(
+            loc, vec, i * eltCount, eltCount, 1);
+        Value v = rewriter.create<vcix::BinaryImmOp>(loc, legalType, opcodeAttr,
+                                                      extracted, zeroImmAttr, rvl);
+        res = rewriter.create<vector::InsertStridedSliceOp>(loc, v, res,
+                                                            i * eltCount, 1);
+      }
+    }
+  }
+  return res;
+}
+
 struct MatmulOpLowering : public OpRewritePattern<linalg::MatmulOp> {
   using OpRewritePattern::OpRewritePattern;
 
@@ -535,51 +580,30 @@ struct MathExpToVCIX: public OpRewritePattern<math::ExpOp> {
       return rewriter.notifyMatchFailure(op, "cannot legalize type for RVV");
     Location loc = op.getLoc();
     Value vec = op.getOperand();
-    Attribute zeroImmAttr = rewriter.getI32IntegerAttr(0);
-    Attribute opcodeAttr = rewriter.getI64IntegerAttr(0b000011);
-    Value rvl = nullptr;
-    VectorType vt = cast<VectorType>(opType);
-    unsigned totalEltCount = vt.getShape()[0];
-    const unsigned eltCount = legalType.getShape()[0];
-    if (legalType.isScalable())
-      // Use arbitrary runtime vector length when vector type is scalable.
-      // Proper conversion pass should take it from the IR.
-      rvl = rewriter.create<arith::ConstantOp>(loc,
-                                                rewriter.getI64IntegerAttr(9));
-    Value res;
-    if (n == 1) {
-      res = rewriter.create<vcix::BinaryImmOp>(loc, legalType, opcodeAttr, vec,
-                                                zeroImmAttr, rvl);
-    } else {
-      Type eltTy = legalType.getElementType();
-      Value zero = rewriter.create<arith::ConstantOp>(
-          loc, eltTy, rewriter.getZeroAttr(eltTy));
-      res = rewriter.create<vector::BroadcastOp>(loc, opType, zero /*dummy*/);
-      if (legalType.isScalable()) {
-        for (unsigned i = 0; i < n; ++i) {
-          Value extracted = rewriter.create<vector::ScalableExtractOp>(
-              loc, legalType, vec, i * eltCount);
-          Value v = rewriter.create<vcix::BinaryImmOp>(loc, legalType, opcodeAttr,
-                                                        extracted, zeroImmAttr, rvl);
-          res = rewriter.create<vector::ScalableInsertOp>(loc, v, res,
-                                                          i * eltCount);
-        }
-      } else { // Fixed-length vector > VLEN
-        for (unsigned i = 0; i < totalEltCount/eltCount; i++) {
-          Value extracted = rewriter.create<vector::ExtractStridedSliceOp>(
-              loc, vec, i * eltCount, eltCount, 1);
-          Value v = rewriter.create<vcix::BinaryImmOp>(loc, legalType, opcodeAttr,
-                                                        extracted, zeroImmAttr, rvl);
-          res = rewriter.create<vector::InsertStridedSliceOp>(loc, v, res,
-                                                              i * eltCount, 1);
-        }
-      }
-    }
+    uint64_t opcode = 0b000011;
+    Value res = make_sf_vc_v_iv(loc, rewriter, vec, opType, n, legalType, opcode);
     rewriter.replaceOp(op, res);
     return success();
   }
 };
 
+struct MathErfToVCIX: public OpRewritePattern<math::ErfOp> {
+  using OpRewritePattern::OpRewritePattern;
+
+  LogicalResult
+  matchAndRewrite(math::ErfOp op, PatternRewriter &rewriter) const override {
+    const Type opType = op.getOperand().getType();
+    auto [n, legalType] = legalizeVectorType(opType);
+    if (!legalType)
+      return rewriter.notifyMatchFailure(op, "cannot legalize type for RVV");
+    Location loc = op.getLoc();
+    Value vec = op.getOperand();
+    uint64_t opcode = 0b000000;
+    Value res = make_sf_vc_v_iv(loc, rewriter, vec, opType, n, legalType, opcode);
+    rewriter.replaceOp(op, res);
+    return success();
+  }
+};
 
 struct TestPyTorchSimToVCIX
     : PassWrapper<TestPyTorchSimToVCIX, OperationPass<ModuleOp>> {
@@ -604,10 +628,11 @@ struct TestPyTorchSimToVCIX
 
     SYSTOLIC_SIZE = systolicSize;
     VLEN = vlen;
-    patterns.add<MatmulOpLowering, MathExpToVCIX>(ctx);
+    patterns.add<MatmulOpLowering, MathExpToVCIX, MathErfToVCIX>(ctx);
     ConversionTarget target(getContext());
     target.addIllegalOp<linalg::MatmulOp>();
     target.addIllegalOp<math::ExpOp>();
+    target.addIllegalOp<math::ErfOp>();
     target.markUnknownOpDynamicallyLegal([](Operation *) { return true; });
     if (failed(applyPartialConversion(getOperation(), target, std::move(patterns)))) {
       signalPassFailure();
