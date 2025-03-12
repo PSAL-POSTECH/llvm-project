@@ -86,6 +86,7 @@ void registerTestCFGLoopInfoPass();
 void registerTestTileOperationGraphPass();
 void registerTestLoopPaddingPass();
 void registerDmaFineGrainedPass();
+void registerGloablIdxPass();
 void registerTestComposeSubView();
 void registerTestCompositePass();
 void registerTestConstantFold();
@@ -224,6 +225,7 @@ void registerTestPasses() {
   mlir::test::registerTestTileOperationGraphPass();
   mlir::test::registerTestLoopPaddingPass();
   mlir::test::registerDmaFineGrainedPass();
+  mlir::test::registerGloablIdxPass();
   mlir::test::registerTestComposeSubView();
   mlir::test::registerTestCompositePass();
   mlir::test::registerTestConstantFold();

@@ -89,6 +89,8 @@ static std::pair<unsigned, VectorType> legalizeVectorType(const Type &type) {
     sew = 64;
   else if (auto intTy = dyn_cast<IntegerType>(eltTy))
     sew = intTy.getWidth();
+  else if (auto intTy = dyn_cast<IndexType>(eltTy))
+    sew = 64;
   else
     return {0, nullptr};
 
