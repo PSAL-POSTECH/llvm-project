@@ -283,7 +283,7 @@ struct MatmulOpLowering : public OpRewritePattern<linalg::MatmulOp> {
     mlir::Value BiasDmaTag;
     ValueRange BiasDMAIndices;
     mlir::Value OuterKLoopVar;
-    int KStep = K > SYSTOLIC_SIZE ? SYSTOLIC_SIZE : K;
+    int KStep = K > SYSTOLIC_SIZE ? SYSTOLIC_SIZE : K; // FIXME: Step should be sub tile size
     int MStep = M > SYSTOLIC_SIZE ? SYSTOLIC_SIZE : M;
     int NStep = N > SYSTOLIC_SIZE ? SYSTOLIC_SIZE : N;
     std::vector<affine::AffineForOp> accumulationLoops;
@@ -480,7 +480,7 @@ struct MatmulOpLowering : public OpRewritePattern<linalg::MatmulOp> {
             AffineMap map = affineApplyOp.getAffineMap();
             AffineExpr expr = map.getResult(0);
             expr.walk([&](AffineExpr subExpr) {
-              if (auto constExpr = subExpr.dyn_cast<AffineConstantExpr>()) {
+              if (auto constExpr = dyn_cast<AffineConstantExpr>(subExpr)) {
                 offset_h = constExpr.getValue();
               }
             });
@@ -489,7 +489,7 @@ struct MatmulOpLowering : public OpRewritePattern<linalg::MatmulOp> {
             AffineMap map = affineApplyOp.getAffineMap();
             AffineExpr expr = map.getResult(0);
             expr.walk([&](AffineExpr subExpr) {
-              if (auto constExpr = subExpr.dyn_cast<AffineConstantExpr>()) {
+              if (auto constExpr = dyn_cast<AffineConstantExpr>(subExpr)) {
                 offset_w = constExpr.getValue();
               }
             });
