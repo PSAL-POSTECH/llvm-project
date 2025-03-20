@@ -335,18 +335,18 @@ void DmaFineGrained::runOnOperation() {
     w = loopW.getInductionVar();
   }
   // Create three nested affine.for loops
-  auto loopN = builder.create<affine::AffineForOp>(loc, 0, tileSizeN, subTileSizeN);
-  loopN->setAttr("inner_loop", builder.getBoolAttr(true));
-  builder.setInsertionPointToStart(loopN.getBody());
-  j = loopN.getInductionVar();
-  auto loopK = builder.create<affine::AffineForOp>(loc, 0, tileSizeK, subTileSizeK);
-  loopK->setAttr("inner_loop", builder.getBoolAttr(true));
-  builder.setInsertionPointToStart(loopK.getBody());
-  k = loopK.getInductionVar();
   auto loopM = builder.create<affine::AffineForOp>(loc, 0, tileSizeM, subTileSizeM);
   loopM->setAttr("inner_loop", builder.getBoolAttr(true));
   builder.setInsertionPointToStart(loopM.getBody());
   i = loopM.getInductionVar();
+  auto loopK = builder.create<affine::AffineForOp>(loc, 0, tileSizeK, subTileSizeK);
+  loopK->setAttr("inner_loop", builder.getBoolAttr(true));
+  builder.setInsertionPointToStart(loopK.getBody());
+  k = loopK.getInductionVar();
+  auto loopN = builder.create<affine::AffineForOp>(loc, 0, tileSizeN, subTileSizeN);
+  loopN->setAttr("inner_loop", builder.getBoolAttr(true));
+  builder.setInsertionPointToStart(loopN.getBody());
+  j = loopN.getInductionVar();
 
   // src_indices = dram index, dst_indices = spad index
   // calculate the dram address
