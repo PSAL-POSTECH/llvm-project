@@ -21,6 +21,7 @@
 #define CONFIG 0
 #define CONFIG2 4
 #define CONFIG3 5
+#define CONFIG4 6
 #define MVIN 2
 #define MVIN2 1
 #define MVIN3 14
@@ -124,6 +125,17 @@ llvm::SmallVector<int64_t> getSramStride(mlir::Operation *operation) {
   return sram_stride;
 }
 
+unsigned int getElementBitWidth(mlir::Type elementType) {
+  if (auto intType = mlir::dyn_cast<mlir::IntegerType>(elementType)) {
+    return intType.getWidth();
+  } else if (auto floatType = mlir::dyn_cast<mlir::FloatType>(elementType)) {
+    return floatType.getWidth();
+  } else {
+    mlir::failure();
+    return 0;
+  }
+}
+
 /// Lowering memref.dma_start operation to Gemmini instructions with LLVM Asm.
 struct DmaWaitOpLowering : public ConvertOpToLLVMPattern<memref::DmaWaitOp> {
   int vectorlaneStride;
@@ -167,15 +179,7 @@ struct DmaStartOpLowering : public ConvertOpToLLVMPattern<memref::DmaStartOp> {
     ValueRange dst_indices = ValueRange({operands.begin() + 1 + op.getSrcMemRefRank() + 1,
                                          operands.begin() + 1 + op.getSrcMemRefRank() + 1 +
                                          op.getDstMemRefRank()});
-    int elen = 0;
-    auto elementTypeA = srcMemRefType.getElementType();
-    if (auto intType = mlir::dyn_cast<mlir::IntegerType>(elementTypeA)) {
-      elen = intType.getWidth();
-    } else if (auto floatType = mlir::dyn_cast<mlir::FloatType>(elementTypeA)) {
-      elen = floatType.getWidth();
-    } else {
-      return failure();
-    }
+    int elen = getElementBitWidth(srcMemRefType.getElementType());
     Value SrcPtr = getStridedElementPtr(loc, srcMemRefType, SrcMemref, src_indices, rewriter);
     Value DstMemref = operands[op.getSrcMemRefRank() + 1];
     auto dstMemRefType = cast<MemRefType>(op.getDstMemRef().getType());
@@ -213,10 +217,48 @@ struct DmaStartOpLowering : public ConvertOpToLLVMPattern<memref::DmaStartOp> {
 
     AffineMap index_map;
     ValueRange parentIndices;
+    uint64_t indirect_access = 0;
+    Value indirect_spad_addr = 0;
+    uint64_t indirect_element_size = 1;
+    uint64_t indirect_stride = 1;
+
     for (auto index : indices) {
       if (auto applyOp = index.getDefiningOp<affine::AffineApplyOp>()) {
         index_map = applyOp.getAffineMap();
+        indirect_access = index_map.getNumSymbols()!=0;
         parentIndices = applyOp.getOperands();
+        if (indirect_access) {
+          // FIXME. How to get converted type?
+          for (mlir::Value operand : applyOp.getMapOperands()) {
+            auto indexCastOp = operand.getDefiningOp<arith::IndexCastOp>();
+            if (!indexCastOp)
+              continue;
+            // Found index cast
+            auto loadOp = indexCastOp.getIn().getDefiningOp<mlir::affine::AffineLoadOp>();
+            if (!loadOp)
+              continue;
+            // Found index spad memref
+            bool found = false;
+            Value indirectMemref = loadOp.getMemRef();
+            auto indirectMemRefType = dyn_cast<MemRefType>(indirectMemref.getType());
+            for (auto &use : indirectMemref.getUses()) {
+              mlir::Operation* userOp = use.getOwner();
+              if (auto castOp = llvm::dyn_cast<mlir::UnrealizedConversionCastOp>(userOp)) {
+                indirectMemref = castOp->getResult(0);
+                found = true;
+              }
+            }
+            if (!found) {
+              op.emitError("Failed to find converted memref...");
+              return failure();
+            }
+            indirect_spad_addr = getStridedElementPtr(loc, indirectMemRefType, indirectMemref, {}, rewriter);
+            indirect_spad_addr = rewriter.create<LLVM::PtrToIntOp>(loc, rewriter.getI64Type(), indirect_spad_addr);
+            indirect_element_size = getElementBitWidth(indirectMemRefType.getElementType()) / 8;
+            llvm::errs() << "element_size: " << indirect_element_size << "\n";
+            break;
+          }
+        }
       }
     }
     if (is_fine_grained(op)) { // fine-grained case has more than one parent
@@ -313,7 +355,7 @@ struct DmaStartOpLowering : public ConvertOpToLLVMPattern<memref::DmaStartOp> {
       ((sub_tensor_shape[0]&0xFFFF)<<shift48) | ((sub_tensor_shape[1]&0xFFFF)<<shift32) | ((sub_tensor_shape[2]&0xFFFF)<<shift16) | ((sub_tensor_shape[3])&0xFFFF))
     ));
     Value config_rs2 = rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(
-      (vlane_stride<<shift32)| ((config_type&0x3)<<shift17) | ((vlane_split_axis&0x3)<<shift14) | (int(elen/8))
+      (vlane_stride<<shift32)| ((config_type&0x3)<<shift17) | ((indirect_access&0b1)<<shift16) | ((vlane_split_axis&0x3)<<shift14) | (int(elen/8))
     ));
     rewriter.create<LLVM::InlineAsmOp>(
         loc,
@@ -376,6 +418,23 @@ struct DmaStartOpLowering : public ConvertOpToLLVMPattern<memref::DmaStartOp> {
         /*asm_dialect=*/asmDialectAttr,
         /*operand_attrs=*/ArrayAttr());
 
+    // config4
+    if (indirect_access) {
+      char* config4AsmStr = getAsmString(CONFIG4);
+      config_rs2 = rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(
+        ((indirect_element_size & 0xFF) << shift16) | (indirect_stride & 0xFFFF)
+      ));
+      rewriter.create<LLVM::InlineAsmOp>(
+          loc,
+          /*resultTypes=*/TypeRange(),
+          /*operands=*/ValueRange({indirect_spad_addr, config_rs2}),
+          /*asm_string=*/config4AsmStr,
+          /*constraints=*/constraintStr,
+          /*has_side_effects=*/true,
+          /*is_align_stack=*/false,
+          /*asm_dialect=*/asmDialectAttr,
+          /*operand_attrs=*/ArrayAttr());
+    }
     rewriter.replaceOpWithNewOp<LLVM::InlineAsmOp>(op,
         /*resultTypes=*/TypeRange(),
         /*operands=*/ValueRange({rs1, rs2}),
