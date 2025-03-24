@@ -698,7 +698,10 @@ void TestLoopPadding::analysisDMAStartNode(
 
     for (auto operand : dmaOp.getOperands()) {
       if (auto applyOp = operand.getDefiningOp<mlir::affine::AffineApplyOp>()) {
-        memRefMapRef.addLoopsFromApplyOp(applyOp);
+        /* Ignore indirect access dma */
+        auto syms = applyOp.getAffineMap().getNumSymbols();
+        if (syms == 0)
+          memRefMapRef.addLoopsFromApplyOp(applyOp);
         break;
       } else if (auto blockArg = llvm::dyn_cast<mlir::BlockArgument>(operand)) {
         auto definingOp = blockArg.getOwner()->getParentOp();
@@ -759,6 +762,8 @@ void TestLoopPadding::createWrapperFunction(mlir::ModuleOp module, mlir::OpBuild
           initial_value = -std::numeric_limits<float>::infinity();
         else if (elementType.isInteger(32))
           initial_value = std::numeric_limits<int32_t>::min();
+        else if (elementType.isInteger(16))
+          initial_value = std::numeric_limits<int16_t>::min();
         else if (elementType.isInteger(8))
           initial_value = std::numeric_limits<int8_t>::min();
         else if (elementType.isInteger(1))
