@@ -144,9 +144,8 @@ Value make_sf_vc_v_iv(Location loc, PatternRewriter &rewriter, Value vec, const 
                                               zeroImmAttr, rvl);
   } else {
     Type eltTy = legalType.getElementType();
-    Value zero = rewriter.create<arith::ConstantOp>(
-        loc, eltTy, rewriter.getZeroAttr(eltTy));
-    res = rewriter.create<vector::BroadcastOp>(loc, opType, zero /*dummy*/);
+    auto vectorAttr = DenseElementsAttr::get(vt, rewriter.getZeroAttr(eltTy));
+    res = rewriter.create<arith::ConstantOp>(loc, vt, vectorAttr);
     if (legalType.isScalable()) {
       for (unsigned i = 0; i < n; ++i) {
         Value extracted = rewriter.create<vector::ScalableExtractOp>(
@@ -307,8 +306,6 @@ struct MatmulOpLowering : public OpRewritePattern<linalg::MatmulOp> {
     bool is_conv2d = (innerLoops.size() == 4);
     assert(accumulationLoops.size()>=1);
     assert(outerLoops.size()>=2);
-    // Assume last accumulation loop is K loop
-    KStep = accumulationLoops.back().getStep().getZExtValue();
     affine::AffineForOp tile_k_w_loop, tile_o_h_loop, tile_o_w_loop;
     if (is_conv2d) {
       tile_k_w_loop = innerLoops.at(1);
@@ -421,7 +418,7 @@ struct MatmulOpLowering : public OpRewritePattern<linalg::MatmulOp> {
     auto BTagMap = mlir::AffineMap::get(BDimOffset+2, 0, BTagExpr);
 
     BTagOperands.push_back(n_idx); //N_idx, K_Idx
-    BTagOperands.push_back(c0);
+    BTagOperands.push_back(k_idx);
     auto BTagIdx = rewriter.create<affine::AffineApplyOp>(loc, BTagMap, BTagOperands);
     rewriter.create<memref::DmaWaitOp>(loc, BDmaTag, ValueRange{BTagIdx}, numElements);
 
@@ -511,7 +508,7 @@ struct MatmulOpLowering : public OpRewritePattern<linalg::MatmulOp> {
       rewriter.getAffineDimExpr(ADimOffset+1).floorDiv((MStep+SYSTOLIC_SIZE-1)/SYSTOLIC_SIZE);
     auto ATagMap = mlir::AffineMap::get(ADimOffset+2, 0, ATagExpr);
 
-    ATagOperands.push_back(c0);    //K_idx, m_idx
+    ATagOperands.push_back(k_idx);    //K_idx, m_idx
     ATagOperands.push_back(m_idx);
     auto ATagIdx = rewriter.create<affine::AffineApplyOp>(loc, ATagMap, ATagOperands);
     rewriter.create<memref::DmaWaitOp>(loc, ADmaTag, ValueRange{ATagIdx}, numElements);
