@@ -180,15 +180,17 @@ class TOGDMANode : public TOGNode {
   std::vector<std::string> tag_idx_list;
   std::vector<int> tag_stride_list;
   std::vector<std::string> loop_idx_list;
+  bool indirect_mode;
 
  public:
   TOGDMANode(const std::string &name, const std::string &addr,
              const std::vector<int> &strides, const std::vector<int> &sizes,
              int elemSize, bool is_write, bool is_async, std::vector<std::string> &tag_idx_list,
-             std::vector<int> &tag_stride_list, std::vector<std::string> &idx_list)
+             std::vector<int> &tag_stride_list, std::vector<std::string> &idx_list, bool indirect_mode)
       : TOGNode(name), base_addr(addr), stride_list(strides), tile_size(sizes),
         element_size(elemSize), is_write(is_write), is_async(is_async),
-        tag_idx_list(tag_idx_list), tag_stride_list(tag_stride_list), loop_idx_list(idx_list) {}
+        tag_idx_list(tag_idx_list), tag_stride_list(tag_stride_list), loop_idx_list(idx_list),
+        indirect_mode(indirect_mode) {}
   std::string getBaseAddr() const { return base_addr; }
   std::vector<int> getStrideList() const { return stride_list; }
   std::vector<int> getTileSize() const { return tile_size; }
@@ -205,6 +207,7 @@ class TOGDMANode : public TOGNode {
     std::cout << "\t\"is_write\": " << is_write << ",\n";
     std::cout << "\t\"is_async\": " << is_async << ",\n";
     std::cout << "\t\"base_address\": \"" << base_addr << "\",\n";
+    std::cout << "\t\"indirect_mode\": " << int(indirect_mode) << ",\n";
 
     auto name = std::string("stride_list");
     printLoopInfo(name, this->stride_list);

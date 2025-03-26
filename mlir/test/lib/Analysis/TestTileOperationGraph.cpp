@@ -69,7 +69,7 @@ struct TestTileOperationGraph
   }
   void processDramIndices(mlir::Value value,
                         std::map<std::string, int> &loop_index_list,
-                        llvm::DenseMap<void *, std::string> &loop_var_name);
+                        llvm::DenseMap<void *, std::string> &loop_var_name, bool &indirect_mode);
   llvm::SmallVector<mlir::Attribute, 2> getSubtileSize(mlir::Operation *operation);
   int getAsyncValue(mlir::Operation *operation);
   std::vector<int> collectCoefficientsFromAffineExpr(mlir::AffineExpr expr);
@@ -190,7 +190,7 @@ std::vector<int> TestTileOperationGraph::collectDividersFromAffineExpr(mlir::Aff
 void TestTileOperationGraph::printOperation(Operation &op, TOGNode *node) {
   StringRef name = op.getName().getStringRef();
   if (name == "affine.yield" || name == "affine.apply" || name == "memref.get_global" || \
-      name == "affine.vector_load" || name == "memref.reinterpret_cast" || name == "arith.constant")
+      name == "memref.reinterpret_cast" || name == "arith.constant")
     return;
 
   if (name == "affine.for") {
@@ -252,6 +252,7 @@ void TestTileOperationGraph::printOperation(Operation &op, TOGNode *node) {
     std::vector<int> tag_stride_list;
     std::map<std::string, int> loop_index_map;
     llvm::SmallVector<int64_t, 2> dmaSubtileValues;
+    bool indirect_mode = false;
     for (auto attr : getSubtileSize(dma_op))
       if (auto intAttr = llvm::dyn_cast<mlir::IntegerAttr>(attr))
         dmaSubtileValues.push_back(intAttr.getInt());
@@ -271,7 +272,7 @@ void TestTileOperationGraph::printOperation(Operation &op, TOGNode *node) {
       return;
     }
     /* Record used loop index names */
-    processDramIndices(dram_indices.front(), loop_index_map, loop_var_name);
+    processDramIndices(dram_indices.front(), loop_index_map, loop_var_name, indirect_mode);
     for (const auto& pair : loop_index_map) {
         loop_index_list.push_back(pair.first);
         stride_list.push_back(pair.second);
@@ -344,7 +345,7 @@ void TestTileOperationGraph::printOperation(Operation &op, TOGNode *node) {
 
     TOGDMANode *tog_dma = new TOGDMANode("DMANode", address, stride_list, tile_size,
                                          element_size, is_write, dmaAsync, tag_index_list,
-                                         tag_stride_list, loop_index_list);
+                                         tag_stride_list, loop_index_list, indirect_mode);
     tog_dma->setOp(&op);
     /* Link child and parent */
     node->addChild(tog_dma);
@@ -561,11 +562,11 @@ int64_t getCoefficientFromDim(mlir::AffineExpr expr, int dim) {
 
 void TestTileOperationGraph::processDramIndices(mlir::Value value,
                         std::map<std::string, int> &loop_index_list,
-                        llvm::DenseMap<void *, std::string> &loop_var_name) {
+                        llvm::DenseMap<void *, std::string> &loop_var_name, bool &indirect_mode) {
   if (auto applyOp = value.getDefiningOp<mlir::affine::AffineApplyOp>()) {
     mlir::AffineMap map = applyOp.getAffineMap();
     mlir::OperandRange applyOperands = applyOp.getOperands();
-
+    indirect_mode = map.getNumSymbols() !=0 && !indirect_mode ? true : indirect_mode;
     for (unsigned i = 0; i < applyOperands.size(); ++i) {
       auto operand = applyOperands[i];
       if (auto blockArg = llvm::dyn_cast<mlir::BlockArgument>(operand)) {
@@ -575,7 +576,7 @@ void TestTileOperationGraph::processDramIndices(mlir::Value value,
         loop_index_list[loop_var_name.at(blockArg.getAsOpaquePointer())] = coeff;
       } else {
         // Otherwise, recursively process the operand
-        processDramIndices(operand, loop_index_list, loop_var_name);
+        processDramIndices(operand, loop_index_list, loop_var_name, indirect_mode);
       }
     }
   } else if (auto blockArg = llvm::dyn_cast<mlir::BlockArgument>(value)) {
