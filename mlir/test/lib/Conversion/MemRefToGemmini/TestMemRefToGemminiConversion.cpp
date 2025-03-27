@@ -255,7 +255,6 @@ struct DmaStartOpLowering : public ConvertOpToLLVMPattern<memref::DmaStartOp> {
             indirect_spad_addr = getStridedElementPtr(loc, indirectMemRefType, indirectMemref, {}, rewriter);
             indirect_spad_addr = rewriter.create<LLVM::PtrToIntOp>(loc, rewriter.getI64Type(), indirect_spad_addr);
             indirect_element_size = getElementBitWidth(indirectMemRefType.getElementType()) / 8;
-            llvm::errs() << "element_size: " << indirect_element_size << "\n";
             break;
           }
         }
