@@ -83,11 +83,18 @@ void DmaFineGrained::runOnOperation() {
   int loopDepth = 0;
   func.walk([&](affine::AffineForOp loop) {
     // Adjust the step size based on loop depth
-    if (auto attr = loop->getAttrOfType<BoolAttr>("accumulation_loop"))
+    if (auto attr = loop->getAttrOfType<BoolAttr>("accumulation_loop")) {
       accumulationLoops.push_back(loop);
-    if (auto attr = loop->getAttrOfType<BoolAttr>("outer_loop"))
+      loopDepth++;
+    }
+    if (auto attr = loop->getAttrOfType<BoolAttr>("outer_loop")) {
       outerLoops.push_back(loop);
-    loopDepth++;
+      loopDepth++;
+    }
+    if (auto attr = loop->getAttrOfType<BoolAttr>("inner_loop")) {
+      if (attr.getValue())
+        loopDepth++;
+    }
   });
 
   // Retrieve tile info
