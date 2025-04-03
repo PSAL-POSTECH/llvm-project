@@ -205,9 +205,6 @@ void TestTileOperationGraph::printOperation(Operation &op, TOGNode *node) {
       loop_type = "accumulation_loop";
     } else if (innerLoopAttr && innerLoopAttr.getValue()) {
       loop_type = "inner_loop";
-    } else {
-      for_op.emitError("Loop attribute is required");
-      return;
     }
 
     if ((outerLoopAttr && outerLoopAttr.getValue()) || (outerLoopAttr2 && outerLoopAttr2.getValue()) || (innerLoopAttr && innerLoopAttr.getValue())) {
