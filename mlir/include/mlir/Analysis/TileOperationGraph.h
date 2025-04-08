@@ -277,7 +277,8 @@ class TOGComputeNode : public TOGNode {
 public:
   enum ComputeType{
     VectorCompute,
-    MatmulCompute
+    MatmulCompute,
+    MatmulPreload,
   };
   std::vector<Operation*> operations;
   TOGComputeNode(const std::string &name, int cycle, ComputeType type) :

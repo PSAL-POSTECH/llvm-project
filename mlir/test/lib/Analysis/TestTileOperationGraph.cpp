@@ -415,12 +415,12 @@ void TestTileOperationGraph::printOperation(Operation &op, TOGNode *node) {
     return;
 
   /* Combine compute node */
-  auto type = (name == "vcix.i" || (name == "vcix.iv")) ? TOGComputeNode::MatmulCompute : TOGComputeNode::VectorCompute;
+  auto type = name == "vcix.i" ? TOGComputeNode::MatmulCompute : (name == "vcix.iv" ? TOGComputeNode::MatmulPreload : TOGComputeNode::VectorCompute);
   if (node->getChildren().size()) {
     TOGComputeNode *last_compute_node = dyn_cast<TOGComputeNode>(node->getLastChild());
     if (last_compute_node) {
       last_compute_node->operations.push_back(&op);
-      if (type == TOGComputeNode::MatmulCompute)
+      if (type == TOGComputeNode::MatmulCompute || type == TOGComputeNode::MatmulPreload)
         last_compute_node->setComputeType(type);
       return;
     }
