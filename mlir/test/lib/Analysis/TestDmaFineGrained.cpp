@@ -73,7 +73,6 @@ void DmaFineGrained::runOnOperation() {
   if (!hasMatmul) // only apply to functions with matmul
     return;
   int64_t tileSizeK, tileSizeN, tileSizeM, tileSizeK_H, tileSizeK_W, tileSizeH, tileSizeW, tileSizeO_H, tileSizeO_W;
-  int64_t vectorlane = systolicSize;
   builder.setInsertionPointToStart(&func.front());
   Value zeroIndex = builder.create<arith::ConstantIndexOp>(func.getLoc(), 0);
 

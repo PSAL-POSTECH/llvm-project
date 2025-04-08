@@ -39,6 +39,26 @@ int64_t getLoopUpperBound(mlir::affine::AffineForOp forOp) {
   return -1;  // This is an example, handle dynamic cases as needed
 }
 
+llvm::SmallVector<mlir::Attribute> getSubtileSize(mlir::Operation *operation) {
+  llvm::SmallVector<mlir::Attribute> subtileSizes;
+  auto attr = operation->getAttr("subtile_size");
+  if (!attr) {
+    return subtileSizes; // Return empty SmallVector
+  }
+
+  if (auto arrayAttr = llvm::dyn_cast<mlir::ArrayAttr>(attr)) {
+    for (auto element : arrayAttr) {
+      // Assume the elements are integers
+      if (auto intAttr = llvm::dyn_cast<mlir::IntegerAttr>(element)) {
+        subtileSizes.push_back(intAttr);
+      } else {
+        llvm::errs() << "Unsupported element type in 'subtile_size'.\n";
+      }
+    }
+  }
+  return subtileSizes;
+}
+
 std::pair<Value, bool> getDramMemRef(mlir::memref::DmaStartOp dmaOp) {
   auto dst_space = dmaOp.getDstMemorySpace();
   auto src_space = dmaOp.getSrcMemorySpace();
@@ -282,9 +302,6 @@ struct MatmulOpLowering : public OpRewritePattern<linalg::MatmulOp> {
     mlir::Value BiasDmaTag;
     ValueRange BiasDMAIndices;
     mlir::Value OuterKLoopVar;
-    int KStep = K > SYSTOLIC_SIZE ? SYSTOLIC_SIZE : K; // FIXME: Step should be sub tile size
-    int MStep = M > SYSTOLIC_SIZE ? SYSTOLIC_SIZE : M;
-    int NStep = N > SYSTOLIC_SIZE ? SYSTOLIC_SIZE : N;
     std::vector<affine::AffineForOp> accumulationLoops;
     std::vector<affine::AffineForOp> outerLoops;
     std::vector<affine::AffineForOp> innerLoops;
@@ -325,6 +342,7 @@ struct MatmulOpLowering : public OpRewritePattern<linalg::MatmulOp> {
 
     // Set Last outer loop
     affineForOp = outerLoops.back();
+    int subtileM, subtileN, subtileK;
     affineForOp->walk([&](mlir::Operation *nestedOp) {
       if (auto dmaStartOp = llvm::dyn_cast<memref::DmaStartOp>(nestedOp)) { // Replace DMAStartOp with actual `dma_start` op type
         auto result = getDramMemRef(dmaStartOp);
@@ -349,8 +367,13 @@ struct MatmulOpLowering : public OpRewritePattern<linalg::MatmulOp> {
           return WalkResult::advance();
         if (blockArg.getArgNumber() == 0) {
           ADmaTag = dmaStartOp.getTagMemRef(); // Assuming `getTag()` retrieves the `tag` from `dma_start`.
+          llvm::SmallVector<mlir::Attribute> dmaSubtile = getSubtileSize(dmaStartOp);
+          subtileM = llvm::dyn_cast<mlir::IntegerAttr>(dmaSubtile[dmaSubtile.size() - 2]).getInt();
+          subtileK = llvm::dyn_cast<mlir::IntegerAttr>(dmaSubtile[dmaSubtile.size() - 1]).getInt();
         } else if (blockArg.getArgNumber() == 1) {
           BDmaTag = dmaStartOp.getTagMemRef(); // Assuming `getTag()` retrieves the `tag` from `dma_start`.
+          llvm::SmallVector<mlir::Attribute> dmaSubtile = getSubtileSize(dmaStartOp);
+          subtileN = llvm::dyn_cast<mlir::IntegerAttr>(dmaSubtile[dmaSubtile.size() - 1]).getInt();
         } else if (blockArg.getArgNumber() == 2) {
           BiasDmaTag = dmaStartOp.getTagMemRef(); // Assuming `getTag()` retrieves the `tag` from `dma_start`.
           BiasDMAIndices = dmaStartOp.getTagIndices();
@@ -358,12 +381,18 @@ struct MatmulOpLowering : public OpRewritePattern<linalg::MatmulOp> {
       }
       return WalkResult::advance();
     });
+    int KStep = subtileK;
+    int push_length = subtileM > SYSTOLIC_SIZE ? SYSTOLIC_SIZE : subtileM;
+    int MStep = M > push_length ? push_length : M;
+    int NStep = subtileN > SYSTOLIC_SIZE ? SYSTOLIC_SIZE : subtileN;
+    Value vector_elements = rewriter.create<mlir::arith::ConstantIndexOp>(rewriter.getUnknownLoc(), push_length);
 
     if (!ADmaTag || !BDmaTag) {
       op.emitError () << "Failed to locate dma_start for retrieving tag.";
       return failure();
     }
     affine::AffineForOp inner_loop;
+    Value zero_vector;
     if (N > SYSTOLIC_SIZE) {
       // N Loop
       inner_loop = rewriter.create<affine::AffineForOp>(loc, 0, N/SYSTOLIC_SIZE, 1);
@@ -374,7 +403,6 @@ struct MatmulOpLowering : public OpRewritePattern<linalg::MatmulOp> {
       n_idx = c0;
     }
 
-    Value zero_vector;
     if (K > SYSTOLIC_SIZE) {
       // K Loop
       inner_loop = rewriter.create<affine::AffineForOp>(loc, 0, K/SYSTOLIC_SIZE, 1);
@@ -417,8 +445,10 @@ struct MatmulOpLowering : public OpRewritePattern<linalg::MatmulOp> {
       rewriter.getAffineDimExpr(BDimOffset+1).floorDiv((KStep+SYSTOLIC_SIZE-1)/SYSTOLIC_SIZE)*1;
     auto BTagMap = mlir::AffineMap::get(BDimOffset+2, 0, BTagExpr);
 
-    BTagOperands.push_back(n_idx); //N_idx, K_Idx
-    BTagOperands.push_back(k_idx);
+    Value n_tag_idx = N == subtileN ? c0 : n_idx; // check whether we need to tag from subtile
+    Value k_tag_idx = K == subtileK ? c0 : k_idx;
+    BTagOperands.push_back(n_tag_idx); //N_idx, K_Idx
+    BTagOperands.push_back(k_tag_idx);
     auto BTagIdx = rewriter.create<affine::AffineApplyOp>(loc, BTagMap, BTagOperands);
     rewriter.create<memref::DmaWaitOp>(loc, BDmaTag, ValueRange{BTagIdx}, numElements);
 
@@ -448,9 +478,9 @@ struct MatmulOpLowering : public OpRewritePattern<linalg::MatmulOp> {
       rewriter.setInsertionPoint(&tile_o_w_loop.getBody()->back());
     }
 
-    if (M > SYSTOLIC_SIZE) {
+    if (M > push_length) {
       // M Loop
-      inner_loop = rewriter.create<affine::AffineForOp>(loc, 0, M/SYSTOLIC_SIZE, 1);
+      inner_loop = rewriter.create<affine::AffineForOp>(loc, 0, M/push_length, 1);
       inner_loop->setAttr("inner_loop", rewriter.getBoolAttr(true));
       rewriter.setInsertionPointToStart(inner_loop.getBody());
       m_idx = inner_loop.getInductionVar();
@@ -508,14 +538,15 @@ struct MatmulOpLowering : public OpRewritePattern<linalg::MatmulOp> {
       rewriter.getAffineDimExpr(ADimOffset+1).floorDiv((MStep+SYSTOLIC_SIZE-1)/SYSTOLIC_SIZE);
     auto ATagMap = mlir::AffineMap::get(ADimOffset+2, 0, ATagExpr);
 
-    ATagOperands.push_back(k_idx);    //K_idx, m_idx
-    ATagOperands.push_back(m_idx);
+    Value m_tag_idx = M == subtileM ? c0 : m_idx;
+    ATagOperands.push_back(k_tag_idx);    //K_idx, m_idx
+    ATagOperands.push_back(m_tag_idx);
     auto ATagIdx = rewriter.create<affine::AffineApplyOp>(loc, ATagMap, ATagOperands);
     rewriter.create<memref::DmaWaitOp>(loc, ADmaTag, ValueRange{ATagIdx}, numElements);
     if (BiasDmaTag) {
       /* Bias could be 1D or 2D */
-      Value first_index = BiasDMAIndices[0].getDefiningOp<mlir::arith::ConstantIndexOp>() ? c0 : n_idx;
-      Value third_index = BiasDMAIndices[0].getDefiningOp<mlir::arith::ConstantIndexOp>() ? c0 : m_idx;
+      Value first_index = BiasDMAIndices[0].getDefiningOp<mlir::arith::ConstantIndexOp>() ? c0 : n_tag_idx;
+      Value third_index = BiasDMAIndices[0].getDefiningOp<mlir::arith::ConstantIndexOp>() ? c0 : m_tag_idx;
       mlir::AffineExpr BiasTagExpr = rewriter.getAffineDimExpr(0).floorDiv((NStep+SYSTOLIC_SIZE-1)/SYSTOLIC_SIZE)*(M/MStep) + rewriter.getAffineDimExpr(1).floorDiv((MStep+SYSTOLIC_SIZE-1)/SYSTOLIC_SIZE); // N, M
       auto BiasTagMap = mlir::AffineMap::get(2, 0, BiasTagExpr);
       auto BiasTagIdx = rewriter.create<affine::AffineApplyOp>(loc, BiasTagMap, ValueRange{first_index, third_index});
@@ -525,11 +556,11 @@ struct MatmulOpLowering : public OpRewritePattern<linalg::MatmulOp> {
 
 
     // For vpush input loop part
-    int64_t M_LOOP = M > SYSTOLIC_SIZE ? SYSTOLIC_SIZE : M;
+    int64_t M_LOOP = M > push_length ? push_length : M;
     for (int i=0; i<M_LOOP; i+=nr_element) { // MxK
       Value i_val = rewriter.create<mlir::arith::ConstantIndexOp>(rewriter.getUnknownLoc(), i);
       Value spad_idx = rewriter.create<affine::AffineApplyOp>(loc, spadIdxMapAttr,
-                                                      ValueRange{k_idx, m_idx, i_val, M_val, SYSTOLIC_SIZE_val});
+                                                      ValueRange{k_idx, m_idx, i_val, M_val, vector_elements});
       Value x_idx = rewriter.create<affine::AffineApplyOp>(loc, spadXIdxMapAttr, ValueRange{spad_idx, K_val});
       Value y_idx = rewriter.create<affine::AffineApplyOp>(loc, spadYIdxMapAttr, ValueRange{spad_idx, K_val});
       auto input_vector = rewriter.create<vector::TransferReadOp>(
@@ -543,7 +574,7 @@ struct MatmulOpLowering : public OpRewritePattern<linalg::MatmulOp> {
     for (int i=0; i<M_LOOP; i+=nr_element) { // MxN
       Value i_val = rewriter.create<mlir::arith::ConstantIndexOp>(rewriter.getUnknownLoc(), i);
       Value spad_idx = rewriter.create<affine::AffineApplyOp>(loc, spadIdxMapAttr,
-                                                      ValueRange{n_idx, m_idx, i_val, M_val, SYSTOLIC_SIZE_val});
+                                                      ValueRange{n_idx, m_idx, i_val, M_val, vector_elements});
       Value vpop = rewriter.create<vcix::UnaryImmOp>(loc, vectorMType, vpop_opcode, zeroImmAttr, zeroImmAttr, rvl);
       Value x_idx = rewriter.create<affine::AffineApplyOp>(loc, spadXIdxMapAttr, ValueRange{spad_idx, N_val});
       Value y_idx = rewriter.create<affine::AffineApplyOp>(loc, spadYIdxMapAttr, ValueRange{spad_idx, N_val});
