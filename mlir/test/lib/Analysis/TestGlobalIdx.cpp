@@ -25,9 +25,7 @@ namespace {
 struct GloablIdx : public PassWrapper<GloablIdx, OperationPass<func::FuncOp>> {
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(GloablIdx)
   GloablIdx() = default;
-  GloablIdx(const GloablIdx &other) : PassWrapper(other) {
-    vlen = other.vlen;
-  }
+  GloablIdx(const GloablIdx &other) : PassWrapper(other) {}
   StringRef getArgument() const final { return "global-idx"; }
   StringRef getDescription() const final {
     return "global idx";
@@ -41,8 +39,7 @@ struct GloablIdx : public PassWrapper<GloablIdx, OperationPass<func::FuncOp>> {
                     memref::MemRefDialect, LLVM::LLVMDialect>();
   }
   void runOnOperation() override;
-  affine::AffineParallelOp findParallelOp(Value input);
-  int is_global_idx(mlir::Operation *operation);
+  int get_vlane_offset(mlir::Operation *operation);
   Value make_sf_vc_v_i(Location loc, OpBuilder &builder, const Type opType, uint64_t opcode);
   std::pair<unsigned, VectorType> legalizeVectorType(const Type &type);
 };
@@ -52,93 +49,43 @@ struct GloablIdx : public PassWrapper<GloablIdx, OperationPass<func::FuncOp>> {
 void GloablIdx::runOnOperation() {
   auto func = getOperation();
   OpBuilder builder(func.getContext());
-  func.walk([&](affine::AffineApplyOp op) {
-    AffineExpr expr = op.getAffineMap().getResults()[0];
-    SmallVector<Value, 8> operands = op.getMapOperands();
-    if (expr.isFunctionOfDim(operands.size()-1) && is_global_idx(op)) {
-      int offset = 0;
-      Value operand = operands[operands.size()-1]; // FIXME: only for vlane split axis is last index
-      affine::AffineParallelOp parallelOp = findParallelOp(operand);
-      auto upper_bound = parallelOp.getUpperBoundMap(parallelOp.getNumDims()-1);
-      if (upper_bound.isSingleConstant()) {
-        offset = static_cast<int>(upper_bound.getSingleConstantResult());
-      } else {
-        AffineExpr expr = upper_bound.getResult(0);
-        expr.walk([&](AffineExpr subExpr) {
-          if (auto constExpr = llvm::dyn_cast<AffineConstantExpr>(subExpr)) {
-            offset = constExpr.getValue();
-          }
-        });
+  func.walk([&](arith::AddIOp op) {
+    if (get_vlane_offset(op)!=-1) {
+      int offset = get_vlane_offset(op);
+
+      Location loc = op.getLoc();
+      Value vec = op.getResult();
+      const Type opType = vec.getType();
+      auto [n, legalType] = legalizeVectorType(opType);
+      if (!legalType) {
+        op.emitError() << "cannot legalize type for RVV";
+        return;
       }
-      Value result = op.getResult();
-      // find vector.broadcast operation using the result as an operand
-      for (auto &use : result.getUses()) {
-        if (auto broadcastOp = dyn_cast<vector::BroadcastOp>(use.getOwner())) {
-          // find arith.index_cast operation using the result as an operand
-          Value broad_result = broadcastOp.getResult();
-          for (auto &nesteduse : broad_result.getUses()) {
-            if (auto castOp = dyn_cast<arith::IndexCastOp>(nesteduse.getOwner())) {
-              const Type opType = castOp.getResult().getType();
-              auto [n, legalType] = legalizeVectorType(opType);
-              if (!legalType) {
-                op.emitError() << "cannot legalize type for RVV";
-                return;
-              }
-              Location loc = castOp.getLoc();
-              Value vec = castOp.getResult();
-              uint64_t opcode = 0b000000;
-              builder.setInsertionPointAfter(castOp);
-              Value res = make_sf_vc_v_i(loc, builder, opType, opcode);
-              // make offset vector with size vec
-              VectorType vt = cast<VectorType>(opType);
-              auto vectorAttr = DenseElementsAttr::get(vt, builder.getI64IntegerAttr(offset));
-              Value offset_vec = builder.create<arith::ConstantOp>(loc, vt, vectorAttr);
-              Value offset_add = builder.create<arith::MulIOp>(loc, res, offset_vec);
-              Value res_add = builder.create<arith::AddIOp>(loc, vec, offset_add);
-              vec.replaceUsesWithIf(res_add, [&](OpOperand &operand) {
-                return operand.getOwner() != res_add.getDefiningOp();
-              });
-            }
-          }
-        }
-      }
+      builder.setInsertionPointAfter(op);
+      uint64_t opcode = 0b000000;
+      Value res = make_sf_vc_v_i(loc, builder, opType, opcode);
+      // make offset vector with size vec
+      VectorType vt = cast<VectorType>(opType);
+      auto vectorAttr = DenseElementsAttr::get(vt, builder.getI64IntegerAttr(offset));
+      Value offset_vec = builder.create<arith::ConstantOp>(loc, vt, vectorAttr);
+      Value offset_add = builder.create<arith::MulIOp>(loc, res, offset_vec);
+      Value res_add = builder.create<arith::AddIOp>(loc, vec, offset_add);
+      vec.replaceUsesWithIf(res_add, [&](OpOperand &operand) {
+        return operand.getOwner() != res_add.getDefiningOp();
+      });
     }
   });
 }
 
-affine::AffineParallelOp GloablIdx::findParallelOp(Value input) {
-  auto operation = input.getDefiningOp();
-  if (operation) {
-    if (auto parallelOp = dyn_cast<affine::AffineParallelOp>(operation)) {
-      return parallelOp;
-    }
-    for (auto operand : operation->getOperands()) {
-      affine::AffineParallelOp ret = findParallelOp(operand);
-      if (ret) {
-        return ret;
-      }
-    }
-  } else if (auto blockArg = dyn_cast<BlockArgument>(input)) {
-    if (auto parallelOp = llvm::dyn_cast<affine::AffineParallelOp>(blockArg.getOwner()->getParentOp())) {
-      if (llvm::isa<affine::AffineParallelOp>(parallelOp)) {
-        return parallelOp;
-      }
-    }
-  } else {
-    llvm::errs() << "Can't find parallel op for global idx\n";
-  }
-  return nullptr;
-}
-
-int GloablIdx::is_global_idx(mlir::Operation *operation) {
-  auto attr = operation->getAttr("global_idx");
+int GloablIdx::get_vlane_offset(mlir::Operation *operation) {
+  auto attr = operation->getAttr("vlane_offset");
   if (!attr)
-    return 0;
+    return -1;
 
   if (auto intAttr = llvm::dyn_cast<mlir::IntegerAttr>(attr))
     return intAttr.getInt(); // Treat non-zero as true
   else
-    return 1;
+    return -1;
 }
 
 Value GloablIdx::make_sf_vc_v_i(Location loc, OpBuilder &builder, const Type opType, uint64_t opcode) {
