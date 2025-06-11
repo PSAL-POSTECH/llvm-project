@@ -61,7 +61,7 @@ struct TestTileOperationGraph
 
   void runOnOperation() override;
   void printOperation(Operation &op, TOGNode *node);
-  void getAffineForBounds(affine::AffineForOp &op, int &start, int &end, int &step);
+  void getAffineForBounds(affine::AffineForOp &op, int &start, int &end, int &step, bool update);
   void getDependentDialects(DialectRegistry &registry) const override {
     registry.insert<arith::ArithDialect, func::FuncDialect, math::MathDialect,
                     vcix::VCIXDialect, vector::VectorDialect, affine::AffineDialect,
@@ -76,10 +76,15 @@ struct TestTileOperationGraph
   std::vector<int> collectDividersFromAffineExpr(mlir::AffineExpr expr);
   int nr_loop = 0;
   llvm::DenseMap<void*, std::string> loop_var_name;
+  Option<int> tls_mode{*this, "tls_mode",
+                  llvm::cl::desc("tls_mode"),
+                  llvm::cl::init(1)};
 };
 } // namespace
 
-void TestTileOperationGraph::getAffineForBounds(affine::AffineForOp &op, int &start, int &end, int &step) {
+void TestTileOperationGraph::getAffineForBounds(affine::AffineForOp &op, int &start, int &end, int &step, bool update) {
+  // Get the step value, which is always an integer
+  step = static_cast<int>(op.getStep().getSExtValue());
   auto lowerBoundMap = op.getLowerBoundMap();
   if (lowerBoundMap.isSingleConstant()) {
     start = static_cast<int>(lowerBoundMap.getSingleConstantResult());
@@ -99,11 +104,9 @@ void TestTileOperationGraph::getAffineForBounds(affine::AffineForOp &op, int &st
     end = static_cast<int>(constOp.value());
   }
 
-  // Get the step value, which is always an integer
-  step = static_cast<int>(op.getStep().getSExtValue());
-
   // Modify step size
-  op.setStep(end);
+  if (update)
+    op.setStep(end);
 }
 
 std::vector<int> TestTileOperationGraph::collectCoefficientsFromAffineExpr(mlir::AffineExpr expr) {
@@ -210,7 +213,7 @@ void TestTileOperationGraph::printOperation(Operation &op, TOGNode *node) {
     if ((outerLoopAttr && outerLoopAttr.getValue()) || (outerLoopAttr2 && outerLoopAttr2.getValue()) || (innerLoopAttr && innerLoopAttr.getValue())) {
       // Get loop information and create loop node
       int start, end, step;
-      getAffineForBounds(for_op, start, end, step);
+      getAffineForBounds(for_op, start, end, step, tls_mode);
       std::ostringstream oss;
       oss << "loop_arg" << std::setw(3) << std::setfill('0') << nr_loop++;
       std::string loop_index = oss.str();
