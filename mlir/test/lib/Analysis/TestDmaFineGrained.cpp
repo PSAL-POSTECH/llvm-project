@@ -96,10 +96,20 @@ void DmaFineGrained::runOnOperation() {
     }
   });
 
+  llvm::errs() << "Size of accL: " << accumulationLoops.size() << "\n";
   // Retrieve tile info
-  tileSizeK = accumulationLoops.front().getStepAsInt();
-  tileSizeN = outerLoops.at(0).getStepAsInt();
-  tileSizeM = outerLoops.at(1).getStepAsInt();
+  if (accumulationLoops.size() == 2) {
+    tileSizeK = accumulationLoops.at(0).getStepAsInt();
+    tileSizeN = accumulationLoops.at(1).getStepAsInt();
+    tileSizeM = outerLoops.at(0).getStepAsInt();
+  } else {
+    tileSizeK = accumulationLoops.front().getStepAsInt();
+    tileSizeN = outerLoops.at(0).getStepAsInt();
+    tileSizeM = outerLoops.at(1).getStepAsInt();
+  }
+  llvm::errs() << "tileSizeK: " << tileSizeK << "\n";
+  llvm::errs() << "tileSizeN: " << tileSizeN << "\n";
+  llvm::errs() << "tileSizeM: " << tileSizeM << "\n";
 
   bool is_bmm = false, is_conv2d = false;
   if (loopDepth == 4) { // bmm has 4 loops (b, m, n, k)
@@ -110,7 +120,6 @@ void DmaFineGrained::runOnOperation() {
     func.emitError() << "Unsupported loop depth: " << loopDepth;
     return;
   }
-
   // inner loop fine-grained dma
   SmallVector<memref::DmaStartOp, 2> dmaOps;
   func.walk([&](memref::DmaStartOp dmaStartOp) {
