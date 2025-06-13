@@ -96,7 +96,6 @@ void DmaFineGrained::runOnOperation() {
     }
   });
 
-  llvm::errs() << "Size of accL: " << accumulationLoops.size() << "\n";
   // Retrieve tile info
   if (accumulationLoops.size() == 2) {
     tileSizeK = accumulationLoops.at(0).getStepAsInt();
