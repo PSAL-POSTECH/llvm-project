@@ -107,9 +107,6 @@ void DmaFineGrained::runOnOperation() {
     tileSizeN = outerLoops.at(0).getStepAsInt();
     tileSizeM = outerLoops.at(1).getStepAsInt();
   }
-  llvm::errs() << "tileSizeK: " << tileSizeK << "\n";
-  llvm::errs() << "tileSizeN: " << tileSizeN << "\n";
-  llvm::errs() << "tileSizeM: " << tileSizeM << "\n";
 
   bool is_bmm = false, is_conv2d = false;
   if (loopDepth == 4) { // bmm has 4 loops (b, m, n, k)
