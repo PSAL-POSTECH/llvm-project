@@ -103,8 +103,19 @@ void DmaFineGrained::runOnOperation() {
     tileSizeM = outerLoops.at(0).getStepAsInt();
   } else {
     tileSizeK = accumulationLoops.front().getStepAsInt();
-    tileSizeN = outerLoops.at(0).getStepAsInt();
-    tileSizeM = outerLoops.at(1).getStepAsInt();
+    auto m_attr = outerLoops.at(1)->getAttr("loop_m");
+    auto n_attr = outerLoops.at(1)->getAttr("loop_n");
+    if (m_attr) {
+      tileSizeM = outerLoops.at(1).getStepAsInt();
+      tileSizeN = outerLoops.at(0).getStepAsInt();
+    } else if (n_attr) {
+      tileSizeN = outerLoops.at(1).getStepAsInt();
+      tileSizeM = outerLoops.at(0).getStepAsInt();
+    } else {
+      /* Default. We assume that M is the outer-most loop */
+      tileSizeN = outerLoops.at(0).getStepAsInt();
+      tileSizeM = outerLoops.at(1).getStepAsInt();
+    }
   }
 
   bool is_bmm = false, is_conv2d = false;
