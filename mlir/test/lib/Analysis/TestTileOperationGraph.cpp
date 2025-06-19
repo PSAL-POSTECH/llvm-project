@@ -68,7 +68,7 @@ struct TestTileOperationGraph
                     memref::MemRefDialect, LLVM::LLVMDialect>();
   }
   void processDramIndices(mlir::Value value,
-                        std::map<std::string, int> &loop_index_list,
+                        std::vector<std::pair<std::string, int>> &loop_index_list,
                         llvm::DenseMap<void *, std::string> &loop_var_name, bool &indirect_mode);
   llvm::SmallVector<mlir::Attribute, 2> getSubtileSize(mlir::Operation *operation);
   int getAsyncValue(mlir::Operation *operation);
@@ -250,7 +250,7 @@ void TestTileOperationGraph::printOperation(Operation &op, TOGNode *node) {
     std::vector<std::string> loop_index_list;
     std::vector<std::string> tag_index_list;
     std::vector<int> tag_stride_list;
-    std::map<std::string, int> loop_index_map;
+    std::vector<std::pair<std::string, int>> loop_index_map;
     llvm::SmallVector<int64_t, 2> dmaSubtileValues;
     bool indirect_mode = false;
     for (auto attr : getSubtileSize(dma_op))
@@ -271,11 +271,30 @@ void TestTileOperationGraph::printOperation(Operation &op, TOGNode *node) {
       op.emitError() << "Unexpected memory space, src: " << src_space << "des: " << dst_space << "\n";
       return;
     }
+
+    // Select tile or subtile
+    auto tile_shape = dmaSubtileValues.size()? dmaSubtileValues : tile_memref_type.getShape();
+
+    /* Extract destination tile size */
+    for (int64_t iter: tile_shape)
+      tile_size.push_back(static_cast<int>(iter));
+
     /* Record used loop index names */
     processDramIndices(dram_indices.front(), loop_index_map, loop_var_name, indirect_mode);
-    for (const auto& pair : loop_index_map) {
+    std::map<std::string, std::pair<int, int>> reorderd_loop_map;
+    for (int i=0; i<loop_index_map.size(); i ++) {
+      const std::string& key = loop_index_map[i].first;
+      int stride = loop_index_map[i].second;
+      int dim_size = i < tile_size.size() ? tile_size.at(i) : -1;
+      reorderd_loop_map[key] = {stride, dim_size};
+    }
+
+    tile_size.clear();
+    for (const auto& pair : reorderd_loop_map) {
         loop_index_list.push_back(pair.first);
-        stride_list.push_back(pair.second);
+        stride_list.push_back(pair.second.first);
+        if (pair.second.second != -1)
+          tile_size.push_back(pair.second.second);
     }
 
     /* Get DRAM argument index */
@@ -286,12 +305,7 @@ void TestTileOperationGraph::printOperation(Operation &op, TOGNode *node) {
     } else {
       op.emitError() << "Unexpected dram buffer argument: " << dram_memref << "\n";
     }
-    // Select tile or subtile
-    auto tile_shape = dmaSubtileValues.size()? dmaSubtileValues : tile_memref_type.getShape();
 
-    /* Extract destination tile size */
-    for (int64_t iter: tile_shape)
-      tile_size.push_back(static_cast<int>(iter));
 
     /* Extract destination element type */
     mlir::Type element_type = tile_memref_type.getElementType();
@@ -561,7 +575,7 @@ int64_t getCoefficientFromDim(mlir::AffineExpr expr, int dim) {
 }
 
 void TestTileOperationGraph::processDramIndices(mlir::Value value,
-                        std::map<std::string, int> &loop_index_list,
+                        std::vector<std::pair<std::string, int>> &loop_index_list,
                         llvm::DenseMap<void *, std::string> &loop_var_name, bool &indirect_mode) {
   if (auto applyOp = value.getDefiningOp<mlir::affine::AffineApplyOp>()) {
     mlir::AffineMap map = applyOp.getAffineMap();
@@ -573,7 +587,8 @@ void TestTileOperationGraph::processDramIndices(mlir::Value value,
         mlir::AffineExpr expr = map.getResult(0);
         auto index_pos = getArgumentIndex(applyOp, blockArg);
         int coeff = getCoefficientFromDim(expr, index_pos);
-        loop_index_list[loop_var_name.at(blockArg.getAsOpaquePointer())] = coeff;
+        std::string key = loop_var_name.at(blockArg.getAsOpaquePointer());
+        loop_index_list.emplace_back(key, coeff);
       } else {
         // Otherwise, recursively process the operand
         processDramIndices(operand, loop_index_list, loop_var_name, indirect_mode);
@@ -581,10 +596,12 @@ void TestTileOperationGraph::processDramIndices(mlir::Value value,
     }
   } else if (auto blockArg = llvm::dyn_cast<mlir::BlockArgument>(value)) {
     // If the value itself is a BlockArgument, add it to the list
-    loop_index_list[loop_var_name.at(blockArg.getAsOpaquePointer())] = 1;
+    std::string key = loop_var_name.at(blockArg.getAsOpaquePointer());
+    loop_index_list.emplace_back(key, 1);
   } else if (auto constOp = value.getDefiningOp<arith::ConstantIndexOp>()) {
     int constValue = static_cast<int>(constOp.value());
-    loop_index_list["c" + std::to_string(constValue)] = constValue;
+    std::string key = "c" + std::to_string(constValue);
+    loop_index_list.emplace_back(key, constValue);
   }
 }
 
