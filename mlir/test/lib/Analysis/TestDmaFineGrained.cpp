@@ -171,6 +171,9 @@ void DmaFineGrained::runOnOperation() {
   llvm::SmallVector<mlir::Attribute> dma2SramStrides = getSramStride(mvin_weight);
   int dma1Async = getAsyncValue(mvin_input);
   int dma2Async = getAsyncValue(mvin_weight);
+  if (!dma1Async && !dma2Async) {
+    return; // no async dma
+  }
 
   NamedAttrList dma1Attr;
   NamedAttrList dma2Attr;

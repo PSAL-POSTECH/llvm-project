@@ -59,6 +59,17 @@ llvm::SmallVector<mlir::Attribute> getSubtileSize(mlir::Operation *operation) {
   return subtileSizes;
 }
 
+int getAsyncValue(mlir::Operation *operation) {
+  auto attr = operation->getAttr("async");
+  if (!attr)
+    return 0;
+
+  if (auto intAttr = llvm::dyn_cast<mlir::IntegerAttr>(attr))
+    return intAttr.getInt(); // Treat non-zero as true
+  else
+    return 1;
+}
+
 std::pair<Value, bool> getDramMemRef(mlir::memref::DmaStartOp dmaOp) {
   auto dst_space = dmaOp.getDstMemorySpace();
   auto src_space = dmaOp.getSrcMemorySpace();
@@ -300,6 +311,9 @@ struct MatmulOpLowering : public OpRewritePattern<linalg::MatmulOp> {
     mlir::Value ADmaTag;
     mlir::Value BDmaTag;
     mlir::Value BiasDmaTag;
+    int ADmaAsync = 0;
+    int BDmaAsync = 0;
+    int BiasDmaAsync = 0;
     ValueRange BiasDMAIndices;
     mlir::Value OuterKLoopVar;
     std::vector<affine::AffineForOp> accumulationLoops;
@@ -367,15 +381,18 @@ struct MatmulOpLowering : public OpRewritePattern<linalg::MatmulOp> {
           return WalkResult::advance();
         if (blockArg.getArgNumber() == 0) {
           ADmaTag = dmaStartOp.getTagMemRef(); // Assuming `getTag()` retrieves the `tag` from `dma_start`.
+          ADmaAsync = getAsyncValue(dmaStartOp);
           llvm::SmallVector<mlir::Attribute> dmaSubtile = getSubtileSize(dmaStartOp);
           subtileM = llvm::dyn_cast<mlir::IntegerAttr>(dmaSubtile[dmaSubtile.size() - 2]).getInt();
           subtileK = llvm::dyn_cast<mlir::IntegerAttr>(dmaSubtile[dmaSubtile.size() - 1]).getInt();
         } else if (blockArg.getArgNumber() == 1) {
           BDmaTag = dmaStartOp.getTagMemRef(); // Assuming `getTag()` retrieves the `tag` from `dma_start`.
+          BDmaAsync = getAsyncValue(dmaStartOp);
           llvm::SmallVector<mlir::Attribute> dmaSubtile = getSubtileSize(dmaStartOp);
           subtileN = llvm::dyn_cast<mlir::IntegerAttr>(dmaSubtile[dmaSubtile.size() - 1]).getInt();
         } else if (blockArg.getArgNumber() == 2) {
           BiasDmaTag = dmaStartOp.getTagMemRef(); // Assuming `getTag()` retrieves the `tag` from `dma_start`.
+          BiasDmaAsync = getAsyncValue(dmaStartOp);
           BiasDMAIndices = dmaStartOp.getTagIndices();
         }
       }
@@ -450,7 +467,8 @@ struct MatmulOpLowering : public OpRewritePattern<linalg::MatmulOp> {
     BTagOperands.push_back(n_tag_idx); //N_idx, K_Idx
     BTagOperands.push_back(k_tag_idx);
     auto BTagIdx = rewriter.create<affine::AffineApplyOp>(loc, BTagMap, BTagOperands);
-    rewriter.create<memref::DmaWaitOp>(loc, BDmaTag, ValueRange{BTagIdx}, numElements);
+    if (BDmaAsync)
+      rewriter.create<memref::DmaWaitOp>(loc, BDmaTag, ValueRange{BTagIdx}, numElements);
 
     // For vpush weight loop part
     for (int i=0; i<SYSTOLIC_SIZE; i+=nr_element) { // KxN
@@ -542,7 +560,8 @@ struct MatmulOpLowering : public OpRewritePattern<linalg::MatmulOp> {
     ATagOperands.push_back(k_tag_idx);    //K_idx, m_idx
     ATagOperands.push_back(m_tag_idx);
     auto ATagIdx = rewriter.create<affine::AffineApplyOp>(loc, ATagMap, ATagOperands);
-    rewriter.create<memref::DmaWaitOp>(loc, ADmaTag, ValueRange{ATagIdx}, numElements);
+    if (ADmaAsync)
+      rewriter.create<memref::DmaWaitOp>(loc, ADmaTag, ValueRange{ATagIdx}, numElements);
     if (BiasDmaTag) {
       /* Bias could be 1D or 2D */
       Value first_index = BiasDMAIndices[0].getDefiningOp<mlir::arith::ConstantIndexOp>() ? c0 : n_tag_idx;
@@ -550,7 +569,8 @@ struct MatmulOpLowering : public OpRewritePattern<linalg::MatmulOp> {
       mlir::AffineExpr BiasTagExpr = rewriter.getAffineDimExpr(0).floorDiv((NStep+SYSTOLIC_SIZE-1)/SYSTOLIC_SIZE)*(M/MStep) + rewriter.getAffineDimExpr(1).floorDiv((MStep+SYSTOLIC_SIZE-1)/SYSTOLIC_SIZE); // N, M
       auto BiasTagMap = mlir::AffineMap::get(2, 0, BiasTagExpr);
       auto BiasTagIdx = rewriter.create<affine::AffineApplyOp>(loc, BiasTagMap, ValueRange{first_index, third_index});
-      rewriter.create<memref::DmaWaitOp>(loc, BiasDmaTag, ValueRange{BiasTagIdx}, numElements);
+      if (BiasDmaAsync)
+        rewriter.create<memref::DmaWaitOp>(loc, BiasDmaTag, ValueRange{BiasTagIdx}, numElements);
     }
 
 
