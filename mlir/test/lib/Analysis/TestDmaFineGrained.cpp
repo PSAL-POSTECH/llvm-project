@@ -11,6 +11,7 @@
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Pass/PassManager.h"
+#include "mlir/Analysis/CustomDMAAttribute.h"
 
 #define MVIN 2
 #define MVIN2 1
@@ -46,9 +47,6 @@ struct DmaFineGrained : public PassWrapper<DmaFineGrained, OperationPass<func::F
                           llvm::cl::desc("Systolic array size (KxK)"),
                           llvm::cl::init(128)};
   void runOnOperation() override;
-  llvm::SmallVector<mlir::Attribute> getSubtileSize(mlir::Operation *operation);
-  llvm::SmallVector<mlir::Attribute> getSramStride(mlir::Operation *operation);
-  int getAsyncValue(mlir::Operation *operation);
   bool traverseOperands(Value op_val, Value input);
   void buildDmaOp(OpBuilder &builder, Location loc, memref::DmaStartOp op, SmallVector<Value> src_indices,
                   SmallVector<Value> dst_indices, SmallVector<Value> tag_indices, NamedAttrList attr);
@@ -169,6 +167,8 @@ void DmaFineGrained::runOnOperation() {
   llvm::SmallVector<mlir::Attribute> dma2Subtile = getSubtileSize(mvin_weight);
   llvm::SmallVector<mlir::Attribute> dma1SramStrides = getSramStride(mvin_input);
   llvm::SmallVector<mlir::Attribute> dma2SramStrides = getSramStride(mvin_weight);
+  llvm::SmallVector<mlir::Attribute> dma1DramStrides = getDramStride(mvin_input);
+  llvm::SmallVector<mlir::Attribute> dma2DramStrides = getDramStride(mvin_weight);
   int dma1Async = getAsyncValue(mvin_input);
   int dma2Async = getAsyncValue(mvin_weight);
   if (!dma1Async && !dma2Async) {
@@ -243,6 +243,10 @@ void DmaFineGrained::runOnOperation() {
     dma1Attr.set("sram_stride", builder.getArrayAttr(dma1SramStrides));
   if (dma2SramStrides.size())
     dma2Attr.set("sram_stride", builder.getArrayAttr(dma2SramStrides));
+  if (dma1DramStrides.size())
+    dma1Attr.set("dram_stride", builder.getArrayAttr(dma1DramStrides));
+  if (dma2DramStrides.size())
+    dma2Attr.set("dram_stride", builder.getArrayAttr(dma2DramStrides));
   dma1Attr.set("async", builder.getIntegerAttr(builder.getI1Type(), dma1Async));
   dma2Attr.set("async", builder.getIntegerAttr(builder.getI1Type(), dma2Async));
   dma1Attr.set("fine_grained", builder.getIntegerAttr(builder.getI1Type(), 1));
@@ -252,6 +256,7 @@ void DmaFineGrained::runOnOperation() {
     // BIAS MVIN
     llvm::SmallVector<mlir::Attribute> dmaSubtile = getSubtileSize(mvin_bias);
     llvm::SmallVector<mlir::Attribute> dmaSramStrides = getSramStride(mvin_bias);
+    llvm::SmallVector<mlir::Attribute> dmaDramStrides = getDramStride(mvin_bias);
     int dmaAsync = getAsyncValue(mvin_bias);
     NamedAttrList dmaAttr;
     if (dmaSubtile.size()) {
@@ -259,6 +264,9 @@ void DmaFineGrained::runOnOperation() {
     }
     if (dmaSramStrides.size()) {
       dmaAttr.set("sram_stride", builder.getArrayAttr(dmaSramStrides));
+    }
+    if (dmaDramStrides.size()) {
+      dmaAttr.set("dram_stride", builder.getArrayAttr(dmaDramStrides));
     }
     dmaAttr.set("async", builder.getBoolAttr(dmaAsync));
     dmaAttr.set("fine_grained", builder.getBoolAttr(true));
@@ -482,37 +490,6 @@ bool DmaFineGrained::traverseOperands(Value op_val, Value input) {
   return found;
 }
 
-llvm::SmallVector<mlir::Attribute> DmaFineGrained::getSubtileSize(mlir::Operation *operation) {
-  llvm::SmallVector<mlir::Attribute> subtileSizes;
-  auto attr = operation->getAttr("subtile_size");
-  if (!attr) {
-    return subtileSizes; // Return empty SmallVector
-  }
-
-  if (auto arrayAttr = llvm::dyn_cast<mlir::ArrayAttr>(attr)) {
-    for (auto element : arrayAttr) {
-      // Assume the elements are integers
-      if (auto intAttr = llvm::dyn_cast<mlir::IntegerAttr>(element)) {
-        subtileSizes.push_back(intAttr);
-      } else {
-        llvm::errs() << "Unsupported element type in 'subtile_size'.\n";
-      }
-    }
-  }
-  return subtileSizes;
-}
-
-int DmaFineGrained::getAsyncValue(mlir::Operation *operation) {
-  auto attr = operation->getAttr("async");
-  if (!attr)
-    return 0;
-
-  if (auto intAttr = llvm::dyn_cast<mlir::IntegerAttr>(attr))
-    return intAttr.getInt(); // Treat non-zero as true
-  else
-    return 1;
-}
-
 void DmaFineGrained::buildDmaOp(OpBuilder &builder, Location loc, memref::DmaStartOp op, SmallVector<Value> src_indices,
                                 SmallVector<Value> dst_indices, SmallVector<Value> tag_indices, NamedAttrList attr) {
   auto src_map = builder.getMultiDimIdentityMap(src_indices.size());
@@ -541,26 +518,6 @@ AffineMap DmaFineGrained::build4DSpadMap(OpBuilder &builder, int64_t tileSize1, 
   int64_t spad_0_stride = spad_1_stride * tileSize1;
   AffineMap spad_map = AffineMap::get(4, 0, builder.getAffineDimExpr(0) * spad_0_stride + builder.getAffineDimExpr(1) * spad_1_stride + buildAffineDimExpr(builder, 2, tileSize2) + builder.getAffineDimExpr(3));
   return spad_map;
-}
-
-llvm::SmallVector<mlir::Attribute> DmaFineGrained::getSramStride(mlir::Operation *operation) {
-  llvm::SmallVector<mlir::Attribute> sram_stride;
-  auto attr = operation->getAttr("sram_stride");
-  if (!attr) {
-    return sram_stride; // Return empty SmallVector
-  }
-
-  if (auto arrayAttr = llvm::dyn_cast<mlir::ArrayAttr>(attr)) {
-    for (auto element : arrayAttr) {
-      // Assume the elements are integers
-      if (auto intAttr = llvm::dyn_cast<mlir::IntegerAttr>(element)) {
-        sram_stride.push_back(intAttr);
-      } else {
-        llvm::errs() << "Unsupported element type in 'sram_stride'.\n";
-      }
-    }
-  }
-  return sram_stride;
 }
 
 namespace mlir {

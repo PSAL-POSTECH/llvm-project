@@ -17,6 +17,7 @@
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Pass/Pass.h"
+#include "mlir/Analysis/CustomDMAAttribute.h"
 
 using namespace mlir;
 
@@ -259,6 +260,7 @@ struct TestLoopPadding
                                             int updated_position_index,
                                             int64_t upperBound,
                                             int64_t paddedUpperBound,
+                                            SmallVector<mlir::Attribute> &dram_stride,
                                             mlir::MLIRContext *context);
   AffineMap updateAffineMapWithNewExpr(AffineMap& oldMap,
                                        mlir::AffineExpr updatedExpr,
@@ -311,6 +313,7 @@ void TestLoopPadding::runOnOperation() {
   func::FuncOp function = getOperation();
   MLIRContext *context = &getContext();
   mlir::ModuleOp module = getOperation()->getParentOfType<mlir::ModuleOp>();
+  mlir::OpBuilder builder(module.getContext());
   func::FuncOp prevKernelFunc = module.lookupSymbol<func::FuncOp>("kernel");
   if (!prevKernelFunc) {
     module.emitError() << "Function 'kernel' not found!\n";
@@ -369,6 +372,7 @@ void TestLoopPadding::runOnOperation() {
       }
       // this axis affecti this dmaOp
       bool isAffected = false;
+      SmallVector<mlir::Attribute> dram_stride = getDramStride(dmaOp);
       for (auto operand : dmaOp.getOperands()) {
         if (auto applyOp = operand.getDefiningOp<mlir::affine::AffineApplyOp>()) {
           AffineMap map = applyOp.getAffineMap();
@@ -419,7 +423,7 @@ void TestLoopPadding::runOnOperation() {
                 AffineExpr expr = dmaOpExpr[dmaOp.getAsOpaquePointer()];
 
                 /* Update affine expression */
-                AffineExpr newExpr = updateAffineExprWithBounds(expr, index_pos, size, newSize, context);
+                AffineExpr newExpr = updateAffineExprWithBounds(expr, index_pos, size, newSize, dram_stride, context);
                 map = updateAffineMapWithNewExpr(map, newExpr, expr_idx, context, forOp);
                 applyOp.setMap(map);
                 return;
@@ -452,10 +456,11 @@ void TestLoopPadding::runOnOperation() {
         /* Need to check which is updated */
 
         /* Update affine expression */
-        AffineExpr newExpr = updateAffineExprWithBounds(expr, index_pos, upperBound, paddedUpperBound, context);
+        AffineExpr newExpr = updateAffineExprWithBounds(expr, index_pos, upperBound, paddedUpperBound, dram_stride, context);
         map = updateAffineMapWithNewExpr(map, newExpr, expr_idx, context, forOp);
         applyOp.setMap(map);
       }
+      dmaOp->setAttr("dram_stride", builder.getArrayAttr(dram_stride));
     });
   });
 
@@ -465,7 +470,6 @@ void TestLoopPadding::runOnOperation() {
   //  i.printLog();
 
   // Create padding wrapper function
-  mlir::OpBuilder builder(module.getContext());
   // FIXME. I want to share wrapper. But validiation binary failed to provide functionality when padding is applied.
   createWrapperFunction(module, builder, prevkernelFuncType, timing_mode);
   return;
@@ -571,6 +575,7 @@ mlir::AffineExpr TestLoopPadding::updateAffineExprWithBounds(mlir::AffineExpr ex
                                             int updated_position_index,
                                             int64_t upperBound,
                                             int64_t paddedUpperBound,
+                                            SmallVector<mlir::Attribute> &dram_stride,
                                             mlir::MLIRContext *context) {
   // Collect coefficients from the AffineExpr
   auto coefficients = collectCoefficientsFromAffineExpr(expr);
@@ -585,8 +590,23 @@ mlir::AffineExpr TestLoopPadding::updateAffineExprWithBounds(mlir::AffineExpr ex
   for (int i = 0; i < static_cast<int>(coefficients.size()); ++i) {
     int64_t coeff = coefficients[i].first;
     int position = coefficients[i].second;
-    if (coeff > targetCoefficient || (coeff == targetCoefficient && position < updated_position_index))
-      coeff = (coeff / upperBound) * paddedUpperBound;
+    if (coeff > targetCoefficient || (coeff == targetCoefficient && position < updated_position_index)) {
+      int64_t new_coeff = (coeff / upperBound) * paddedUpperBound;
+      for (size_t i = 0; i < dram_stride.size(); ++i) {
+        auto intAttr = llvm::dyn_cast<mlir::IntegerAttr>(dram_stride[i]);
+        if (!intAttr) {
+          llvm::errs() << "Non-integer attribute found in dram_stride.\n";
+          continue;
+        }
+
+        int64_t value = intAttr.getInt();
+        if (value == coeff) {
+          dram_stride[i] = mlir::IntegerAttr::get(intAttr.getType(),
+                                                  new_coeff);
+        }
+      }
+      coeff = new_coeff;
+    }
     modifiedCoefficients.push_back(std::make_tuple(coeff, position));
   }
 

@@ -17,6 +17,7 @@
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Pass/PassManager.h"
+#include "mlir/Analysis/CustomDMAAttribute.h"
 
 #define CONFIG 0
 #define CONFIG2 4
@@ -63,68 +64,6 @@ char* getAsmString(unsigned func7) {
   return result;
 }
 
-llvm::SmallVector<int64_t, 2> getSubtileSize(mlir::Operation *operation) {
-  llvm::SmallVector<int64_t, 2> subtileSizes;
-  auto attr = operation->getAttr("subtile_size");
-  if (!attr) {
-    return subtileSizes; // Return empty SmallVector
-  }
-
-  if (auto arrayAttr = llvm::dyn_cast<mlir::ArrayAttr>(attr)) {
-    for (auto element : arrayAttr) {
-      // Assume the elements are integers
-      if (auto intAttr = llvm::dyn_cast<mlir::IntegerAttr>(element)) {
-        subtileSizes.push_back(intAttr.getInt());
-      } else {
-        llvm::errs() << "Unsupported element type in 'subtile_size'.\n";
-      }
-    }
-  }
-  return subtileSizes;
-}
-
-int getAsyncValue(mlir::Operation *operation) {
-  auto attr = operation->getAttr("async");
-  if (!attr)
-    return 0;
-
-  if (auto intAttr = llvm::dyn_cast<mlir::IntegerAttr>(attr))
-    return intAttr.getInt(); // Treat non-zero as true
-  else
-    return 1;
-}
-
-int is_fine_grained(mlir::Operation *operation) {
-  auto attr = operation->getAttr("fine_grained");
-  if (!attr)
-    return 0;
-
-  if (auto intAttr = llvm::dyn_cast<mlir::IntegerAttr>(attr))
-    return intAttr.getInt(); // Treat non-zero as true
-  else
-    return 1;
-}
-
-llvm::SmallVector<int64_t> getSramStride(mlir::Operation *operation) {
-  llvm::SmallVector<int64_t> sram_stride;
-  auto attr = operation->getAttr("sram_stride");
-  if (!attr) {
-    return sram_stride; // Return empty SmallVector
-  }
-
-  if (auto arrayAttr = llvm::dyn_cast<mlir::ArrayAttr>(attr)) {
-    for (auto element : arrayAttr) {
-      // Assume the elements are integers
-      if (auto intAttr = llvm::dyn_cast<mlir::IntegerAttr>(element)) {
-        sram_stride.push_back(intAttr.getInt());
-      } else {
-        llvm::errs() << "Unsupported element type in 'sram_stride'.\n";
-      }
-    }
-  }
-  return sram_stride;
-}
-
 unsigned int getElementBitWidth(mlir::Type elementType) {
   if (auto intType = mlir::dyn_cast<mlir::IntegerType>(elementType)) {
     return intType.getWidth();
@@ -162,56 +101,56 @@ struct DmaStartOpLowering : public ConvertOpToLLVMPattern<memref::DmaStartOp> {
   LogicalResult
   matchAndRewrite(memref::DmaStartOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    auto asmDialectAttr =
-      LLVM::AsmDialectAttr::get(rewriter.getContext(), LLVM::AsmDialect::AD_ATT);
-    const char* constraintStr = "r,r,~{dirflag},~{fpsr},~{flags}";
-    auto loc = op.getLoc();
-    unsigned func7;
-    llvm::SmallVector<int64_t, 2> dmaSubtile = getSubtileSize(op);
-    llvm::SmallVector<int64_t> spad_strides = getSramStride(op);
 
-    SmallVector<Value> operands;
-    for (auto val : adaptor.getOperands())
-      operands.push_back(val);
+    auto loc = op.getLoc();
+
+    // Extract source/destination operands
+    SmallVector<Value> operands(adaptor.getOperands().begin(), adaptor.getOperands().end());
     Value SrcMemref = operands[0];
+    Value DstMemref = operands[op.getSrcMemRefRank() + 1];
     auto srcMemRefType = cast<MemRefType>(op.getSrcMemRef().getType());
+    auto dstMemRefType = cast<MemRefType>(op.getDstMemRef().getType());
     ValueRange src_indices = ValueRange({operands.begin() + 1, operands.begin() + 1 + op.getSrcMemRefRank()});
     ValueRange dst_indices = ValueRange({operands.begin() + 1 + op.getSrcMemRefRank() + 1,
                                          operands.begin() + 1 + op.getSrcMemRefRank() + 1 +
                                          op.getDstMemRefRank()});
-    int elen = getElementBitWidth(srcMemRefType.getElementType());
     Value SrcPtr = getStridedElementPtr(loc, srcMemRefType, SrcMemref, src_indices, rewriter);
-    Value DstMemref = operands[op.getSrcMemRefRank() + 1];
-    auto dstMemRefType = cast<MemRefType>(op.getDstMemRef().getType());
     Value DstPtr = getStridedElementPtr(loc, dstMemRefType, DstMemref, dst_indices, rewriter);
-    Value vlane_split_axis_val = op.getStride();
-    uint64_t vlane_split_axis = extractConstantIntValue(vlane_split_axis_val);
-    Value num_elt_per_stride = op.getNumElementsPerStride();
-    uint64_t vlane_stride = extractConstantIntValue(num_elt_per_stride);
-    vlane_stride = (vlane_stride & 0x7FFF); // mask out the fine-grained bit
-    uint64_t vlane_stride_byte = vlane_stride * elen / 8;
-    Value numElements = op.getNumElements();
-    int dmaType = extractConstantIntValue(numElements);
-    Value rs1;
-    Value spad_addr;
-    llvm::ArrayRef<int64_t> tile_shape;
-    llvm::ArrayRef<int64_t> subtile_shape(dmaSubtile);
-    bool is_mvin = dmaType == MVIN || dmaType == MVIN2 || dmaType == MVIN3;
 
-    SmallVector<int64_t> mm_strides;
+    // Extract other operands
+    int elen = getElementBitWidth(srcMemRefType.getElementType());
+    Value numElements = op.getNumElements();
+    Value num_elt_per_stride = op.getNumElementsPerStride();
+    uint64_t vlane_split_axis = extractConstantIntValue(op.getStride());
+    uint64_t vlane_stride = extractConstantIntValue(num_elt_per_stride) & 0x7FFF; // mask out the fine-grained bit
+    uint64_t vlane_stride_byte = vlane_stride * elen / 8;
+    int dmaType = extractConstantIntValue(numElements);
+    bool is_mvin = dmaType == MVIN || dmaType == MVIN2 || dmaType == MVIN3;
+    if (elen < 8) {
+      if (vlane_stride_byte < 1) {
+        vlane_stride_byte = 1;
+      }
+      elen = 8;
+    }
+
+    // Extract attributes
+    SmallVector<mlir::Attribute, 2> dmaSubtile = getSubtileSize(op);
+    SmallVector<mlir::Attribute> spad_strides = getSramStride(op);
+    SmallVector<mlir::Attribute> dram_strides = getDramStride(op);
+
+    Value dram_addr;
+    Value spad_addr;
+    SmallVector<int64_t,4> tile_shape;
     ValueRange indices;
-    int64_t mm_offset;
     if (is_mvin) { // MVIN
-      rs1 = rewriter.create<LLVM::PtrToIntOp>(loc, rewriter.getI64Type(), SrcPtr);
+      dram_addr = rewriter.create<LLVM::PtrToIntOp>(loc, rewriter.getI64Type(), SrcPtr);
       spad_addr = rewriter.create<LLVM::PtrToIntOp>(loc, rewriter.getI64Type(), DstPtr);
-      tile_shape = dstMemRefType.getShape();
-      std::tie(mm_strides, mm_offset) = getStridesAndOffset(srcMemRefType);
+      tile_shape = SmallVector<int64_t,4>(dstMemRefType.getShape());
       indices = op.getSrcIndices();;
     } else { // MVOUT
-      rs1 = rewriter.create<LLVM::PtrToIntOp>(loc, rewriter.getI64Type(), DstPtr);
+      dram_addr = rewriter.create<LLVM::PtrToIntOp>(loc, rewriter.getI64Type(), DstPtr);
       spad_addr = rewriter.create<LLVM::PtrToIntOp>(loc, rewriter.getI64Type(), SrcPtr);
-      tile_shape = srcMemRefType.getShape();
-      std::tie(mm_strides, mm_offset) = getStridesAndOffset(dstMemRefType);
+      tile_shape = SmallVector<int64_t,4>(srcMemRefType.getShape());
       indices = op.getDstIndices();
     }
 
@@ -260,56 +199,53 @@ struct DmaStartOpLowering : public ConvertOpToLLVMPattern<memref::DmaStartOp> {
         }
       }
     }
-    if (is_fine_grained(op)) { // fine-grained case has more than one parent
-      index_map = AffineMap();
-      for (auto parentIndex : parentIndices) {
-        if (auto applyOp = parentIndex.getDefiningOp<affine::AffineApplyOp>()) {
-          index_map = applyOp.getAffineMap();
-        }
-      }
-    }
-
-    if (index_map) {
-      mm_strides = SmallVector<int64_t>(index_map.getNumDims(), 0);
-      // Ensure the AffineMap has at least one result
-      if (index_map.getNumResults() != 1) {
-        llvm::errs() << "AffineMap should have exactly one result.\n";
-      }
-
-      // Extract the single result expression
-      mlir::AffineExpr resultExpr = index_map.getResult(0);
-      // Traverse the result expression to calculate strides
-      resultExpr.walk([&](mlir::AffineExpr subExpr) {
-        if (auto dimExpr = subExpr.dyn_cast<mlir::AffineDimExpr>()) {
-          // Set stride for the corresponding dimension
-          mm_strides[dimExpr.getPosition()] = 1;
-        } else if (auto mulExpr = subExpr.dyn_cast<mlir::AffineBinaryOpExpr>()) {
-          // Handle multiplications
-          if (mulExpr.getKind() == mlir::AffineExprKind::Mul) {
-            if (auto dimExpr = mulExpr.getLHS().dyn_cast<mlir::AffineDimExpr>()) {
-              if (auto constExpr = mulExpr.getRHS().dyn_cast<mlir::AffineConstantExpr>()) {
-                mm_strides[dimExpr.getPosition()] = constExpr.getValue();
-              }
-            }
-          }
-        }
-      });
-    }
 
     /* Use subtile size if it has subtile attribute */
-    if (subtile_shape.size()) {
-      tile_shape = subtile_shape;
-    }
-
-    func7 = dmaType;
-
-    if (elen < 8) {
-      if (vlane_stride_byte < 1) {
-        vlane_stride_byte = 1;
+    if (dmaSubtile.size()) {
+      tile_shape.clear();
+      for (Attribute attr : dmaSubtile) {
+        auto intAttr = llvm::dyn_cast<mlir::IntegerAttr>(attr);
+        if (!intAttr) {
+          llvm::errs() << "Error: Non-integer attribute found in 'dmaSubtile'.\n";
+          return failure();
+        }
+        tile_shape.push_back(intAttr.getInt());
       }
-      elen = 8;
     }
 
+    /* Sanity check for attributes */
+    if (tile_shape.size() != dram_strides.size() ||
+      tile_shape.size() != spad_strides.size()) {
+      llvm::errs() << "Size mismatch: tile_shape, dram_strides, and spad_strides must have the same size.\n";
+      return failure();
+    }
+
+    /* Expand attributes if needed */
+    int64_t expanding_dim = MAX_TENSOR_DIM - tile_shape.size();
+    vlane_split_axis += expanding_dim;
+    SmallVector<int64_t> tensor_shape_4d(MAX_TENSOR_DIM, 1);
+    SmallVector<int64_t> dram_strides_4d(MAX_TENSOR_DIM, 0);
+    SmallVector<int64_t> spad_strides_4d(MAX_TENSOR_DIM, 0);
+
+    for (int i = 0; i < static_cast<int>(tile_shape.size()); i++) {
+      tensor_shape_4d[expanding_dim + i] = tile_shape[i];
+      auto dramAttr = llvm::dyn_cast<mlir::IntegerAttr>(dram_strides[i]);
+      auto spadAttr = llvm::dyn_cast<mlir::IntegerAttr>(spad_strides[i]);
+      if (!spadAttr || !dramAttr) {
+        llvm::errs() << "Error: Non-integer attribute found in 'dmaSubtile'.\n";
+        return failure();
+      }
+      dram_strides_4d[expanding_dim + i] = dramAttr.getInt();
+      spad_strides_4d[expanding_dim + i] = spadAttr.getInt();
+    }
+
+    /* ============================================== */
+    /* =        Inline assembly codegen phase       = */
+    /* ============================================== */
+    auto asmDialectAttr =
+      LLVM::AsmDialectAttr::get(rewriter.getContext(), LLVM::AsmDialect::AD_ATT);
+    const char* constraintStr = "r,r,~{dirflag},~{fpsr},~{flags}";
+    unsigned func7 = dmaType;
     char* asmStr = getAsmString(func7);
     // constants for shifting
     uint64_t shift14 = 14;
@@ -317,10 +253,6 @@ struct DmaStartOpLowering : public ConvertOpToLLVMPattern<memref::DmaStartOp> {
     uint64_t shift17 = 17;
     uint64_t shift32 = 32;
     uint64_t shift48 = 48;
-
-    // encoding rs2
-    // rs2 = spad_addr
-    Value rs2 = spad_addr;
 
     // config_mvin, config_mvout instructions
     func7 = CONFIG;
@@ -338,20 +270,11 @@ struct DmaStartOpLowering : public ConvertOpToLLVMPattern<memref::DmaStartOp> {
     }
 
     // config1
-    char* configAsmStr = getAsmString(func7);
-
-    // expand vlane_split_axis to 4D
-    int64_t expanding_dim = MAX_TENSOR_DIM - tile_shape.size();
-    int64_t mm_expanding_dim = mm_strides.size() == 0 ? MAX_TENSOR_DIM - 1 : MAX_TENSOR_DIM - mm_strides.size();
-    vlane_split_axis += mm_expanding_dim;
     // config_rs1 = 1st dim << 48 | 2nd dim << 32 | 3rd dim << 16 | 4th dim size
     // config_rs2 = vlane_stride << 32 | config_type << 17  | vlane_split_axis << 14 | element size
-    SmallVector<int64_t> sub_tensor_shape(MAX_TENSOR_DIM, 1);
-    for (int i = 0; i < static_cast<int>(tile_shape.size()); i++) {
-      sub_tensor_shape[expanding_dim + i] = tile_shape[i];
-    }
+    char* configAsmStr = getAsmString(func7);
     Value config_rs1 = rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr((
-      ((sub_tensor_shape[0]&0xFFFF)<<shift48) | ((sub_tensor_shape[1]&0xFFFF)<<shift32) | ((sub_tensor_shape[2]&0xFFFF)<<shift16) | ((sub_tensor_shape[3])&0xFFFF))
+      ((tensor_shape_4d[0]&0xFFFF)<<shift48) | ((tensor_shape_4d[1]&0xFFFF)<<shift32) | ((tensor_shape_4d[2]&0xFFFF)<<shift16) | ((tensor_shape_4d[3])&0xFFFF))
     ));
     Value config_rs2 = rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(
       (vlane_stride<<shift32)| ((config_type&0x3)<<shift17) | ((indirect_access&0b1)<<shift16) | ((vlane_split_axis&0x3)<<shift14) | (int(elen/8))
@@ -368,18 +291,14 @@ struct DmaStartOpLowering : public ConvertOpToLLVMPattern<memref::DmaStartOp> {
         /*operand_attrs=*/ArrayAttr());
 
     // config2
-    char* config2AsmStr = getAsmString(CONFIG2);
     // config_rs1 = 1st dim stride << 32 | 2nd dim stride
     // config_rs2 = 3rd dim stride << 32 | 4th dim stride
-    SmallVector<int64_t> mm_strides_4d(MAX_TENSOR_DIM, 0);
-    for (int i = 0; i < static_cast<int>(mm_strides.size()); i++) {
-      mm_strides_4d[mm_expanding_dim + i] = mm_strides[i];
-    }
+    char* config2AsmStr = getAsmString(CONFIG2);
     config_rs1 = rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(
-      (mm_strides_4d[0]<<shift32) | (mm_strides_4d[1]&0xFFFFFFFF)
+      (dram_strides_4d[0]<<shift32) | (dram_strides_4d[1]&0xFFFFFFFF)
     ));
     config_rs2 = rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(
-      (mm_strides_4d[2]<<shift32) | (mm_strides_4d[3]&0xFFFFFFFF)
+      (dram_strides_4d[2]<<shift32) | (dram_strides_4d[3]&0xFFFFFFFF)
     ));
     rewriter.create<LLVM::InlineAsmOp>(
         loc,
@@ -393,13 +312,9 @@ struct DmaStartOpLowering : public ConvertOpToLLVMPattern<memref::DmaStartOp> {
         /*operand_attrs=*/ArrayAttr());
 
     // config3
-    char* config3AsmStr = getAsmString(CONFIG3);
     // config_rs1 = 1st dim spad_stride << 32 | 2nd dim spad_stride
     // config_rs2 = 3rd dim spad_stride << 32 | 4th dim spad_stride
-    SmallVector<int64_t> spad_strides_4d(MAX_TENSOR_DIM, 0);
-    for (int i = 0; i < static_cast<int>(spad_strides.size()); i++) {
-      spad_strides_4d[expanding_dim + i] = spad_strides[i];
-    }
+    char* config3AsmStr = getAsmString(CONFIG3);
     config_rs1 = rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(
       (spad_strides_4d[0]<<shift32) | (spad_strides_4d[1]&0xFFFFFFFF)
     ));
@@ -436,7 +351,7 @@ struct DmaStartOpLowering : public ConvertOpToLLVMPattern<memref::DmaStartOp> {
     }
     rewriter.replaceOpWithNewOp<LLVM::InlineAsmOp>(op,
         /*resultTypes=*/TypeRange(),
-        /*operands=*/ValueRange({rs1, rs2}),
+        /*operands=*/ValueRange({dram_addr, spad_addr}),
         /*asm_string=*/asmStr,
         /*constraints=*/constraintStr,
         /*has_side_effects=*/true,
