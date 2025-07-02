@@ -59,24 +59,28 @@ struct DmaFineGrained : public PassWrapper<DmaFineGrained, OperationPass<func::F
 void DmaFineGrained::runOnOperation() {
   auto func = getOperation();
   OpBuilder builder(func.getContext());
-  bool hasMatmul = false;
-  Value matmulResult, matmulInput, matmulWeight;
-  llvm::ArrayRef<int64_t> input_tile_shape, weight_tile_shape, output_tile_shape;
-  func.walk([&](linalg::MatmulOp matmulOp) {
-    hasMatmul = true;
-    matmulResult = matmulOp.getOutputs()[0];
-    matmulInput = matmulOp.getInputs()[0];
-    matmulWeight = matmulOp.getInputs()[1];
-  });
-  if (!hasMatmul) // only apply to functions with matmul
-    return;
-  int64_t tileSizeK, tileSizeN, tileSizeM, tileSizeK_H, tileSizeK_W, tileSizeH, tileSizeW, tileSizeO_H, tileSizeO_W;
   builder.setInsertionPointToStart(&func.front());
   Value zeroIndex = builder.create<arith::ConstantIndexOp>(func.getLoc(), 0);
 
+  // -------------------------------
+  // Extract informations
+  // -------------------------------
+  linalg::MatmulOp matmulOp;
+  func.walk([&](linalg::MatmulOp op) {
+    if (!matmulOp)
+      matmulOp = op;
+  });
+
+  if (!matmulOp) // only apply to functions with matmul
+    return;
+
+  // Extract inputs and outputs
+  Value matmulResult = matmulOp.getOutputs()[0];
+  Value matmulInput = matmulOp.getInputs()[0];
+  Value matmulWeight = matmulOp.getInputs()[1];
+
   // outer loop step modify
-  std::vector<affine::AffineForOp> accumulationLoops;
-  std::vector<affine::AffineForOp> outerLoops;
+  std::vector<affine::AffineForOp> accumulationLoops, outerLoops;
   int loopDepth = 0;
   func.walk([&](affine::AffineForOp loop) {
     // Adjust the step size based on loop depth
@@ -94,28 +98,73 @@ void DmaFineGrained::runOnOperation() {
     }
   });
 
+  llvm::ArrayRef<int64_t> input_tile_shape, weight_tile_shape, output_tile_shape;
+  int64_t tileSizeK = 0, tileSizeN = 0, tileSizeM = 0;
+  Value loop_M, loop_N, loop_K;
+  int64_t tileSizeK_H = 0, tileSizeK_W = 0, tileSizeH = 0, tileSizeW = 0;
+  int64_t tileSizeO_H = 0, tileSizeO_W = 0;
+
   // Retrieve tile info
   if (accumulationLoops.size() == 2) {
     tileSizeK = accumulationLoops.at(0).getStepAsInt();
     tileSizeN = accumulationLoops.at(1).getStepAsInt();
     tileSizeM = outerLoops.at(0).getStepAsInt();
+    loop_K = accumulationLoops.at(0).getInductionVar();
+    loop_N = accumulationLoops.at(1).getInductionVar();
+    loop_M = outerLoops.at(0).getInductionVar();
   } else {
     tileSizeK = accumulationLoops.front().getStepAsInt();
+    loop_K = accumulationLoops.front().getInductionVar();
     auto m_attr = outerLoops.at(1)->getAttr("loop_m");
     auto n_attr = outerLoops.at(1)->getAttr("loop_n");
     if (m_attr) {
       tileSizeM = outerLoops.at(1).getStepAsInt();
       tileSizeN = outerLoops.at(0).getStepAsInt();
+      loop_M = outerLoops.at(1).getInductionVar();
+      loop_N = outerLoops.at(0).getInductionVar();
     } else if (n_attr) {
       tileSizeN = outerLoops.at(1).getStepAsInt();
       tileSizeM = outerLoops.at(0).getStepAsInt();
+      loop_N = outerLoops.at(1).getInductionVar();
+      loop_M = outerLoops.at(0).getInductionVar();
     } else {
       /* Default. We assume that M is the outer-most loop */
       tileSizeN = outerLoops.at(0).getStepAsInt();
       tileSizeM = outerLoops.at(1).getStepAsInt();
+      loop_N = outerLoops.at(0).getInductionVar();
+      loop_M = outerLoops.at(1).getInductionVar();
     }
   }
 
+
+  // inner loop fine-grained dma
+  SmallVector<memref::DmaStartOp, 2> dmaOps;
+  func.walk([&](memref::DmaStartOp dmaStartOp) {
+    dmaOps.push_back(dmaStartOp);
+  });
+
+  // check Bias is moved to Output buffer
+  bool is_bias = false;
+  memref::DmaStartOp mvin_bias, mvin_input, mvin_weight;
+  for(auto dmaOp : dmaOps) {
+    int dmaType = getConstantIntValue(dmaOp.getNumElements());
+    if (dmaType == MVOUT)
+      continue;
+
+    if (traverseOperands(matmulInput, dmaOp.getDstMemRef())) {
+      mvin_input = dmaOp;
+    } else if (traverseOperands(matmulWeight, dmaOp.getDstMemRef())) {
+      mvin_weight = dmaOp;
+    } else if (traverseOperands(matmulResult, dmaOp.getDstMemRef())) {
+      if (getSubtileSize(dmaOp).size() > 1) {
+        mvin_bias = dmaOp;
+        is_bias = true;
+      }
+    }
+  }
+  // -------------------------------
+  // Pattern Matching
+  // -------------------------------
   bool is_bmm = false, is_conv2d = false;
   if (loopDepth == 4) { // bmm has 4 loops (b, m, n, k)
     is_bmm = true;
@@ -125,35 +174,12 @@ void DmaFineGrained::runOnOperation() {
     func.emitError() << "Unsupported loop depth: " << loopDepth;
     return;
   }
-  // inner loop fine-grained dma
-  SmallVector<memref::DmaStartOp, 2> dmaOps;
-  func.walk([&](memref::DmaStartOp dmaStartOp) {
-    dmaOps.push_back(dmaStartOp);
-  });
+  if (!getAsyncValue(mvin_input) & !getAsyncValue(mvin_weight))
+    return; // no async dma
 
-  // check Bias is moved to Output buffer
-  bool is_bias = false;
-  memref::DmaStartOp mvin_bias;
-  memref::DmaStartOp mvin_input;
-  memref::DmaStartOp mvin_weight;
-
-  for(auto dmaOp : dmaOps) {
-    Value numElements = dmaOp.getNumElements();
-    int dmaType = getConstantIntValue(numElements);
-    if (dmaType != MVOUT) {
-      if (traverseOperands(matmulInput, dmaOp.getDstMemRef())) {
-        mvin_input = dmaOp;
-      } else if (traverseOperands(matmulWeight, dmaOp.getDstMemRef())) {
-        mvin_weight = dmaOp;
-      } else if (traverseOperands(matmulResult, dmaOp.getDstMemRef())) {
-        if (getSubtileSize(dmaOp).size() > 1) { // TODO: bias needs subtiling?
-          mvin_bias = dmaOp;
-          is_bias = true;
-        }
-      }
-    }
-  }
-
+  // -------------------------------
+  // Code Generation
+  // -------------------------------
   Value i, j, k, k_w, k_h, w, h; // subtile loops indices
   SmallVector<Value> src_indices;
   SmallVector<Value> dst_indices;
@@ -171,10 +197,6 @@ void DmaFineGrained::runOnOperation() {
   llvm::SmallVector<mlir::Attribute> dma2DramStrides = getDramStride(mvin_weight);
   int dma1Async = getAsyncValue(mvin_input);
   int dma2Async = getAsyncValue(mvin_weight);
-  if (!dma1Async && !dma2Async) {
-    return; // no async dma
-  }
-
   NamedAttrList dma1Attr;
   NamedAttrList dma2Attr;
 
@@ -295,12 +317,12 @@ void DmaFineGrained::runOnOperation() {
     int64_t subTileSizeM = llvm::dyn_cast<mlir::IntegerAttr>(dmaSubtile[dmaSubtile.size() - 2]).getInt();
     int64_t subTileSizeN = llvm::dyn_cast<mlir::IntegerAttr>(dmaSubtile.back()).getInt();
     auto loopN = builder.create<affine::AffineForOp>(loc, 0, tileSizeN, subTileSizeN);
-    loopN->setAttr("inner_loop", builder.getBoolAttr(true));
     builder.setInsertionPointToStart(loopN.getBody());
-    j = loopN.getInductionVar();
     auto loopM = builder.create<affine::AffineForOp>(loc, 0, tileSizeM, subTileSizeM);
-    loopM->setAttr("inner_loop", builder.getBoolAttr(true));
     builder.setInsertionPointToStart(loopM.getBody());
+    loopN->setAttr("inner_loop", builder.getBoolAttr(true));
+    loopM->setAttr("inner_loop", builder.getBoolAttr(true));
+    j = loopN.getInductionVar();
     i = loopM.getInductionVar();
     srcIndices = mvin_bias.getSrcIndices();
     for (auto index : srcIndices) {
@@ -312,8 +334,10 @@ void DmaFineGrained::runOnOperation() {
     Value dram_idx;
     if (dram_map) {
       dram_idx = builder.create<affine::AffineApplyOp>(loc, dram_map, new_src_indices);
-    } else {
+    } else if (srcIndices[0] == loop_N) {
       dram_idx = j;
+    } else {
+      dram_idx = i;
     }
     dram_idx = builder.create<affine::AffineApplyOp>(loc, sum_map, ValueRange{dram_idx, srcIndices[0]});
     src_indices.push_back(dram_idx);
