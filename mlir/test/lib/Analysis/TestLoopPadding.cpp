@@ -586,10 +586,12 @@ mlir::AffineExpr TestLoopPadding::updateAffineExprWithBounds(mlir::AffineExpr ex
   //llvm::dbgs() << "Target coeff: " << targetCoefficient << "\n";
   //llvm::dbgs() << "Upper: " << upperBound << "\n";
   //llvm::dbgs() << "PaddedUpper: " << paddedUpperBound << "\n";
+  //llvm::dbgs() << "TargetPos: " << updated_position_index << "\n";
 
   for (int i = 0; i < static_cast<int>(coefficients.size()); ++i) {
     int64_t coeff = coefficients[i].first;
     int position = coefficients[i].second;
+    //llvm::errs() << "coeff:" << coeff << " pos: " << position << "\n";
     if (coeff > targetCoefficient || (coeff == targetCoefficient && position < updated_position_index)) {
       int64_t new_coeff = (coeff / upperBound) * paddedUpperBound;
       for (size_t i = 0; i < dram_stride.size(); ++i) {
@@ -600,10 +602,8 @@ mlir::AffineExpr TestLoopPadding::updateAffineExprWithBounds(mlir::AffineExpr ex
         }
 
         int64_t value = intAttr.getInt();
-        if (value == coeff) {
-          dram_stride[i] = mlir::IntegerAttr::get(intAttr.getType(),
-                                                  new_coeff);
-        }
+        if (value == coeff)
+          dram_stride[i] = mlir::IntegerAttr::get(intAttr.getType(), new_coeff);
       }
       coeff = new_coeff;
     }

@@ -80,23 +80,37 @@ void DmaFineGrained::runOnOperation() {
   Value matmulWeight = matmulOp.getInputs()[1];
 
   // outer loop step modify
-  std::vector<affine::AffineForOp> accumulationLoops, outerLoops;
+  affine::AffineForOp affineLoopM, affineLoopN,affineLoopK;
   int loopDepth = 0;
   func.walk([&](affine::AffineForOp loop) {
     // Adjust the step size based on loop depth
     if (auto attr = loop->getAttrOfType<BoolAttr>("accumulation_loop")) {
-      accumulationLoops.push_back(loop);
       loopDepth++;
     }
     if (auto attr = loop->getAttrOfType<BoolAttr>("outer_loop")) {
-      outerLoops.push_back(loop);
       loopDepth++;
     }
     if (auto attr = loop->getAttrOfType<BoolAttr>("inner_loop")) {
       if (attr.getValue())
         loopDepth++;
     }
+    // Handle subtile_loop attributes and map them to the correct affine loops
+    if (auto subtile_attr = loop->getAttrOfType<StringAttr>("subtile_loop")) {
+      std::string subtile_loop_str = subtile_attr.getValue().str();
+      if (subtile_loop_str == "m") {
+        affineLoopM = loop;
+      } else if (subtile_loop_str == "n") {
+        affineLoopN = loop;
+      } else if (subtile_loop_str == "k") {
+        affineLoopK = loop;
+      }
+    }
   });
+
+  if (!affineLoopM || !affineLoopN || !affineLoopK) {
+    func.emitError("Failed to find subtile_loop attribute...");
+    return;
+  }
 
   llvm::ArrayRef<int64_t> input_tile_shape, weight_tile_shape, output_tile_shape;
   int64_t tileSizeK = 0, tileSizeN = 0, tileSizeM = 0;
@@ -105,37 +119,9 @@ void DmaFineGrained::runOnOperation() {
   int64_t tileSizeO_H = 0, tileSizeO_W = 0;
 
   // Retrieve tile info
-  if (accumulationLoops.size() == 2) {
-    tileSizeK = accumulationLoops.at(0).getStepAsInt();
-    tileSizeN = accumulationLoops.at(1).getStepAsInt();
-    tileSizeM = outerLoops.at(0).getStepAsInt();
-    loop_K = accumulationLoops.at(0).getInductionVar();
-    loop_N = accumulationLoops.at(1).getInductionVar();
-    loop_M = outerLoops.at(0).getInductionVar();
-  } else {
-    tileSizeK = accumulationLoops.front().getStepAsInt();
-    loop_K = accumulationLoops.front().getInductionVar();
-    auto m_attr = outerLoops.at(1)->getAttr("loop_m");
-    auto n_attr = outerLoops.at(1)->getAttr("loop_n");
-    if (m_attr) {
-      tileSizeM = outerLoops.at(1).getStepAsInt();
-      tileSizeN = outerLoops.at(0).getStepAsInt();
-      loop_M = outerLoops.at(1).getInductionVar();
-      loop_N = outerLoops.at(0).getInductionVar();
-    } else if (n_attr) {
-      tileSizeN = outerLoops.at(1).getStepAsInt();
-      tileSizeM = outerLoops.at(0).getStepAsInt();
-      loop_N = outerLoops.at(1).getInductionVar();
-      loop_M = outerLoops.at(0).getInductionVar();
-    } else {
-      /* Default. We assume that M is the outer-most loop */
-      tileSizeN = outerLoops.at(0).getStepAsInt();
-      tileSizeM = outerLoops.at(1).getStepAsInt();
-      loop_N = outerLoops.at(0).getInductionVar();
-      loop_M = outerLoops.at(1).getInductionVar();
-    }
-  }
-
+  tileSizeK = affineLoopK.getStepAsInt();
+  tileSizeN = affineLoopN.getStepAsInt();
+  tileSizeM = affineLoopM.getStepAsInt();
 
   // inner loop fine-grained dma
   SmallVector<memref::DmaStartOp, 2> dmaOps;
@@ -223,9 +209,7 @@ void DmaFineGrained::runOnOperation() {
   } else {
     mvin_input.emitError() << "subtile_size attribute required for matmul.\n";
   }
-  if (dma1Subtile.size() == 3) {
-    mvin_input.emitError() << "3D input attribute is not supported.\n";
-  } else if (is_input_4d_subtile) {
+  if (is_input_4d_subtile) {
     subTileSizeH = llvm::dyn_cast<mlir::IntegerAttr>(dma1Subtile[0]).getInt();
     subTileSizeW = llvm::dyn_cast<mlir::IntegerAttr>(dma1Subtile[1]).getInt();
     auto dstMemRefType = cast<MemRefType>(mvin_input.getDstMemRef().getType());
@@ -237,9 +221,7 @@ void DmaFineGrained::runOnOperation() {
   } else if (dma1Subtile.size() > 4) {
     mvin_input.emitError() << "more than 4D input attribute is not supported.\n";
   }
-  if (dma2Subtile.size() == 3) {
-    mvin_weight.emitError() << "3D weight subtile size is not supported\n";
-  } else if (is_weight_4d_subtile) {
+  if (is_weight_4d_subtile) {
     subTileSizeK_H = llvm::dyn_cast<mlir::IntegerAttr>(dma2Subtile[0]).getInt();
     subTileSizeK_W = llvm::dyn_cast<mlir::IntegerAttr>(dma2Subtile[1]).getInt();
     auto dstMemRefType = cast<MemRefType>(mvin_weight.getDstMemRef().getType());
@@ -298,10 +280,10 @@ void DmaFineGrained::runOnOperation() {
     auto dstMemRefType = cast<MemRefType>(mvin_bias.getDstMemRef().getType());
     output_tile_shape = dstMemRefType.getShape();
     if (is_conv2d) {
-      tileSizeO_H = output_tile_shape[0];
-      tileSizeO_W = output_tile_shape[1];
-      subTileSizeO_H = llvm::dyn_cast<mlir::IntegerAttr>(dmaSubtile[0]).getInt();
-      subTileSizeO_W = llvm::dyn_cast<mlir::IntegerAttr>(dmaSubtile[1]).getInt();
+      tileSizeO_H = output_tile_shape[2];
+      tileSizeO_W = output_tile_shape[3];
+      subTileSizeO_H = llvm::dyn_cast<mlir::IntegerAttr>(dmaSubtile[2]).getInt();
+      subTileSizeO_W = llvm::dyn_cast<mlir::IntegerAttr>(dmaSubtile[3]).getInt();
       // Create 2 nested affine.for loops for O_H x O_W Outputs
       auto loopK_H = builder.create<affine::AffineForOp>(loc, 0, tileSizeO_H, subTileSizeO_H);
       loopK_H->setAttr("inner_loop", builder.getBoolAttr(true));
@@ -312,10 +294,6 @@ void DmaFineGrained::runOnOperation() {
       builder.setInsertionPointToStart(loopK_W.getBody());
       w = loopK_W.getInductionVar();
     }
-    int64_t tileSizeM = output_tile_shape[output_tile_shape.size() - 2];
-    int64_t tileSizeN = output_tile_shape[output_tile_shape.size() - 1];
-    int64_t subTileSizeM = llvm::dyn_cast<mlir::IntegerAttr>(dmaSubtile[dmaSubtile.size() - 2]).getInt();
-    int64_t subTileSizeN = llvm::dyn_cast<mlir::IntegerAttr>(dmaSubtile.back()).getInt();
     auto loopN = builder.create<affine::AffineForOp>(loc, 0, tileSizeN, subTileSizeN);
     builder.setInsertionPointToStart(loopN.getBody());
     auto loopM = builder.create<affine::AffineForOp>(loc, 0, tileSizeM, subTileSizeM);
@@ -334,10 +312,13 @@ void DmaFineGrained::runOnOperation() {
     Value dram_idx;
     if (dram_map) {
       dram_idx = builder.create<affine::AffineApplyOp>(loc, dram_map, new_src_indices);
-    } else if (srcIndices[0] == loop_N) {
+    } else if (srcIndices[0] == affineLoopN.getInductionVar()) {
       dram_idx = j;
-    } else {
+    } else if (srcIndices[0] == affineLoopM.getInductionVar()) {
       dram_idx = i;
+    } else {
+      mvin_bias.emitError("Failed to match bias index");
+      return;
     }
     dram_idx = builder.create<affine::AffineApplyOp>(loc, sum_map, ValueRange{dram_idx, srcIndices[0]});
     src_indices.push_back(dram_idx);
@@ -370,7 +351,7 @@ void DmaFineGrained::runOnOperation() {
 
   // Get insertion point for new loops
   auto loc = mvin_input.getLoc();
-  builder.setInsertionPoint(mvin_input);
+  builder.setInsertionPointAfter(mvin_weight);
 
   if (is_weight_4d_subtile && is_input_4d_subtile && is_conv2d) {
     // Create 4 nested affine.for loops for KxK CONV kernels & HxW Outputs
@@ -430,8 +411,6 @@ void DmaFineGrained::runOnOperation() {
   // calculate the spad address & tag idx
   int64_t tag_k_stride = ((tileSizeM+subTileSizeM-1) / subTileSizeM);
   if (is_input_4d_subtile) {
-    dst_indices.push_back(zeroIndex);
-    dst_indices.push_back(zeroIndex);
     new_spad_map = build4DSpadMap(builder, tileSizeW, tileSizeM, tileSizeK);
     new_dst_indices = {h, w, k, i};
     int64_t tag_w_stride = tag_k_stride * ((tileSizeK+subTileSizeK-1) / subTileSizeK);
@@ -443,7 +422,8 @@ void DmaFineGrained::runOnOperation() {
     new_tag_map = AffineMap::get(2, 0 , builder.getAffineDimExpr(0) * tag_k_stride + builder.getAffineDimExpr(1));
   }
   auto dst_idx = builder.create<affine::AffineApplyOp>(loc, new_spad_map, new_dst_indices);
-  dst_indices.push_back(zeroIndex);
+  for (int i=0; i<dma1Subtile.size()-1;i++)
+    dst_indices.push_back(zeroIndex);
   dst_indices.push_back(dst_idx);
   tag_indices.push_back(builder.create<affine::AffineApplyOp>(loc, new_tag_map, new_dst_indices));
   buildDmaOp(builder, loc, mvin_input, src_indices, dst_indices, tag_indices, dma1Attr);
@@ -473,8 +453,6 @@ void DmaFineGrained::runOnOperation() {
 
   int64_t tag_j_stride = ((tileSizeK+subTileSizeK-1) / subTileSizeK);
   if (is_weight_4d_subtile) {
-    dst_indices.push_back(zeroIndex);
-    dst_indices.push_back(zeroIndex);
     new_dst_indices = {k_h, k_w, j, k};
     new_spad_map = build4DSpadMap(builder, tileSizeK_W, tileSizeK, tileSizeN);
     int64_t tag_w_stride = tag_j_stride * ((tileSizeN+subTileSizeN-1) / subTileSizeN);
@@ -487,7 +465,8 @@ void DmaFineGrained::runOnOperation() {
   }
 
   dst_idx = builder.create<affine::AffineApplyOp>(loc, new_spad_map, new_dst_indices);
-  dst_indices.push_back(zeroIndex);
+  for (int i=0; i<dma2Subtile.size()-1;i++)
+    dst_indices.push_back(zeroIndex);
   dst_indices.push_back(dst_idx);
   tag_indices.push_back(builder.create<affine::AffineApplyOp>(loc, new_tag_map, new_dst_indices));
   buildDmaOp(builder, loc, mvin_weight, src_indices, dst_indices, tag_indices, dma2Attr);

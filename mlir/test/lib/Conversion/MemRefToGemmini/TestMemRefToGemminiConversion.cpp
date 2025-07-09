@@ -216,6 +216,9 @@ struct DmaStartOpLowering : public ConvertOpToLLVMPattern<memref::DmaStartOp> {
     /* Sanity check for attributes */
     if (tile_shape.size() != dram_strides.size() ||
       tile_shape.size() != spad_strides.size()) {
+      llvm::errs() << "Size: " << tile_shape.size() << "\n";
+      llvm::errs() << "Size: " << dram_strides.size() << "\n";
+      llvm::errs() << "Size: " << spad_strides.size() << "\n";
       llvm::errs() << "Size mismatch: tile_shape, dram_strides, and spad_strides must have the same size.\n";
       return failure();
     }
