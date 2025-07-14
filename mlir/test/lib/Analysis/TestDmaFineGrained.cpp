@@ -166,7 +166,7 @@ void DmaFineGrained::runOnOperation() {
   // -------------------------------
   // Code Generation
   // -------------------------------
-  Value i, j, k, k_w, k_h, w, h; // subtile loops indices
+  Value subLoopVarM, subLoopVarN, subLoopVarK, subLoopVarKW, subLoopVarKH, subLoopVarW, subLoopVarH; // subtile loops indices
   SmallVector<Value> src_indices;
   SmallVector<Value> dst_indices;
   SmallVector<Value> tag_indices;
@@ -285,42 +285,42 @@ void DmaFineGrained::runOnOperation() {
       subTileSizeO_H = llvm::dyn_cast<mlir::IntegerAttr>(dmaSubtile[2]).getInt();
       subTileSizeO_W = llvm::dyn_cast<mlir::IntegerAttr>(dmaSubtile[3]).getInt();
       // Create 2 nested affine.for loops for O_H x O_W Outputs
-      auto loopK_H = builder.create<affine::AffineForOp>(loc, 0, tileSizeO_H, subTileSizeO_H);
-      loopK_H->setAttr("inner_loop", builder.getBoolAttr(true));
-      builder.setInsertionPointToStart(loopK_H.getBody());
-      h = loopK_H.getInductionVar();
-      auto loopK_W = builder.create<affine::AffineForOp>(loc, 0, tileSizeO_W, subTileSizeO_W);
-      loopK_W->setAttr("inner_loop", builder.getBoolAttr(true));
-      builder.setInsertionPointToStart(loopK_W.getBody());
-      w = loopK_W.getInductionVar();
+      auto subLoopH = builder.create<affine::AffineForOp>(loc, 0, tileSizeO_H, subTileSizeO_H);
+      builder.setInsertionPointToStart(subLoopH.getBody());
+      auto subLoopW = builder.create<affine::AffineForOp>(loc, 0, tileSizeO_W, subTileSizeO_W);
+      builder.setInsertionPointToStart(subLoopW.getBody());
+      subLoopH->setAttr("inner_loop", builder.getBoolAttr(true));
+      subLoopW->setAttr("inner_loop", builder.getBoolAttr(true));
+      subLoopVarH = subLoopH.getInductionVar();
+      subLoopVarW = subLoopW.getInductionVar();
     }
-    auto loopN = builder.create<affine::AffineForOp>(loc, 0, tileSizeN, subTileSizeN);
-    builder.setInsertionPointToStart(loopN.getBody());
-    auto loopM = builder.create<affine::AffineForOp>(loc, 0, tileSizeM, subTileSizeM);
-    builder.setInsertionPointToStart(loopM.getBody());
-    loopN->setAttr("inner_loop", builder.getBoolAttr(true));
-    loopM->setAttr("inner_loop", builder.getBoolAttr(true));
-    j = loopN.getInductionVar();
-    i = loopM.getInductionVar();
+    auto subLoopN = builder.create<affine::AffineForOp>(loc, 0, tileSizeN, subTileSizeN);
+    builder.setInsertionPointToStart(subLoopN.getBody());
+    auto subLoopM = builder.create<affine::AffineForOp>(loc, 0, tileSizeM, subTileSizeM);
+    builder.setInsertionPointToStart(subLoopM.getBody());
+    subLoopN->setAttr("inner_loop", builder.getBoolAttr(true));
+    subLoopM->setAttr("inner_loop", builder.getBoolAttr(true));
+    subLoopVarN = subLoopN.getInductionVar();
+    subLoopVarM = subLoopM.getInductionVar();
     srcIndices = mvin_bias.getSrcIndices();
     for (auto index : srcIndices) {
       if (auto applyOp = index.getDefiningOp<affine::AffineApplyOp>()) {
         dram_map = applyOp.getAffineMap();
       }
     }
-    new_src_indices = {i, j}; // bmm has no bias
+    new_src_indices = {subLoopVarM, subLoopVarN}; // bmm has no bias
     Value dram_idx;
     if (dram_map) {
       // FiXME. This is not a good solution but works for now.
       if (dram_map && dram_map.getNumDims() == 4) {
-        new_src_indices.insert(new_src_indices.begin(), zeroIndex);
-        new_src_indices.insert(new_src_indices.begin(), zeroIndex);
+        new_src_indices.push_back(zeroIndex);
+        new_src_indices.push_back(zeroIndex);
       }
       dram_idx = builder.create<affine::AffineApplyOp>(loc, dram_map, new_src_indices);
     } else if (srcIndices[0] == affineLoopN.getInductionVar()) {
-      dram_idx = j;
+      dram_idx = subLoopVarN;
     } else if (srcIndices[0] == affineLoopM.getInductionVar()) {
-      dram_idx = i;
+      dram_idx = subLoopVarM;
     } else {
       mvin_bias.emitError("Failed to match bias index");
       return;
@@ -332,14 +332,14 @@ void DmaFineGrained::runOnOperation() {
       dst_indices.push_back(zeroIndex);
       dst_indices.push_back(zeroIndex);
       new_spad_map = build4DSpadMap(builder, tileSizeO_W, tileSizeM, tileSizeN);
-      new_dst_indices = {h, w, j, i};
+      new_dst_indices = {subLoopVarH, subLoopVarW, subLoopVarN, subLoopVarM};
       int64_t tag_w_stride = tag_j_stride * ((tileSizeN+subTileSizeN-1) / subTileSizeN);
       int64_t tag_h_stride = tag_w_stride * ((tileSizeO_W+subTileSizeO_W-1) / subTileSizeO_W);
       new_tag_map = AffineMap::get(4, 0, builder.getAffineDimExpr(0) * tag_h_stride + builder.getAffineDimExpr(1) * tag_w_stride + builder.getAffineDimExpr(2) * tag_j_stride + builder.getAffineDimExpr(3));
     } else {
       new_spad_map = AffineMap::get(2, 0, buildAffineDimExpr(builder, 0, tileSizeM) + builder.getAffineDimExpr(1));
       new_tag_map = AffineMap::get(2, 0, builder.getAffineDimExpr(0) * tag_j_stride + builder.getAffineDimExpr(1));
-      new_dst_indices = {j, i};
+      new_dst_indices = {subLoopVarN, subLoopVarM};
     }
     auto dst_idx = builder.create<affine::AffineApplyOp>(loc, new_spad_map, new_dst_indices);
 
@@ -361,35 +361,35 @@ void DmaFineGrained::runOnOperation() {
   if (is_weight_4d_subtile && is_input_4d_subtile && is_conv2d) {
     // Create 4 nested affine.for loops for KxK CONV kernels & HxW Outputs
     auto loopK_H = builder.create<affine::AffineForOp>(loc, 0, tileSizeK_H, subTileSizeK_H);
-    loopK_H->setAttr("inner_loop", builder.getBoolAttr(true));
     builder.setInsertionPointToStart(loopK_H.getBody());
-    k_h = loopK_H.getInductionVar();
     auto loopK_W = builder.create<affine::AffineForOp>(loc, 0, tileSizeK_W, subTileSizeK_W);
-    loopK_W->setAttr("inner_loop", builder.getBoolAttr(true));
     builder.setInsertionPointToStart(loopK_W.getBody());
-    k_w = loopK_W.getInductionVar();
     auto loopH = builder.create<affine::AffineForOp>(loc, 0, tileSizeH, subTileSizeH);
-    loopH->setAttr("inner_loop", builder.getBoolAttr(true));
     builder.setInsertionPointToStart(loopH.getBody());
-    h = loopH.getInductionVar();
     auto loopW = builder.create<affine::AffineForOp>(loc, 0, tileSizeW, subTileSizeW);
-    loopW->setAttr("inner_loop", builder.getBoolAttr(true));
     builder.setInsertionPointToStart(loopW.getBody());
-    w = loopW.getInductionVar();
+    loopK_H->setAttr("inner_loop", builder.getBoolAttr(true));
+    loopK_W->setAttr("inner_loop", builder.getBoolAttr(true));
+    loopH->setAttr("inner_loop", builder.getBoolAttr(true));
+    loopW->setAttr("inner_loop", builder.getBoolAttr(true));
+    subLoopVarKH = loopK_H.getInductionVar();
+    subLoopVarKW = loopK_W.getInductionVar();
+    subLoopVarH = loopH.getInductionVar();
+    subLoopVarW = loopW.getInductionVar();
   }
   // Create three nested affine.for loops
-  auto loopM = builder.create<affine::AffineForOp>(loc, 0, tileSizeM, subTileSizeM);
-  loopM->setAttr("inner_loop", builder.getBoolAttr(true));
-  builder.setInsertionPointToStart(loopM.getBody());
-  i = loopM.getInductionVar();
-  auto loopK = builder.create<affine::AffineForOp>(loc, 0, tileSizeK, subTileSizeK);
-  loopK->setAttr("inner_loop", builder.getBoolAttr(true));
-  builder.setInsertionPointToStart(loopK.getBody());
-  k = loopK.getInductionVar();
-  auto loopN = builder.create<affine::AffineForOp>(loc, 0, tileSizeN, subTileSizeN);
-  loopN->setAttr("inner_loop", builder.getBoolAttr(true));
-  builder.setInsertionPointToStart(loopN.getBody());
-  j = loopN.getInductionVar();
+  auto subLoopM = builder.create<affine::AffineForOp>(loc, 0, tileSizeM, subTileSizeM);
+  builder.setInsertionPointToStart(subLoopM.getBody());
+  auto subLoopK = builder.create<affine::AffineForOp>(loc, 0, tileSizeK, subTileSizeK);
+  builder.setInsertionPointToStart(subLoopK.getBody());
+  auto subLoopN = builder.create<affine::AffineForOp>(loc, 0, tileSizeN, subTileSizeN);
+  builder.setInsertionPointToStart(subLoopN.getBody());
+  subLoopM->setAttr("inner_loop", builder.getBoolAttr(true));
+  subLoopK->setAttr("inner_loop", builder.getBoolAttr(true));
+  subLoopN->setAttr("inner_loop", builder.getBoolAttr(true));
+  subLoopVarM = subLoopM.getInductionVar();
+  subLoopVarK = subLoopK.getInductionVar();
+  subLoopVarN = subLoopN.getInductionVar();
 
   // src_indices = dram index, dst_indices = spad index
   // calculate the dram address
@@ -400,13 +400,13 @@ void DmaFineGrained::runOnOperation() {
     }
   }
   if (is_bmm) {
-    new_src_indices = {zeroIndex, i, k}; // other approach is make sub map using only i, k
+    new_src_indices = {zeroIndex, subLoopVarM, subLoopVarK}; // other approach is make sub map using only i, k
   } else if (is_input_4d_subtile && is_conv2d) {
-    new_src_indices = {h, w, i, k};
+    new_src_indices = {subLoopVarH, subLoopVarW, subLoopVarM, subLoopVarK};
   } else if (is_conv2d) {
-    new_src_indices = {zeroIndex, zeroIndex, i, k};
+    new_src_indices = {zeroIndex, zeroIndex, subLoopVarM, subLoopVarK};
   } else {
-    new_src_indices = {i, k};
+    new_src_indices = {subLoopVarM, subLoopVarK};
   }
   auto dram_idx = builder.create<affine::AffineApplyOp>(loc, dram_map, new_src_indices);
   // Total dram idx = Big Tile idx(srcIndices[0]) + Sub Tile idx(dram_idx)
@@ -417,13 +417,13 @@ void DmaFineGrained::runOnOperation() {
   int64_t tag_k_stride = ((tileSizeM+subTileSizeM-1) / subTileSizeM);
   if (is_input_4d_subtile) {
     new_spad_map = build4DSpadMap(builder, tileSizeW, tileSizeM, tileSizeK);
-    new_dst_indices = {h, w, k, i};
+    new_dst_indices = {subLoopVarH, subLoopVarW, subLoopVarK, subLoopVarM};
     int64_t tag_w_stride = tag_k_stride * ((tileSizeK+subTileSizeK-1) / subTileSizeK);
     int64_t tag_h_stride = tag_w_stride * ((tileSizeW+subTileSizeW-1) / subTileSizeW);
     new_tag_map = AffineMap::get(4, 0, builder.getAffineDimExpr(0) * tag_h_stride + builder.getAffineDimExpr(1) * tag_w_stride + builder.getAffineDimExpr(2) * tag_k_stride + builder.getAffineDimExpr(3));
   } else {
     new_spad_map = AffineMap::get(2, 0, buildAffineDimExpr(builder, 0, tileSizeM) + builder.getAffineDimExpr(1));
-    new_dst_indices = {k, i};
+    new_dst_indices = {subLoopVarK, subLoopVarM};
     new_tag_map = AffineMap::get(2, 0 , builder.getAffineDimExpr(0) * tag_k_stride + builder.getAffineDimExpr(1));
   }
   auto dst_idx = builder.create<affine::AffineApplyOp>(loc, new_spad_map, new_dst_indices);
@@ -444,13 +444,13 @@ void DmaFineGrained::runOnOperation() {
     }
   }
   if (is_bmm) {
-    new_src_indices = {zeroIndex, k, j};
+    new_src_indices = {zeroIndex, subLoopVarK, subLoopVarN};
   } else if (is_weight_4d_subtile && is_conv2d) {
-    new_src_indices = {k_h, k_w, k, j};
+    new_src_indices = {subLoopVarKH, subLoopVarKW, subLoopVarK, subLoopVarN};
   } else if (is_conv2d) {
-    new_src_indices = {zeroIndex, k, j};
+    new_src_indices = {zeroIndex, subLoopVarK, subLoopVarN};
   } else {
-    new_src_indices = {k, j};
+    new_src_indices = {subLoopVarK, subLoopVarN};
   }
   dram_idx = builder.create<affine::AffineApplyOp>(loc, dram_map, new_src_indices);
   dram_idx = builder.create<affine::AffineApplyOp>(loc, sum_map, ValueRange{dram_idx, srcIndices[0]});
@@ -458,13 +458,13 @@ void DmaFineGrained::runOnOperation() {
 
   int64_t tag_j_stride = ((tileSizeK+subTileSizeK-1) / subTileSizeK);
   if (is_weight_4d_subtile) {
-    new_dst_indices = {k_h, k_w, j, k};
+    new_dst_indices = {subLoopVarKH, subLoopVarKW, subLoopVarN, subLoopVarK};
     new_spad_map = build4DSpadMap(builder, tileSizeK_W, tileSizeK, tileSizeN);
     int64_t tag_w_stride = tag_j_stride * ((tileSizeN+subTileSizeN-1) / subTileSizeN);
     int64_t tag_h_stride = tag_w_stride * ((tileSizeK_W+subTileSizeK_W-1) / subTileSizeK_W);
     new_tag_map = AffineMap::get(4, 0, builder.getAffineDimExpr(0) * tag_h_stride + builder.getAffineDimExpr(1) * tag_w_stride + builder.getAffineDimExpr(2) * tag_j_stride + builder.getAffineDimExpr(3));
   } else {
-    new_dst_indices = {j, k};
+    new_dst_indices = {subLoopVarN, subLoopVarK};
     new_spad_map = AffineMap::get(2, 0, buildAffineDimExpr(builder, 0, tileSizeK) + builder.getAffineDimExpr(1));
     new_tag_map = AffineMap::get(2, 0 , builder.getAffineDimExpr(0) * tag_j_stride + builder.getAffineDimExpr(1));
   }
