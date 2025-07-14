@@ -311,6 +311,11 @@ void DmaFineGrained::runOnOperation() {
     new_src_indices = {i, j}; // bmm has no bias
     Value dram_idx;
     if (dram_map) {
+      // FiXME. This is not a good solution but works for now.
+      if (dram_map && dram_map.getNumDims() == 4) {
+        new_src_indices.insert(new_src_indices.begin(), zeroIndex);
+        new_src_indices.insert(new_src_indices.begin(), zeroIndex);
+      }
       dram_idx = builder.create<affine::AffineApplyOp>(loc, dram_map, new_src_indices);
     } else if (srcIndices[0] == affineLoopN.getInductionVar()) {
       dram_idx = j;
