@@ -19,37 +19,12 @@
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Analysis/CustomDMAAttribute.h"
 
-#define CONFIG 0
-#define CONFIG2 4
-#define CONFIG3 5
-#define CONFIG4 6
-#define MVIN 2
-#define MVIN2 1
-#define MVIN3 14
-#define MVOUT 3
-
-#define CONFIG_MVIN 0
-#define CONFIG_MVIN2 1
-#define CONFIG_MVIN3 2
-#define CONFIG_MVOUT 3
-
 #define MAX_TENSOR_DIM 4
 
 namespace mlir {
 namespace {
 
 int64_t VECTOR_LANE = 128;
-
-int extractConstantIntValue(Value val) {
-  int val_int;
-  if (auto constOp = val.getDefiningOp<arith::ConstantOp>()) {
-    Attribute constantAttr = constOp.getValue();
-    if (auto intAttr = llvm::dyn_cast<IntegerAttr>(constantAttr)) {
-      val_int = intAttr.getInt();
-    }
-  }
-  return val_int;
-}
 
 char* getAsmString(unsigned func7) {
   // return ".insn r CUSTOM_1, 0x3, " + std::to_string(func7) + ", x0, $0, $1";
@@ -119,12 +94,11 @@ struct DmaStartOpLowering : public ConvertOpToLLVMPattern<memref::DmaStartOp> {
 
     // Extract other operands
     int elen = getElementBitWidth(srcMemRefType.getElementType());
-    Value numElements = op.getNumElements();
     Value num_elt_per_stride = op.getNumElementsPerStride();
-    uint64_t vlane_split_axis = extractConstantIntValue(op.getStride());
-    uint64_t vlane_stride = extractConstantIntValue(num_elt_per_stride) & 0x7FFF; // mask out the fine-grained bit
+    uint64_t vlane_split_axis = getVlaneSplitAxis(op);
+    uint64_t vlane_stride = getVlaneStride(op);
     uint64_t vlane_stride_byte = vlane_stride * elen / 8;
-    int dmaType = extractConstantIntValue(numElements);
+    int dmaType = getDMAType(op);
     bool is_mvin = dmaType == MVIN || dmaType == MVIN2 || dmaType == MVIN3;
     if (elen < 8) {
       if (vlane_stride_byte < 1) {
