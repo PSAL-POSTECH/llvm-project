@@ -12,6 +12,7 @@
 #include "mlir/Pass/Pass.h"
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Analysis/CustomDMAAttribute.h"
+#include "mlir/IR/IRMapping.h"
 
 #define MVIN 2
 #define MVIN2 1
@@ -48,14 +49,13 @@ struct DmaFineGrained : public PassWrapper<DmaFineGrained, OperationPass<func::F
                           llvm::cl::init(128)};
   void runOnOperation() override;
   bool traverseOperands(Value op_val, Value input);
-  void buildDmaOp(OpBuilder &builder, Location loc, memref::DmaStartOp op, SmallVector<Value> src_indices,
-                  SmallVector<Value> dst_indices, SmallVector<Value> tag_indices, NamedAttrList attr);
-  AffineExpr buildAffineDimExpr(OpBuilder &builder, int idx, int64_t tileSize);
-  AffineMap build4DSpadMap(OpBuilder &builder, int64_t tileSize1, int64_t tileSize2, int64_t tileSize3);
   AffineMap buildSramAffineMap(OpBuilder &builder, memref::DmaStartOp op);
   AffineMap buildDramAffineMap(OpBuilder &builder, memref::DmaStartOp op);
   FailureOr<SmallVector<Value>> buildSubtileLoop(memref::DmaStartOp dmaOp, OpBuilder &builder, ArrayRef<int64_t> loopOrder, AffineMap& tagMap);
-  FailureOr<SmallVector<Value>> createSubtileDMA(memref::DmaStartOp dmaOp, ArrayRef<int64_t> loopOrder, OpBuilder &builder);
+  FailureOr<std::pair<SmallVector<Value>, memref::DmaStartOp>> createSubtileDMA(memref::DmaStartOp dmaOp, ArrayRef<int64_t> loopOrder, OpBuilder &builder);
+  FailureOr<SmallVector<Value>> fuseSubtileLoops(
+    OpBuilder &builder, SmallVector<Value> lhsLoopVars, SmallVector<Value> rhsLoopVars,
+    ArrayRef<Block *> loopBodies, std::vector<std::vector<Value>> &loopGroups);
 };
 
 } // namespace
@@ -63,8 +63,6 @@ struct DmaFineGrained : public PassWrapper<DmaFineGrained, OperationPass<func::F
 void DmaFineGrained::runOnOperation() {
   auto func = getOperation();
   OpBuilder builder(func.getContext());
-  builder.setInsertionPointToStart(&func.front());
-  Value zeroIndex = builder.create<arith::ConstantIndexOp>(func.getLoc(), 0);
 
   // -------------------------------
   // Extract informations
@@ -74,7 +72,6 @@ void DmaFineGrained::runOnOperation() {
     if (!matmulOp)
       matmulOp = op;
   });
-
   if (!matmulOp) // only apply to functions with matmul
     return;
 
@@ -82,50 +79,6 @@ void DmaFineGrained::runOnOperation() {
   Value matmulResult = matmulOp.getOutputs()[0];
   Value matmulInput = matmulOp.getInputs()[0];
   Value matmulWeight = matmulOp.getInputs()[1];
-
-  // outer loop step modify
-  affine::AffineForOp affineLoopM, affineLoopN,affineLoopK;
-  int loopDepth = 0;
-  func.walk([&](affine::AffineForOp loop) {
-    // Adjust the step size based on loop depth
-    if (auto attr = loop->getAttrOfType<BoolAttr>("accumulation_loop")) {
-      loopDepth++;
-    }
-    if (auto attr = loop->getAttrOfType<BoolAttr>("outer_loop")) {
-      loopDepth++;
-    }
-    if (auto attr = loop->getAttrOfType<BoolAttr>("inner_loop")) {
-      if (attr.getValue())
-        loopDepth++;
-    }
-    // Handle subtile_loop attributes and map them to the correct affine loops
-    if (auto subtile_attr = loop->getAttrOfType<StringAttr>("subtile_loop")) {
-      std::string subtile_loop_str = subtile_attr.getValue().str();
-      if (subtile_loop_str == "m") {
-        affineLoopM = loop;
-      } else if (subtile_loop_str == "n") {
-        affineLoopN = loop;
-      } else if (subtile_loop_str == "k") {
-        affineLoopK = loop;
-      }
-    }
-  });
-
-  if (!affineLoopM || !affineLoopN || !affineLoopK) {
-    func.emitError("Failed to find subtile_loop attribute...");
-    return;
-  }
-
-  llvm::ArrayRef<int64_t> input_tile_shape, weight_tile_shape, dmaBiasTileShape;
-  int64_t tileSizeK = 0, tileSizeN = 0, tileSizeM = 0;
-  Value loop_M, loop_N, loop_K;
-  int64_t tileSizeK_H = 0, tileSizeK_W = 0, tileSizeH = 0, tileSizeW = 0;
-  int64_t tileSizeO_H = 0, tileSizeO_W = 0;
-
-  // Retrieve tile info
-  tileSizeK = affineLoopK.getStepAsInt();
-  tileSizeN = affineLoopN.getStepAsInt();
-  tileSizeM = affineLoopM.getStepAsInt();
 
   // inner loop fine-grained dma
   SmallVector<memref::DmaStartOp, 2> dmaOps;
@@ -152,100 +105,15 @@ void DmaFineGrained::runOnOperation() {
       }
     }
   }
-  // -------------------------------
-  // Pattern Matching
-  // -------------------------------
-  bool is_bmm = false, is_conv2d = false;
-  if (loopDepth == 4) { // bmm has 4 loops (b, m, n, k)
-    is_bmm = true;
-  } else if (loopDepth > 9) { // conv2d has 7 loops (b, kh, kw, oh, ow, oc, ic)
-    is_conv2d = true;
-  } else if (loopDepth != 3) {
-    func.emitError() << "Unsupported loop depth: " << loopDepth;
-    return;
-  }
   if (!getAsyncValue(mvin_input) & !getAsyncValue(mvin_weight))
     return; // no async dma
 
   // -------------------------------
   // Code Generation
   // -------------------------------
-  Value subLoopVarM, subLoopVarN, subLoopVarK, subLoopVarKW, subLoopVarKH, subLoopVarW, subLoopVarH; // subtile loops indices
-  SmallVector<Value> src_indices;
-  SmallVector<Value> dst_indices;
-  SmallVector<Value> tag_indices;
-  AffineMap dram_map, new_spad_map, new_tag_map;
-  SmallVector<Value> new_src_indices, new_dst_indices;
-  ValueRange srcIndices;
-  // sum_map = affine_map<(d0, d1) -> (d0 + d1)>
-  auto sum_map = AffineMap::get(2, 0, builder.getAffineDimExpr(0) + builder.getAffineDimExpr(1));
-  llvm::SmallVector<mlir::Attribute> dma1Subtile = getSubtileSize(mvin_input);
-  llvm::SmallVector<mlir::Attribute> dma2Subtile = getSubtileSize(mvin_weight);
-  llvm::SmallVector<mlir::Attribute> dma1SramStrides = getSramStride(mvin_input);
-  llvm::SmallVector<mlir::Attribute> dma2SramStrides = getSramStride(mvin_weight);
-  llvm::SmallVector<mlir::Attribute> dma1DramStrides = getDramStride(mvin_input);
-  llvm::SmallVector<mlir::Attribute> dma2DramStrides = getDramStride(mvin_weight);
-  int dma1Async = getAsyncValue(mvin_input);
-  int dma2Async = getAsyncValue(mvin_weight);
-  NamedAttrList dma1Attr = getDmaAttrs(mvin_input, builder);
-  NamedAttrList dma2Attr = getDmaAttrs(mvin_weight, builder);
-
-  int64_t subTileSizeM, subTileSizeN, subTileSizeK, subTileSizeK_H, subTileSizeK_W, subTileSizeH, subTileSizeW, subTileSizeO_H, subTileSizeO_W;
-  bool is_weight_4d_subtile = dma2Subtile.size() == 4;
-  bool is_input_4d_subtile = dma1Subtile.size() == 4;
-
-  // Sanity check
-  if (dma1Subtile.size() > 1 && dma2Subtile.size() > 1) {
-    if (auto intAttr1 = llvm::dyn_cast<mlir::IntegerAttr>(dma1Subtile.back())) {
-      if (auto intAttr2 = llvm::dyn_cast<mlir::IntegerAttr>(dma2Subtile[dma2Subtile.size() - 2]))
-        if (intAttr1.getInt() != intAttr2.getInt()) {
-          mvin_weight.emitError() << " Not matched: "
-                          << "dma1Subtile[-1] = " << intAttr1.getInt()
-                          << ", dma2Subtile[-2] = " << intAttr2.getInt()
-                          << "\n";
-        } else {
-          subTileSizeK = intAttr1.getInt();
-        }
-      else
-        mvin_weight.emitError() << "dma2Subtile[-1] is not an IntegerAttr.\n";
-    } else
-      mvin_input.emitError() << "dma1Subtile[-2] is not an IntegerAttr.\n";
-  } else {
-    mvin_input.emitError() << "subtile_size attribute required for matmul.\n";
-  }
-  if (is_input_4d_subtile) {
-    subTileSizeH = llvm::dyn_cast<mlir::IntegerAttr>(dma1Subtile[0]).getInt();
-    subTileSizeW = llvm::dyn_cast<mlir::IntegerAttr>(dma1Subtile[1]).getInt();
-    auto dstMemRefType = cast<MemRefType>(mvin_input.getDstMemRef().getType());
-    input_tile_shape = dstMemRefType.getShape();
-    tileSizeH = input_tile_shape[0];
-    tileSizeW = input_tile_shape[1];
-    tileSizeM = input_tile_shape[2];
-    tileSizeK = input_tile_shape[3];
-  } else if (dma1Subtile.size() > 4) {
-    mvin_input.emitError() << "more than 4D input attribute is not supported.\n";
-  }
-  if (is_weight_4d_subtile) {
-    subTileSizeK_H = llvm::dyn_cast<mlir::IntegerAttr>(dma2Subtile[0]).getInt();
-    subTileSizeK_W = llvm::dyn_cast<mlir::IntegerAttr>(dma2Subtile[1]).getInt();
-    auto dstMemRefType = cast<MemRefType>(mvin_weight.getDstMemRef().getType());
-    weight_tile_shape = dstMemRefType.getShape();
-    tileSizeK_H = weight_tile_shape[0];
-    tileSizeK_W = weight_tile_shape[1];
-    tileSizeK = weight_tile_shape[2];
-    tileSizeN = weight_tile_shape[3];
-  } else if (dma2Subtile.size() > 4) {
-    mvin_weight.emitError() << "more than 4D weight attribute is not supported.\n";
-  }
-  if (is_conv2d && (weight_tile_shape[2] != input_tile_shape[3])) {
-    mvin_weight.emitError() << "Weight K dimension must match Input K dimension.\n";
-  }
-  subTileSizeM = llvm::dyn_cast<mlir::IntegerAttr>(dma1Subtile[dma1Subtile.size() - 2]).getInt();
-  subTileSizeN = llvm::dyn_cast<mlir::IntegerAttr>(dma2Subtile.back()).getInt();
-
   if (is_bias) {
     // BIAS MVIN
-    unsigned rank = mvin_bias.getDstMemRef().getType().cast<MemRefType>().getRank();
+    unsigned rank = llvm::dyn_cast<MemRefType>(mvin_bias.getDstMemRef().getType()).getRank();
     llvm::SmallVector<int64_t> loopOrder;
     // FIXME. loopOrder is hardcoded for 2D and 4D bias subtile
     if (rank == 2) {
@@ -256,134 +124,69 @@ void DmaFineGrained::runOnOperation() {
       mvin_bias.emitError("Unsupported memref rank: expected 2 or 4.");
       return;
     }
-    auto loopVarOuts = createSubtileDMA(mvin_bias, loopOrder, builder);
+    (void)createSubtileDMA(mvin_bias, loopOrder, builder);
   }
 
-  // Get insertion point for new loops
-  auto loc = mvin_input.getLoc();
-  builder.setInsertionPointAfter(mvin_weight);
+  unsigned rank;
+  llvm::SmallVector<int64_t> inputLoopOrder, weightLoopOrder;
+  rank = llvm::dyn_cast<MemRefType>(mvin_input.getDstMemRef().getType()).getRank();
+  // FIXME. loopOrder is hardcoded for 2D and 4D bias subtile
+  // Note that this order was determined empirically
+  if (rank == 2) {
+    inputLoopOrder = {0, 1};
+    weightLoopOrder = {1, 0};
+  } else if (rank == 3) {
+    inputLoopOrder = {0, 1, 2};
+    weightLoopOrder = {0, 2, 1};
+  } else if (rank == 4) {
+    inputLoopOrder = {0, 1, 2, 3};
+    weightLoopOrder = {0, 1, 3, 2};
+  }
+  auto [inputLoopVarOuts, inputDmaOp] = createSubtileDMA(mvin_input, inputLoopOrder, builder).value();
+  auto [weightLoopVarOuts, weightDmaOp] = createSubtileDMA(mvin_weight, weightLoopOrder, builder).value();
 
-  if (is_weight_4d_subtile && is_input_4d_subtile && is_conv2d) {
-    // Create 4 nested affine.for loops for KxK CONV kernels & HxW Outputs
-    auto loopK_H = builder.create<affine::AffineForOp>(loc, 0, tileSizeK_H, subTileSizeK_H);
-    builder.setInsertionPointToStart(loopK_H.getBody());
-    auto loopK_W = builder.create<affine::AffineForOp>(loc, 0, tileSizeK_W, subTileSizeK_W);
-    builder.setInsertionPointToStart(loopK_W.getBody());
-    auto loopH = builder.create<affine::AffineForOp>(loc, 0, tileSizeH, subTileSizeH);
-    builder.setInsertionPointToStart(loopH.getBody());
-    auto loopW = builder.create<affine::AffineForOp>(loc, 0, tileSizeW, subTileSizeW);
-    builder.setInsertionPointToStart(loopW.getBody());
-    loopK_H->setAttr("inner_loop", builder.getBoolAttr(true));
-    loopK_W->setAttr("inner_loop", builder.getBoolAttr(true));
-    loopH->setAttr("inner_loop", builder.getBoolAttr(true));
-    loopW->setAttr("inner_loop", builder.getBoolAttr(true));
-    subLoopVarKH = loopK_H.getInductionVar();
-    subLoopVarKW = loopK_W.getInductionVar();
-    subLoopVarH = loopH.getInductionVar();
-    subLoopVarW = loopW.getInductionVar();
-  }
-  // Create three nested affine.for loops
-  auto subLoopM = builder.create<affine::AffineForOp>(loc, 0, tileSizeM, subTileSizeM);
-  builder.setInsertionPointToStart(subLoopM.getBody());
-  auto subLoopK = builder.create<affine::AffineForOp>(loc, 0, tileSizeK, subTileSizeK);
-  builder.setInsertionPointToStart(subLoopK.getBody());
-  auto subLoopN = builder.create<affine::AffineForOp>(loc, 0, tileSizeN, subTileSizeN);
-  builder.setInsertionPointToStart(subLoopN.getBody());
-  subLoopM->setAttr("inner_loop", builder.getBoolAttr(true));
-  subLoopK->setAttr("inner_loop", builder.getBoolAttr(true));
-  subLoopN->setAttr("inner_loop", builder.getBoolAttr(true));
-  subLoopVarM = subLoopM.getInductionVar();
-  subLoopVarK = subLoopK.getInductionVar();
-  subLoopVarN = subLoopN.getInductionVar();
+  SmallVector<Block *> loopBodies = {inputDmaOp.getOperation()->getBlock(), weightDmaOp.getOperation()->getBlock()};
+  std::vector<std::vector<Value>> loopGroups;
+  auto outermostInputLoop = llvm::dyn_cast<affine::AffineForOp>(mlir::isa<BlockArgument>(inputLoopVarOuts.front())
+      ? llvm::dyn_cast<BlockArgument>(inputLoopVarOuts.front()).getOwner()->getParent()->getParentOp()
+      : nullptr);
+  auto outermostWeightLoop = llvm::dyn_cast<affine::AffineForOp>(mlir::isa<BlockArgument>(weightLoopVarOuts.front())
+      ? llvm::dyn_cast<BlockArgument>(weightLoopVarOuts.front()).getOwner()->getParent()->getParentOp()
+      : nullptr);
 
-  // src_indices = dram index, dst_indices = spad index
-  // calculate the dram address
-  srcIndices = mvin_input.getSrcIndices();
-  for (auto index : srcIndices) {
-    if (auto applyOp = index.getDefiningOp<affine::AffineApplyOp>()) {
-      dram_map = applyOp.getAffineMap();
-    }
-  }
-  if (is_bmm) {
-    new_src_indices = {zeroIndex, subLoopVarM, subLoopVarK}; // other approach is make sub map using only i, k
-  } else if (is_input_4d_subtile && is_conv2d) {
-    new_src_indices = {subLoopVarH, subLoopVarW, subLoopVarM, subLoopVarK};
-  } else if (is_conv2d) {
-    new_src_indices = {zeroIndex, zeroIndex, subLoopVarM, subLoopVarK};
-  } else {
-    new_src_indices = {subLoopVarM, subLoopVarK};
-  }
-  auto dram_idx = builder.create<affine::AffineApplyOp>(loc, dram_map, new_src_indices);
-  // Total dram idx = Big Tile idx(srcIndices[0]) + Sub Tile idx(dram_idx)
-  dram_idx = builder.create<affine::AffineApplyOp>(loc, sum_map, ValueRange{dram_idx, srcIndices[0]});
-  src_indices.push_back(dram_idx);
-
-  // calculate the spad address & tag idx
-  int64_t tag_k_stride = ((tileSizeM+subTileSizeM-1) / subTileSizeM);
-  if (is_input_4d_subtile) {
-    new_spad_map = build4DSpadMap(builder, tileSizeW, tileSizeM, tileSizeK);
-    new_dst_indices = {subLoopVarH, subLoopVarW, subLoopVarK, subLoopVarM};
-    int64_t tag_w_stride = tag_k_stride * ((tileSizeK+subTileSizeK-1) / subTileSizeK);
-    int64_t tag_h_stride = tag_w_stride * ((tileSizeW+subTileSizeW-1) / subTileSizeW);
-    new_tag_map = AffineMap::get(4, 0, builder.getAffineDimExpr(0) * tag_h_stride + builder.getAffineDimExpr(1) * tag_w_stride + builder.getAffineDimExpr(2) * tag_k_stride + builder.getAffineDimExpr(3));
-  } else {
-    new_spad_map = AffineMap::get(2, 0, buildAffineDimExpr(builder, 0, tileSizeM) + builder.getAffineDimExpr(1));
-    new_dst_indices = {subLoopVarK, subLoopVarM};
-    new_tag_map = AffineMap::get(2, 0 , builder.getAffineDimExpr(0) * tag_k_stride + builder.getAffineDimExpr(1));
-  }
-  auto dst_idx = builder.create<affine::AffineApplyOp>(loc, new_spad_map, new_dst_indices);
-  for (int i=0; i<dma1Subtile.size()-1;i++)
-    dst_indices.push_back(zeroIndex);
-  dst_indices.push_back(dst_idx);
-  tag_indices.push_back(builder.create<affine::AffineApplyOp>(loc, new_tag_map, new_dst_indices));
-  buildDmaOp(builder, loc, mvin_input, src_indices, dst_indices, tag_indices, dma1Attr);
-  src_indices.clear();
-  dst_indices.clear();
-  tag_indices.clear();
-
-  // Insert the second dma_start operation
-  srcIndices = mvin_weight.getSrcIndices();
-  for (auto index : srcIndices) {
-    if (auto applyOp = index.getDefiningOp<affine::AffineApplyOp>()) {
-      dram_map = applyOp.getAffineMap();
-    }
-  }
-  if (is_bmm) {
-    new_src_indices = {zeroIndex, subLoopVarK, subLoopVarN};
-  } else if (is_weight_4d_subtile && is_conv2d) {
-    new_src_indices = {subLoopVarKH, subLoopVarKW, subLoopVarK, subLoopVarN};
-  } else if (is_conv2d) {
-    new_src_indices = {zeroIndex, subLoopVarK, subLoopVarN};
-  } else {
-    new_src_indices = {subLoopVarK, subLoopVarN};
-  }
-  dram_idx = builder.create<affine::AffineApplyOp>(loc, dram_map, new_src_indices);
-  dram_idx = builder.create<affine::AffineApplyOp>(loc, sum_map, ValueRange{dram_idx, srcIndices[0]});
-  src_indices.push_back(dram_idx);;
-
-  int64_t tag_j_stride = ((tileSizeK+subTileSizeK-1) / subTileSizeK);
-  if (is_weight_4d_subtile) {
-    new_dst_indices = {subLoopVarKH, subLoopVarKW, subLoopVarN, subLoopVarK};
-    new_spad_map = build4DSpadMap(builder, tileSizeK_W, tileSizeK, tileSizeN);
-    int64_t tag_w_stride = tag_j_stride * ((tileSizeN+subTileSizeN-1) / subTileSizeN);
-    int64_t tag_h_stride = tag_w_stride * ((tileSizeK_W+subTileSizeK_W-1) / subTileSizeK_W);
-    new_tag_map = AffineMap::get(4, 0, builder.getAffineDimExpr(0) * tag_h_stride + builder.getAffineDimExpr(1) * tag_w_stride + builder.getAffineDimExpr(2) * tag_j_stride + builder.getAffineDimExpr(3));
-  } else {
-    new_dst_indices = {subLoopVarN, subLoopVarK};
-    new_spad_map = AffineMap::get(2, 0, buildAffineDimExpr(builder, 0, tileSizeK) + builder.getAffineDimExpr(1));
-    new_tag_map = AffineMap::get(2, 0 , builder.getAffineDimExpr(0) * tag_j_stride + builder.getAffineDimExpr(1));
+  /* Set fused loop order */
+  builder.setInsertionPointAfter(outermostWeightLoop);
+  if (rank == 2) {
+    loopGroups = {
+        {inputLoopVarOuts[0]},
+        {inputLoopVarOuts[1], weightLoopVarOuts[0]}, // K dim will be fused
+        {weightLoopVarOuts[1]}
+    };
+  } else if (rank == 3) {
+    loopGroups = {
+        {inputLoopVarOuts[0], weightLoopVarOuts[0]}, // Batch dim will be fused
+        {inputLoopVarOuts[1]},
+        {inputLoopVarOuts[2], weightLoopVarOuts[1]}, // K dim will be fused
+        {weightLoopVarOuts[2]}
+    };
+  } else if (rank == 4) {
+    loopGroups = {
+        {inputLoopVarOuts[0]},
+        {inputLoopVarOuts[1]},
+        {weightLoopVarOuts[0]},
+        {weightLoopVarOuts[1]},
+        {inputLoopVarOuts[2]},
+        {inputLoopVarOuts[3], weightLoopVarOuts[2]}, // K dim wil be fused
+        {weightLoopVarOuts[3]}
+    };
   }
 
-  dst_idx = builder.create<affine::AffineApplyOp>(loc, new_spad_map, new_dst_indices);
-  for (int i=0; i<dma2Subtile.size()-1;i++)
-    dst_indices.push_back(zeroIndex);
-  dst_indices.push_back(dst_idx);
-  tag_indices.push_back(builder.create<affine::AffineApplyOp>(loc, new_tag_map, new_dst_indices));
-  buildDmaOp(builder, loc, mvin_weight, src_indices, dst_indices, tag_indices, dma2Attr);
+  // Fuse the subtile loops
+  (void)fuseSubtileLoops(builder, inputLoopVarOuts, weightLoopVarOuts, loopBodies, loopGroups);
 
-  // Erase the original dma_start operations
-  mvin_input.erase();
-  mvin_weight.erase();
+  // Erase subtile loops
+  outermostInputLoop.erase();
+  outermostWeightLoop.erase();
 }
 
 bool DmaFineGrained::traverseOperands(Value op_val, Value input) {
@@ -403,36 +206,6 @@ bool DmaFineGrained::traverseOperands(Value op_val, Value input) {
   return found;
 }
 
-void DmaFineGrained::buildDmaOp(OpBuilder &builder, Location loc, memref::DmaStartOp op, SmallVector<Value> src_indices,
-                                SmallVector<Value> dst_indices, SmallVector<Value> tag_indices, NamedAttrList attr) {
-  auto src_map = builder.getMultiDimIdentityMap(src_indices.size());
-  auto dst_map = builder.getMultiDimIdentityMap(dst_indices.size());
-  auto tag_map = builder.getMultiDimIdentityMap(tag_indices.size());
-  auto maybeExpandedSrcMap = affine::expandAffineMap(builder, loc, src_map, src_indices);
-  auto maybeExpandedDstMap = affine::expandAffineMap(builder, loc, dst_map, dst_indices);
-  auto maybeExpandedTagMap = affine::expandAffineMap(builder, loc, tag_map, tag_indices);
-  builder.create<memref::DmaStartOp>(
-      loc, op.getSrcMemRef(), *maybeExpandedSrcMap, op.getDstMemRef(),
-      *maybeExpandedDstMap, op.getNumElements(), op.getTagMemRef(),
-      *maybeExpandedTagMap, op.getStride(), op.getNumElementsPerStride(),
-      attr);
-}
-
-AffineExpr DmaFineGrained::buildAffineDimExpr(OpBuilder &builder, int idx, int64_t tileSize) {
-  if (tileSize / systolicSize == 0)
-    return builder.getAffineDimExpr(idx).floorDiv(systolicSize / tileSize);
-  else
-    return builder.getAffineDimExpr(idx) * (tileSize / systolicSize);
-}
-
-AffineMap DmaFineGrained::build4DSpadMap(OpBuilder &builder, int64_t tileSize1, int64_t tileSize2, int64_t tileSize3) {
-  int64_t vectorlane = systolicSize;
-  int64_t spad_1_stride = tileSize2 * ((tileSize3 + vectorlane - 1) / vectorlane);
-  int64_t spad_0_stride = spad_1_stride * tileSize1;
-  AffineMap spad_map = AffineMap::get(4, 0, builder.getAffineDimExpr(0) * spad_0_stride + builder.getAffineDimExpr(1) * spad_1_stride + buildAffineDimExpr(builder, 2, tileSize2) + builder.getAffineDimExpr(3));
-  return spad_map;
-}
-
 AffineMap DmaFineGrained::buildSramAffineMap(OpBuilder &builder, memref::DmaStartOp op) {
   int64_t vectorlane = systolicSize;
   SmallVector<int64_t, 4> tile_shape = getTileShape(op);
@@ -440,12 +213,13 @@ AffineMap DmaFineGrained::buildSramAffineMap(OpBuilder &builder, memref::DmaStar
   int64_t vlane_split_axis = getVlaneSplitAxis(op);
   int64_t vlane_stride = getVlaneStride(op);
   int64_t target_stride;
+  int64_t nr_outerloop;
   int64_t old_size, new_size;
 
   target_stride = llvm::dyn_cast<mlir::IntegerAttr>(tile_stride[vlane_split_axis]).getInt();
   old_size = tile_shape[vlane_split_axis];
-  new_size = (old_size + vectorlane*vlane_stride - 1) / (vectorlane*vlane_stride);
-  new_size /= vectorlane;
+  nr_outerloop = (old_size + vectorlane*vlane_stride - 1) / (vectorlane*vlane_stride);
+  new_size = nr_outerloop * vlane_stride;
 
   // Dynamically compute scaled strides based on the vector size
   SmallVector<AffineExpr, 4> exprs;
@@ -454,10 +228,10 @@ AffineMap DmaFineGrained::buildSramAffineMap(OpBuilder &builder, memref::DmaStar
     if (stride > target_stride) {
       stride = stride / old_size * new_size;
     }
-    if (i != vlane_split_axis)
+    if (i != static_cast<size_t>(vlane_split_axis))
       exprs.push_back(builder.getAffineDimExpr(i) * stride);
     else
-      exprs.push_back((builder.getAffineDimExpr(i) * stride).floorDiv(vectorlane));
+      exprs.push_back(builder.getAffineDimExpr(i).floorDiv(vectorlane) * stride);
   }
   AffineExpr combinedExpr = exprs[0];
   for (size_t i = 1; i < exprs.size(); ++i) {
@@ -473,7 +247,7 @@ AffineMap DmaFineGrained::buildDramAffineMap(OpBuilder &builder, memref::DmaStar
 
   AffineExpr expr = builder.getAffineConstantExpr(0);
   for (unsigned i = 0; i < rank; ++i) {
-    int64_t stride = dramStride[i].cast<IntegerAttr>().getInt();
+    int64_t stride = llvm::dyn_cast<IntegerAttr>(dramStride[i]).getInt();
     expr = expr + getAffineDimExpr(i, ctx) * builder.getAffineConstantExpr(stride);
   }
 
@@ -489,7 +263,7 @@ FailureOr<SmallVector<Value>> DmaFineGrained::buildSubtileLoop(
   unsigned rank = tileSizes.size();
   llvm::SmallVector<int64_t> subTileSizes;
   for (auto attr : getSubtileSize(dmaOp)) {
-    if (auto intAttr = attr.dyn_cast<IntegerAttr>()) {
+    if (auto intAttr = llvm::dyn_cast<IntegerAttr>(attr)) {
       subTileSizes.push_back(intAttr.getInt());
     } else {
       dmaOp->emitError("Non-integer subtile_size element.");
@@ -517,7 +291,6 @@ FailureOr<SmallVector<Value>> DmaFineGrained::buildSubtileLoop(
   // Begin constructing nested affine.for loops
   subLoopVarsOut.resize(rank, nullptr);
   builder.setInsertionPoint(dmaOp);  // Safe initial insertion point
-  Operation *insertPoint = dmaOp;
 
   for (unsigned orderIdx = 0; orderIdx <rank; ++orderIdx) {
     unsigned dim = loopOrder[orderIdx];
@@ -528,7 +301,6 @@ FailureOr<SmallVector<Value>> DmaFineGrained::buildSubtileLoop(
     loop->setAttr("inner_loop", builder.getBoolAttr(true));
     subLoopVarsOut[dim] = loop.getInductionVar();
     builder.setInsertionPointToStart(loop.getBody());
-    insertPoint = loop;
   }
 
   // Now create a unique tag
@@ -550,17 +322,18 @@ FailureOr<SmallVector<Value>> DmaFineGrained::buildSubtileLoop(
   return subLoopVarsOut;
 }
 
-FailureOr<SmallVector<Value>> DmaFineGrained::createSubtileDMA(memref::DmaStartOp dmaOp,
+FailureOr<std::pair<SmallVector<Value>, memref::DmaStartOp>> DmaFineGrained::createSubtileDMA(memref::DmaStartOp dmaOp,
                                                     ArrayRef<int64_t> loopOrder,
                                                     OpBuilder &builder) {
   Location loc = dmaOp.getLoc();
+  builder.setInsertionPoint(dmaOp);
   MLIRContext *ctx = builder.getContext();
   Value zeroIndex = builder.create<arith::ConstantIndexOp>(loc, 0);
 
   AffineMap tagMap;
   auto subLoopVarsOut = buildSubtileLoop(dmaOp, builder, loopOrder, tagMap);
   if (failed(subLoopVarsOut)) {
-    dmaOp.emitError("Failed to build subtile loop for bias DMA.");
+    dmaOp.emitError("Failed to build subtile loop for DMA.");
     return failure();
   }
 
@@ -596,7 +369,58 @@ FailureOr<SmallVector<Value>> DmaFineGrained::createSubtileDMA(memref::DmaStartO
       dmaOp.getStride(), dmaOp.getNumElementsPerStride(),
       dmaAttr);
   dmaOp.erase();
-  return subLoopVarsOut;
+  return std::make_pair(subLoopVarsOut.value(), newDma);
+}
+
+FailureOr<SmallVector<Value>> DmaFineGrained::fuseSubtileLoops(
+    OpBuilder &builder,
+    SmallVector<Value> lhsLoopVars,
+    SmallVector<Value> rhsLoopVars,
+    ArrayRef<Block *> loopBodies,
+    std::vector<std::vector<Value>> &loopGroups) {
+
+  SmallVector<Value> newLoopVars;
+  IRMapping replacementMap;
+  SmallVector<affine::AffineForOp> loopsToErase;
+
+  affine::AffineForOp lastLoop = nullptr;
+  for (const auto &group : loopGroups) {
+    Value refIV = group.front();
+    auto refLoop = llvm::dyn_cast<affine::AffineForOp>(mlir::isa<BlockArgument>(refIV)
+          ? llvm::dyn_cast<BlockArgument>(refIV).getOwner()->getParent()->getParentOp()
+          : nullptr);
+    if (!refLoop)
+      return failure();
+
+    loopsToErase.push_back(refLoop);
+    auto newLoop = builder.create<affine::AffineForOp>(
+        refLoop.getLoc(),
+        refLoop.getLowerBoundOperands(), refLoop.getLowerBoundMap(),
+        refLoop.getUpperBoundOperands(), refLoop.getUpperBoundMap(),
+        refLoop.getStep().getSExtValue());
+    newLoop->setAttr("inner_loop", builder.getBoolAttr(true));
+    Value newIV = newLoop.getInductionVar();
+    newLoopVars.push_back(newIV);
+    lastLoop = newLoop;
+
+    for (Value oldIV : group)
+      replacementMap.map(oldIV, newIV);
+
+    builder.setInsertionPointToStart(newLoop.getBody());
+  }
+
+  if (!lastLoop)
+    return failure();
+
+  Block *dstBody = lastLoop.getBody();
+  builder.setInsertionPointToStart(dstBody);
+  for (Block* srcBody : loopBodies) {
+    for (Operation &op : srcBody->without_terminator()) {
+      builder.clone(op, replacementMap);
+    }
+  }
+
+  return newLoopVars;
 }
 
 namespace mlir {

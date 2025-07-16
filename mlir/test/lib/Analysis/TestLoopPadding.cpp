@@ -426,6 +426,7 @@ void TestLoopPadding::runOnOperation() {
                 AffineExpr newExpr = updateAffineExprWithBounds(expr, index_pos, size, newSize, dram_stride, context);
                 map = updateAffineMapWithNewExpr(map, newExpr, expr_idx, context, forOp);
                 applyOp.setMap(map);
+                dmaOp->setAttr("dram_stride", builder.getArrayAttr(dram_stride));
                 return;
               }
             }
@@ -594,20 +595,21 @@ mlir::AffineExpr TestLoopPadding::updateAffineExprWithBounds(mlir::AffineExpr ex
     //llvm::errs() << "coeff:" << coeff << " pos: " << position << "\n";
     if (coeff > targetCoefficient || (coeff == targetCoefficient && position < updated_position_index)) {
       int64_t new_coeff = (coeff / upperBound) * paddedUpperBound;
-      for (size_t i = 0; i < dram_stride.size(); ++i) {
-        auto intAttr = llvm::dyn_cast<mlir::IntegerAttr>(dram_stride[i]);
-        if (!intAttr) {
-          llvm::errs() << "Non-integer attribute found in dram_stride.\n";
-          continue;
-        }
-
-        int64_t value = intAttr.getInt();
-        if (value == coeff)
-          dram_stride[i] = mlir::IntegerAttr::get(intAttr.getType(), new_coeff);
-      }
       coeff = new_coeff;
     }
     modifiedCoefficients.push_back(std::make_tuple(coeff, position));
+  }
+
+  for (size_t i = 0; i < dram_stride.size(); ++i) {
+    auto intAttr = llvm::dyn_cast<mlir::IntegerAttr>(dram_stride[i]);
+    if (!intAttr) {
+      llvm::errs() << "Non-integer attribute found in dram_stride.\n";
+      continue;
+    }
+
+    int64_t value = intAttr.getInt();
+    if (value > targetCoefficient || (value == targetCoefficient && i < updated_position_index))
+      dram_stride[i] = mlir::IntegerAttr::get(intAttr.getType(), (value / upperBound) * paddedUpperBound);
   }
 
   // Updated coeff
