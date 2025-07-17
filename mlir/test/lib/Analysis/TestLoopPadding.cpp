@@ -608,7 +608,7 @@ mlir::AffineExpr TestLoopPadding::updateAffineExprWithBounds(mlir::AffineExpr ex
     }
 
     int64_t value = intAttr.getInt();
-    if (value > targetCoefficient || (value == targetCoefficient && i < updated_position_index))
+    if (value > targetCoefficient)
       dram_stride[i] = mlir::IntegerAttr::get(intAttr.getType(), (value / upperBound) * paddedUpperBound);
   }
 
