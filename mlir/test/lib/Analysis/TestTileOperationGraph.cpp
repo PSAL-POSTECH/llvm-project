@@ -23,21 +23,11 @@
 #include <algorithm>
 #include <iomanip>
 #include <sstream>
+#include "mlir/Analysis/CustomDMAAttribute.h"
 
 using namespace mlir;
 
 int64_t VECTOR_LANE = 128;
-
-int extractConstantIntValue(Value val) {
-  int val_int;
-  if (auto constOp = val.getDefiningOp<arith::ConstantOp>()) {
-    Attribute constantAttr = constOp.getValue();
-    if (auto intAttr = mlir::dyn_cast<IntegerAttr>(constantAttr)) {
-      val_int = intAttr.getInt();
-    }
-  }
-  return val_int;
-}
 
 namespace {
 /// A testing pass that applies the TileOperationGraph analysis on a region and prints
@@ -237,7 +227,7 @@ void TestTileOperationGraph::printOperation(Operation &op, TOGNode *node) {
 
   if (name == "memref.dma_start") {
     auto dma_op = dyn_cast<memref::DmaStartOp>(op);
-    std::vector<int> tile_size, tile_stride, stride_list;
+    std::vector<int> tile_size, tile_stride, loop_stride_list;
     std::string address = "arg";
     int element_size = 0;
     bool is_write;
@@ -275,9 +265,16 @@ void TestTileOperationGraph::printOperation(Operation &op, TOGNode *node) {
     // Select tile or subtile
     auto tile_shape = dmaSubtileValues.size()? dmaSubtileValues : tile_memref_type.getShape();
 
-    /* Extract destination tile size */
+    /* Extract destination tile size & stride */
     for (int64_t iter: tile_shape)
       tile_size.push_back(static_cast<int>(iter));
+    auto tile_stride_attributes = getDramStride(dma_op);
+    for (auto attr : tile_stride_attributes) {
+      if (auto int_attr = attr.dyn_cast<mlir::IntegerAttr>())
+        tile_stride.push_back(int_attr.getInt());
+      else
+        llvm::errs() << "Non-integer attribute in stride\n";
+    }
 
     /* Record used loop index names */
     processDramIndices(dram_indices.front(), loop_index_map, loop_var_name, indirect_mode);
@@ -292,7 +289,7 @@ void TestTileOperationGraph::printOperation(Operation &op, TOGNode *node) {
     tile_size.clear();
     for (const auto& pair : reorderd_loop_map) {
         loop_index_list.push_back(pair.first);
-        stride_list.push_back(pair.second.first);
+        loop_stride_list.push_back(pair.second.first);
         if (pair.second.second != -1)
           tile_size.push_back(pair.second.second);
     }
@@ -357,9 +354,9 @@ void TestTileOperationGraph::printOperation(Operation &op, TOGNode *node) {
       tag_stride_list.push_back(1);
     }
 
-    TOGDMANode *tog_dma = new TOGDMANode("DMANode", address, stride_list, tile_size,
+    TOGDMANode *tog_dma = new TOGDMANode("DMANode", address, tile_size, tile_stride,
                                          element_size, is_write, dmaAsync, tag_index_list,
-                                         tag_stride_list, loop_index_list, indirect_mode);
+                                         tag_stride_list, loop_index_list, loop_stride_list, indirect_mode);
     tog_dma->setOp(&op);
     /* Link child and parent */
     node->addChild(tog_dma);
