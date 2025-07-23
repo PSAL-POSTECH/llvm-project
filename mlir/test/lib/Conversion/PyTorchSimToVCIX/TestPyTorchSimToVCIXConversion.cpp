@@ -25,6 +25,7 @@
 #include "mlir/IR/Types.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Pass/PassManager.h"
+#include "mlir/Analysis/CustomDMAAttribute.h"
 
 namespace mlir {
 namespace {
@@ -37,37 +38,6 @@ int64_t getLoopUpperBound(mlir::affine::AffineForOp forOp) {
     return constantOp;
   }
   return -1;  // This is an example, handle dynamic cases as needed
-}
-
-llvm::SmallVector<mlir::Attribute> getSubtileSize(mlir::Operation *operation) {
-  llvm::SmallVector<mlir::Attribute> subtileSizes;
-  auto attr = operation->getAttr("subtile_size");
-  if (!attr) {
-    return subtileSizes; // Return empty SmallVector
-  }
-
-  if (auto arrayAttr = llvm::dyn_cast<mlir::ArrayAttr>(attr)) {
-    for (auto element : arrayAttr) {
-      // Assume the elements are integers
-      if (auto intAttr = llvm::dyn_cast<mlir::IntegerAttr>(element)) {
-        subtileSizes.push_back(intAttr);
-      } else {
-        llvm::errs() << "Unsupported element type in 'subtile_size'.\n";
-      }
-    }
-  }
-  return subtileSizes;
-}
-
-int getAsyncValue(mlir::Operation *operation) {
-  auto attr = operation->getAttr("async");
-  if (!attr)
-    return 0;
-
-  if (auto intAttr = llvm::dyn_cast<mlir::IntegerAttr>(attr))
-    return intAttr.getInt(); // Treat non-zero as true
-  else
-    return 1;
 }
 
 std::pair<Value, bool> getDramMemRef(mlir::memref::DmaStartOp dmaOp) {
@@ -542,14 +512,10 @@ struct MatmulOpLowering : public OpRewritePattern<linalg::MatmulOp> {
         }
       });
       coeff_h = 1 + (oW - 1) * offset_w + (kW - 1);
-      ATagOperands.push_back(innerLoops.at(0).getInductionVar());
       ATagOperands.push_back(innerLoops.at(2).getInductionVar());
-      ATagOperands.push_back(innerLoops.at(1).getInductionVar());
       ATagOperands.push_back(innerLoops.at(3).getInductionVar());
       ADimOffset = ATagOperands.size();
-        ATagExpr = ATagExpr + rewriter.getAffineDimExpr(ADimOffset-4)*((K/KStep)*(M/MStep)*coeff_h) + \
-                              rewriter.getAffineDimExpr(ADimOffset-3)*((K/KStep)*(M/MStep)*offset_h*coeff_h) + \
-                              rewriter.getAffineDimExpr(ADimOffset-2)*((K/KStep)*(M/MStep)) + \
+        ATagExpr = ATagExpr + rewriter.getAffineDimExpr(ADimOffset-2)*((K/KStep)*(M/MStep)*offset_h*coeff_h) + \
                               rewriter.getAffineDimExpr(ADimOffset-1)*((K/KStep)*(M/MStep)*offset_w);
     }
     ATagExpr = ATagExpr + rewriter.getAffineDimExpr(ADimOffset)*(M/MStep) + \
