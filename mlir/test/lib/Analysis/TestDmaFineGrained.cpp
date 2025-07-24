@@ -134,13 +134,13 @@ void DmaFineGrained::runOnOperation() {
   // Note that this order was determined empirically
   if (rank == 2) {
     inputLoopOrder = {0, 1};
-    weightLoopOrder = {1, 0};
+    weightLoopOrder = {0, 1};
   } else if (rank == 3) {
     inputLoopOrder = {0, 1, 2};
-    weightLoopOrder = {0, 2, 1};
+    weightLoopOrder = {0, 1, 2};
   } else if (rank == 4) {
     inputLoopOrder = {0, 1, 2, 3};
-    weightLoopOrder = {0, 1, 3, 2};
+    weightLoopOrder = {0, 1, 2, 3};
   }
   auto [inputLoopVarOuts, inputDmaOp] = createSubtileDMA(mvin_input, inputLoopOrder, builder).value();
   auto [weightLoopVarOuts, weightDmaOp] = createSubtileDMA(mvin_weight, weightLoopOrder, builder).value();
@@ -210,6 +210,7 @@ AffineMap DmaFineGrained::buildSramAffineMap(OpBuilder &builder, memref::DmaStar
   int64_t vectorlane = systolicSize;
   SmallVector<int64_t, 4> tile_shape = getTileShape(op);
   SmallVector<Attribute, 4> tile_stride = getSramStride(op);
+  SmallVector<Attribute, 4> subtile_sizes = getSubtileSize(op);
   int64_t vlane_split_axis = getVlaneSplitAxis(op);
   int64_t vlane_stride = getVlaneStride(op);
   int64_t target_stride;
@@ -224,14 +225,15 @@ AffineMap DmaFineGrained::buildSramAffineMap(OpBuilder &builder, memref::DmaStar
   // Dynamically compute scaled strides based on the vector size
   SmallVector<AffineExpr, 4> exprs;
   for (size_t i = 0; i < tile_stride.size(); ++i) {
+    int64_t subtilesize = llvm::dyn_cast<IntegerAttr>(subtile_sizes[i]).getInt();
     int64_t stride = llvm::dyn_cast<mlir::IntegerAttr>(tile_stride[i]).getInt();
     if (stride > target_stride) {
       stride = stride / old_size * new_size;
     }
     if (i != static_cast<size_t>(vlane_split_axis))
-      exprs.push_back(builder.getAffineDimExpr(i) * stride);
+      exprs.push_back(builder.getAffineDimExpr(i) * subtilesize * stride);
     else
-      exprs.push_back(builder.getAffineDimExpr(i).floorDiv(vectorlane) * stride);
+      exprs.push_back((builder.getAffineDimExpr(i) * subtilesize).floorDiv(vectorlane) * stride);
   }
   AffineExpr combinedExpr = exprs[0];
   for (size_t i = 1; i < exprs.size(); ++i) {
@@ -246,9 +248,11 @@ AffineMap DmaFineGrained::buildDramAffineMap(OpBuilder &builder, memref::DmaStar
   MLIRContext *ctx = builder.getContext();
 
   AffineExpr expr = builder.getAffineConstantExpr(0);
+  SmallVector<Attribute> subTileSizes =  getSubtileSize(op);
   for (unsigned i = 0; i < rank; ++i) {
+    int64_t subtilesize = llvm::dyn_cast<IntegerAttr>(subTileSizes[i]).getInt();
     int64_t stride = llvm::dyn_cast<IntegerAttr>(dramStride[i]).getInt();
-    expr = expr + getAffineDimExpr(i, ctx) * builder.getAffineConstantExpr(stride);
+    expr = expr + getAffineDimExpr(i, ctx) * builder.getAffineConstantExpr(stride*subtilesize);
   }
 
   return AffineMap::get(rank, 0, expr);
@@ -297,7 +301,7 @@ FailureOr<SmallVector<Value>> DmaFineGrained::buildSubtileLoop(
     int64_t tileSize = tileSizes[dim];
     int64_t subTileSize = subTileSizes[dim];
 
-    auto loop = builder.create<affine::AffineForOp>(loc, 0, tileSize, subTileSize);
+    auto loop = builder.create<affine::AffineForOp>(loc, 0, (tileSize+subTileSize-1)/subTileSize, 1);
     loop->setAttr("inner_loop", builder.getBoolAttr(true));
     subLoopVarsOut[dim] = loop.getInductionVar();
     builder.setInsertionPointToStart(loop.getBody());
