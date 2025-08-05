@@ -594,7 +594,7 @@ mlir::AffineExpr TestLoopPadding::updateAffineExprWithBounds(mlir::AffineExpr ex
     int position = coefficients[i].second;
     //llvm::errs() << "coeff:" << coeff << " pos: " << position << "\n";
     if (coeff > targetCoefficient || (coeff == targetCoefficient && position < updated_position_index)) {
-      int64_t new_coeff = (coeff / upperBound) * paddedUpperBound;
+      int64_t new_coeff = (coeff * paddedUpperBound) / upperBound;
       coeff = new_coeff;
     }
     modifiedCoefficients.push_back(std::make_tuple(coeff, position));
@@ -609,7 +609,7 @@ mlir::AffineExpr TestLoopPadding::updateAffineExprWithBounds(mlir::AffineExpr ex
 
     int64_t value = intAttr.getInt();
     if (value > targetCoefficient)
-      dram_stride[i] = mlir::IntegerAttr::get(intAttr.getType(), (value / upperBound) * paddedUpperBound);
+      dram_stride[i] = mlir::IntegerAttr::get(intAttr.getType(), (value  * paddedUpperBound) / upperBound);
   }
 
   // Updated coeff
