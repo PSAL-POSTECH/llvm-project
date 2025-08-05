@@ -9,8 +9,7 @@ jobs:
   build:
     runs-on: self-hosted
     permissions:
-      contents: read
-      id-token: write
+      contents: write
 
     steps:
       - name: Pull Gem5 Prebuilt Dependency Image
@@ -25,18 +24,18 @@ jobs:
 
       - name: Build LLVM
         run: |
-          docker run --rm -v ${{ github.workspace }}:/workspace -w /workspace \
+          docker run --rm -v ${{ github.workspace }}:/workspace -w /workspace/llvm-project \
+          -u $(id -u):$(id -g) \
           ghcr.io/gem5/ubuntu-22.04_all-dependencies:latest \
           bash -c "
             mkdir -p build && cd build &&
-            cmake -DLLVM_ENABLE_PROJECTS=mlir -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/workspace/riscv-llvm -DLLVM_TARGETS_TO_BUILD=RISCV -G \"Unix Makefiles\" ../llvm &&
+            cmake -DLLVM_ENABLE_PROJECTS=mlir -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/workspace/llvm-project/riscv-llvm -DLLVM_TARGETS_TO_BUILD=RISCV -G \"Unix Makefiles\" ../llvm &&
             make -j && make install"
 
       - name: Archive Build Artifacts
-        run: tar -czvf riscv-llvm-release.tar.gz riscv-llvm
+        run: tar -czvf -C llvm-project riscv-llvm-release.tar.gz llvm-project/riscv-llvm
 
       - name: Create Release
-        id: create_release
         uses: softprops/action-gh-release@v1
         with:
           tag_name: ${{ github.ref }}
@@ -57,4 +56,4 @@ jobs:
       - name: Trigger building base iamge
         run: gh api /repos/PSAL-POSTECH/PyTorchSim/dispatches -f event_type='build_base'
         env:
-          GITHUB_TOKEN: ${{ secrets.GIT_ACCESS_TOKEN }}
+          GH_TOKEN: ${{ secrets.GIT_ACCESS_TOKEN }}
