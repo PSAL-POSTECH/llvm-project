@@ -8,55 +8,46 @@ on:
 jobs:
   build:
     runs-on: self-hosted
+    permissions:
+      contents: read
+      id-token: write
 
     steps:
       - name: Pull Gem5 Prebuilt Dependency Image
-        run: |
-          docker pull ghcr.io/gem5/ubuntu-22.04_all-dependencies:latest
+        run: docker pull ghcr.io/gem5/ubuntu-22.04_all-dependencies:latest
+
+      - name: Checkout llvm-project
+        uses: actions/checkout@v4
+        with:
+          repository: PSAL-POSTECH/llvm-project
+          ref: torchsim
+          path: llvm-project
 
       - name: Build LLVM
-        env:
-          GIT_ACCESS_TOKEN: ${{ secrets.GIT_ACCESS_TOKEN }}
         run: |
-          docker run --rm -v ${{ github.workspace }}:/workspace -e GIT_ACCESS_TOKEN=${GIT_ACCESS_TOKEN} -w /workspace \
+          docker run --rm -v ${{ github.workspace }}:/workspace -w /workspace \
           ghcr.io/gem5/ubuntu-22.04_all-dependencies:latest \
           bash -c "
-            if [ -d \"llvm-project\" ]; then
-              echo \"Directory llvm-project already exists. Skipping git clone.\"
-            else
-              echo \"Cloning repository...\"
-              git clone https://${GIT_ACCESS_TOKEN}@github.com/PSAL-POSTECH/llvm-project.git --branch torchsim --depth 10
-            fi
-            cd llvm-project && git pull && mkdir -p build && cd build &&
+            mkdir -p build && cd build &&
             cmake -DLLVM_ENABLE_PROJECTS=mlir -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/workspace/riscv-llvm -DLLVM_TARGETS_TO_BUILD=RISCV -G \"Unix Makefiles\" ../llvm &&
             make -j && make install"
 
       - name: Archive Build Artifacts
-        run: |
-          tar -czvf riscv-llvm-release.tar.gz riscv-llvm
+        run: tar -czvf riscv-llvm-release.tar.gz riscv-llvm
 
       - name: Create Release
         id: create_release
-        uses: actions/create-release@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GIT_ACCESS_TOKEN }}
-          ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION: true
+        uses: softprops/action-gh-release@v1
         with:
           tag_name: ${{ github.ref }}
-          release_name: Release ${{ github.ref }}
+          name: Release ${{ github.ref }}
           draft: false
           prerelease: false
 
       - name: Upload Release Assets
-        uses: actions/upload-release-asset@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GIT_ACCESS_TOKEN }}
-          ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION: true
+        uses: softprops/action-gh-release@v1
         with:
-          upload_url: ${{ steps.create_release.outputs.upload_url }}
-          asset_path: ./riscv-llvm-release.tar.gz
-          asset_name: riscv-llvm-release.tar.gz
-          asset_content_type: application/gzip
+          files: riscv-llvm-release.tar.gz
 
   trigger:
     name: Trigger build base image
