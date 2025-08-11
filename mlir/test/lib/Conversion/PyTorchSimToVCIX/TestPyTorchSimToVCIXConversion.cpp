@@ -425,8 +425,8 @@ struct MatmulOpLowering : public OpRewritePattern<linalg::MatmulOp> {
       BTagOperands.push_back(innerLoops.at(1).getInductionVar());
       BDimOffset = BTagOperands.size();
       BTagExpr = BTagExpr + \
-        rewriter.getAffineDimExpr(BDimOffset-2)*((N/NStep)*(K/KStep)*kW) + \
-        rewriter.getAffineDimExpr(BDimOffset-1)*((N/NStep)*(K/KStep));
+        rewriter.getAffineDimExpr(BDimOffset-2)*((N/subtileN)*(K/subtileK)*kW) + \
+        rewriter.getAffineDimExpr(BDimOffset-1)*((N/subtileN)*(K/subtileK));
     }
     BTagExpr = BTagExpr + rewriter.getAffineDimExpr(BDimOffset).floorDiv((NStep+SYSTOLIC_SIZE-1)/SYSTOLIC_SIZE)*(K/KStep) + \
       rewriter.getAffineDimExpr(BDimOffset+1).floorDiv((KStep+SYSTOLIC_SIZE-1)/SYSTOLIC_SIZE)*1;
@@ -515,8 +515,8 @@ struct MatmulOpLowering : public OpRewritePattern<linalg::MatmulOp> {
       ATagOperands.push_back(innerLoops.at(2).getInductionVar());
       ATagOperands.push_back(innerLoops.at(3).getInductionVar());
       ADimOffset = ATagOperands.size();
-        ATagExpr = ATagExpr + rewriter.getAffineDimExpr(ADimOffset-2)*((K/KStep)*(M/MStep)*offset_h*coeff_h) + \
-                              rewriter.getAffineDimExpr(ADimOffset-1)*((K/KStep)*(M/MStep)*offset_w);
+        ATagExpr = ATagExpr + rewriter.getAffineDimExpr(ADimOffset-2)*((K/subtileK)*(M/subtileM)*offset_h*coeff_h) + \
+                              rewriter.getAffineDimExpr(ADimOffset-1)*((K/subtileK)*(M/subtileM)*offset_w);
     }
     ATagExpr = ATagExpr + rewriter.getAffineDimExpr(ADimOffset)*(M/MStep) + \
       rewriter.getAffineDimExpr(ADimOffset+1).floorDiv((MStep+SYSTOLIC_SIZE-1)/SYSTOLIC_SIZE);

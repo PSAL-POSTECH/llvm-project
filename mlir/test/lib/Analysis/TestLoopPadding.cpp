@@ -782,6 +782,8 @@ void TestLoopPadding::createWrapperFunction(mlir::ModuleOp module, mlir::OpBuild
       } else if (padding_type == 1) { // negative padding (-inf) for softmax reduction
         if (elementType.isF32())
           initial_value = -std::numeric_limits<float>::infinity();
+        else if (elementType.isInteger(64))
+          initial_value = std::numeric_limits<int64_t>::min();
         else if (elementType.isInteger(32))
           initial_value = std::numeric_limits<int32_t>::min();
         else if (elementType.isInteger(16))
@@ -797,7 +799,7 @@ void TestLoopPadding::createWrapperFunction(mlir::ModuleOp module, mlir::OpBuild
       }
       if (elementType.isF32()) {
         zeroValue = builder.create<arith::ConstantOp>(wrapperFunc.getLoc(), elementType, builder.getF32FloatAttr(initial_value));
-      } else if (elementType.isInteger(32) || elementType.isInteger(8) || elementType.isInteger(1)) {
+      } else if (elementType.isInteger(64) || elementType.isInteger(32) || elementType.isInteger(8) || elementType.isInteger(1)) {
         zeroValue = builder.create<arith::ConstantOp>(wrapperFunc.getLoc(), elementType, builder.getIntegerAttr(elementType, 0));
       } else {
         wrapperFunc.emitError("Unsupported padding type");
