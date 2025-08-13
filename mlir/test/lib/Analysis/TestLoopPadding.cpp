@@ -497,7 +497,11 @@ void TestLoopPadding::modifyMemrefWithPadding(Value memref, int64_t upperBound, 
 
   // Calculate the original flattened size (for 1D memref, it's just the first dimension)
   int64_t flattenedSize = memrefType.getShape().front();  // Only one dimension, so it's the size itself
-  int64_t newFlattenedSize = (flattenedSize / upperBound) * paddedUpperBound;
+  int64_t newFlattenedSize;
+  if ((flattenedSize * paddedUpperBound) % upperBound != 0)
+    newFlattenedSize = ((flattenedSize * paddedUpperBound)+upperBound-1) / upperBound;
+  else
+    newFlattenedSize = (flattenedSize * paddedUpperBound) / upperBound;
   SmallVector<int64_t, 1> newShape = {newFlattenedSize};  // For 1D, the shape is a single value
 
   // Recalculate the flattened size based on the padding and set the new memref type
@@ -526,6 +530,17 @@ SmallVector<std::pair<int64_t, unsigned>, 4> TestLoopPadding::collectCoefficient
         // Add: Recursively collect both sides
         collectCoefficients(binExpr.getLHS());
         collectCoefficients(binExpr.getRHS());
+      } else {
+        // Fallback for unexpected binary expression kinds
+        if (auto lhs = llvm::dyn_cast<mlir::AffineConstantExpr>(binExpr.getLHS())) {
+          if (auto rhs = llvm::dyn_cast<mlir::AffineDimExpr>(binExpr.getRHS())) {
+            coefficients.push_back(std::make_pair(1, rhs.getPosition()));
+          }
+        } else if (auto rhs = llvm::dyn_cast<mlir::AffineConstantExpr>(binExpr.getRHS())) {
+          if (auto lhs = llvm::dyn_cast<mlir::AffineDimExpr>(binExpr.getLHS())) {
+            coefficients.push_back(std::make_pair(1, lhs.getPosition()));
+          }
+        }
       }
     } else if (auto dimExpr = llvm::dyn_cast<mlir::AffineDimExpr>(expr)) {
       coefficients.push_back(std::make_pair(1, dimExpr.getPosition()));
@@ -561,6 +576,8 @@ int64_t TestLoopPadding::getCoefficientFromDim(mlir::AffineExpr expr, int dim) {
         result = collectCoefficients(binExpr.getRHS());
         if (result != -1)
           return result;
+      } else {
+        return 1L;
       }
     } else if (auto dimExpr = llvm::dyn_cast<mlir::AffineDimExpr>(expr)) {
       if (dimExpr.isFunctionOfDim(dim)) {
@@ -624,19 +641,16 @@ mlir::AffineExpr TestLoopPadding::updateAffineExprWithBounds(mlir::AffineExpr ex
     if (auto binExpr = llvm::dyn_cast<mlir::AffineBinaryOpExpr>(expr)) {
       mlir::AffineExpr lhs = rebuildExprWithUpdatedCoefficients(binExpr.getLHS());
       mlir::AffineExpr rhs = rebuildExprWithUpdatedCoefficients(binExpr.getRHS());
-
-      auto result = binExpr.getKind() == mlir::AffineExprKind::Add ? lhs + rhs : lhs * rhs;
-      if (binExpr.getKind() == mlir::AffineExprKind::Add)
-        auto result =  lhs + rhs;
-      else {
-        if (auto constExpr = llvm::dyn_cast<mlir::AffineConstantExpr>(rhs)) {
-          return lhs;
-        } else {
-          return rhs;
-        }
+      switch (binExpr.getKind()) {
+        case mlir::AffineExprKind::Mul:
+          if (auto constExpr = llvm::dyn_cast<mlir::AffineConstantExpr>(rhs)) {
+            return lhs;
+          } else {
+            return rhs;
+          }
+        default:
+          return mlir::getAffineBinaryOpExpr(binExpr.getKind(), lhs, rhs);
       }
-
-      return result;
     } else if (auto dimExpr = llvm::dyn_cast<mlir::AffineDimExpr>(expr)) {
       for (const auto& entry : modifiedCoefficients) {
         int64_t coeff;
@@ -647,7 +661,8 @@ mlir::AffineExpr TestLoopPadding::updateAffineExprWithBounds(mlir::AffineExpr ex
           return expr;
         }
       }
-      llvm::errs() << "Failed to update dimension \"" << dimExpr << "\"";
+      if (modifiedCoefficients.size() != 1)
+        llvm::errs() << "Failed to update dimension \"" << expr << "\"";
       return dimExpr;
     } else if (auto constExpr = llvm::dyn_cast<mlir::AffineConstantExpr>(expr)) {
       return mlir::getAffineConstantExpr(constExpr.getValue(), context);

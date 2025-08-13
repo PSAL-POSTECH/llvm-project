@@ -12,8 +12,12 @@ jobs:
       contents: write
 
     steps:
-      - name: Pull Gem5 Prebuilt Dependency Image
-        run: docker pull ghcr.io/gem5/ubuntu-22.04_all-dependencies:latest
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Checkout llvm-project
         uses: actions/checkout@v4
@@ -21,6 +25,9 @@ jobs:
           repository: PSAL-POSTECH/llvm-project
           ref: torchsim
           path: llvm-project
+
+      - name: Debug1
+        run: ls ${{ github.workspace }} -al && ls ${{ github.workspace }}/llvm-project -al
 
       - name: Build LLVM
         run: |
@@ -32,8 +39,11 @@ jobs:
             cmake -DLLVM_ENABLE_PROJECTS=mlir -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/workspace/llvm-project/riscv-llvm -DLLVM_TARGETS_TO_BUILD=RISCV -G \"Unix Makefiles\" ../llvm &&
             make -j && make install"
 
+      - name: Debug2
+        run: ls ${{ github.workspace }} -al
+
       - name: Archive Build Artifacts
-        run: tar -czvf -C llvm-project riscv-llvm-release.tar.gz llvm-project/riscv-llvm
+        run: tar -czvf riscv-llvm-release.tar.gz -C ${{ github.workspace }}/llvm-project riscv-llvm
 
       - name: Create Release
         uses: softprops/action-gh-release@v1
