@@ -577,7 +577,8 @@ void TestTileOperationGraph::processDramIndices(mlir::Value value,
   if (auto applyOp = value.getDefiningOp<mlir::affine::AffineApplyOp>()) {
     mlir::AffineMap map = applyOp.getAffineMap();
     mlir::OperandRange applyOperands = applyOp.getOperands();
-    indirect_mode = map.getNumSymbols() !=0 && !indirect_mode ? true : indirect_mode;
+    Attribute indirectAccessAttr = applyOp->getAttr("indirect_access");
+    indirect_mode = indirectAccessAttr ? true : false;
     for (unsigned i = 0; i < applyOperands.size(); ++i) {
       auto operand = applyOperands[i];
       if (auto blockArg = llvm::dyn_cast<mlir::BlockArgument>(operand)) {

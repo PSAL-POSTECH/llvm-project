@@ -7,6 +7,8 @@
 //===----------------------------------------------------------------------===//
 
 #include "mlir/Conversion/ConvertToLLVM/ToLLVMInterface.h"
+#include "mlir/Conversion/LLVMCommon/MemRefBuilder.h"
+#include "mlir/Conversion/MemRefToLLVM/MemRefToLLVM.h"
 #include "mlir/Conversion/LLVMCommon/ConversionTarget.h"
 #include "mlir/Conversion/LLVMCommon/TypeConverter.h"
 #include "mlir/Conversion/LLVMCommon/Pattern.h"
@@ -138,37 +140,41 @@ struct DmaStartOpLowering : public ConvertOpToLLVMPattern<memref::DmaStartOp> {
     for (auto index : indices) {
       if (auto applyOp = index.getDefiningOp<affine::AffineApplyOp>()) {
         index_map = applyOp.getAffineMap();
-        indirect_access = index_map.getNumSymbols()!=0;
+        Attribute indirectAccessAttr = applyOp->getAttr("indirect_access");
+        indirect_access = indirectAccessAttr ? 1 : 0;
         parentIndices = applyOp.getOperands();
         if (indirect_access) {
           // FIXME. How to get converted type?
+          bool found = false;
           for (mlir::Value operand : applyOp.getMapOperands()) {
+            // Found index cast
             auto indexCastOp = operand.getDefiningOp<arith::IndexCastOp>();
             if (!indexCastOp)
               continue;
-            // Found index cast
+
             auto loadOp = indexCastOp.getIn().getDefiningOp<mlir::affine::AffineLoadOp>();
             if (!loadOp)
               continue;
+
             // Found index spad memref
-            bool found = false;
-            Value indirectMemref = loadOp.getMemRef();
-            auto indirectMemRefType = dyn_cast<MemRefType>(indirectMemref.getType());
-            for (auto &use : indirectMemref.getUses()) {
-              mlir::Operation* userOp = use.getOwner();
-              if (auto castOp = llvm::dyn_cast<mlir::UnrealizedConversionCastOp>(userOp)) {
-                indirectMemref = castOp->getResult(0);
-                found = true;
-              }
-            }
-            if (!found) {
-              op.emitError("Failed to find converted memref...");
+            Value rawMemref = loadOp.getMemRef();
+            Type convertedTy = typeConverter->convertType(rawMemref.getType());
+            if (!convertedTy)
               return failure();
-            }
-            indirect_spad_addr = getStridedElementPtr(loc, indirectMemRefType, indirectMemref, {}, rewriter);
+            Value llvmMemref = rewriter.create<UnrealizedConversionCastOp>(op.getLoc(), convertedTy, rawMemref).getResult(0);
+
+            found = true;
+            MemRefType originalType = loadOp.getMemRefType();
+            MemRefDescriptor descriptor(llvmMemref);
+            Value base_ptr = descriptor.allocatedPtr(rewriter, loc);
+            indirect_spad_addr = getStridedElementPtr(loc, originalType, llvmMemref, {}, rewriter);
             indirect_spad_addr = rewriter.create<LLVM::PtrToIntOp>(loc, rewriter.getI64Type(), indirect_spad_addr);
-            indirect_element_size = getElementBitWidth(indirectMemRefType.getElementType()) / 8;
+            indirect_element_size = getElementBitWidth(originalType.getElementType()) / 8;
             break;
+          }
+          if (!found) {
+            op.emitError("Failed to find indirect access for affine apply operation.");
+            return failure();
           }
         }
       }
@@ -386,21 +392,23 @@ struct TestMemRefToGemmini
     MLIRContext *ctx = &getContext();
     LowerToLLVMOptions options(ctx);
     LLVMTypeConverter typeConverter(ctx, options);
-
-    VECTOR_LANE = vectorlane;
-    RewritePatternSet patterns(ctx);
     // vectorlane is passed to the pattern as an argument
+    VECTOR_LANE = vectorlane;
+
+    // Lower dma_start and dma_wait operations to gemmini instructions
+    LLVMConversionTarget target(getContext());
+    RewritePatternSet patterns(ctx);
+    target.addIllegalOp<memref::DmaStartOp>();
+    target.addIllegalOp<memref::DmaWaitOp>();
     if (timing_mode)
       patterns.add<TimingDmaStartOpLowering>(typeConverter);
     else
       patterns.add<DmaStartOpLowering>(typeConverter);
     patterns.add<DmaWaitOpLowering>(typeConverter);
-    LLVMConversionTarget target(getContext());
     if (failed(applyPartialConversion(getOperation(), target,
                                       std::move(patterns))))
       signalPassFailure();
   }
-
 };
 
 } // namespace
