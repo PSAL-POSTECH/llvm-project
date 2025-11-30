@@ -126,6 +126,49 @@ bool traverseMMOperands(Value op_val, Value input) {
   return found;
 }
 
+Value make_sf_vc_v_sv(Location loc, PatternRewriter &rewriter, Value vec, const Type opType,
+                      unsigned n, VectorType legalType, uint64_t opcode) {
+  Attribute opcodeAttr = rewriter.getI64IntegerAttr(opcode);
+  Value rvl = nullptr;
+  VectorType vt = cast<VectorType>(opType);
+  unsigned totalEltCount = vt.getShape()[0];
+  const unsigned eltCount = legalType.getShape()[0];
+  if (legalType.isScalable())
+    // Use arbitrary runtime vector length when vector type is scalable.
+    // Proper conversion pass should take it from the IR.
+    rvl = rewriter.create<arith::ConstantOp>(loc,
+                                              rewriter.getI64IntegerAttr(9));
+  Value res;
+  if (n == 1) {
+    res = rewriter.create<vcix::BinaryOp>(loc, legalType, opcodeAttr, vec,
+                                              vec, rvl);
+  } else {
+    Type eltTy = legalType.getElementType();
+    auto vectorAttr = DenseElementsAttr::get(vt, rewriter.getZeroAttr(eltTy));
+    res = rewriter.create<arith::ConstantOp>(loc, vt, vectorAttr);
+    if (legalType.isScalable()) {
+      for (unsigned i = 0; i < n; ++i) {
+        Value extracted = rewriter.create<vector::ScalableExtractOp>(
+            loc, legalType, vec, i * eltCount);
+        Value v = rewriter.create<vcix::BinaryOp>(loc, legalType, opcodeAttr,
+                                                      extracted, extracted, rvl);
+        res = rewriter.create<vector::ScalableInsertOp>(loc, v, res,
+                                                        i * eltCount);
+      }
+    } else { // Fixed-length vector > VLEN
+      for (unsigned i = 0; i < totalEltCount/eltCount; i++) {
+        Value extracted = rewriter.create<vector::ExtractStridedSliceOp>(
+            loc, vec, i * eltCount, eltCount, 1);
+        Value v = rewriter.create<vcix::BinaryOp>(loc, legalType, opcodeAttr,
+                                                      extracted, extracted, rvl);
+        res = rewriter.create<vector::InsertStridedSliceOp>(loc, v, res,
+                                                            i * eltCount, 1);
+      }
+    }
+  }
+  return res;
+}
+
 Value make_sf_vc_v_iv(Location loc, PatternRewriter &rewriter, Value vec, const Type opType,
                       unsigned n, VectorType legalType, uint64_t opcode, uint64_t imm=0) {
   Attribute zeroImmAttr = rewriter.getI32IntegerAttr(imm);
@@ -604,6 +647,24 @@ struct MathExpToVCIX: public OpRewritePattern<math::ExpOp> {
   }
 };
 
+struct MathExp2ToVCIX: public OpRewritePattern<math::Exp2Op> {
+  using OpRewritePattern::OpRewritePattern;
+
+  LogicalResult
+  matchAndRewrite(math::Exp2Op op, PatternRewriter &rewriter) const override {
+    const Type opType = op.getOperand().getType();
+    auto [n, legalType] = legalizeVectorType(opType);
+    if (!legalType)
+      return rewriter.notifyMatchFailure(op, "cannot legalize type for RVV");
+    Location loc = op.getLoc();
+    Value vec = op.getOperand();
+    uint64_t opcode = 0b000000;
+    Value res = make_sf_vc_v_sv(loc, rewriter, vec, opType, n, legalType, opcode);
+    rewriter.replaceOp(op, res);
+    return success();
+  }
+};
+
 struct MathErfToVCIX: public OpRewritePattern<math::ErfOp> {
   using OpRewritePattern::OpRewritePattern;
 
@@ -707,9 +768,11 @@ struct TestPyTorchSimToVCIX
     patterns.add<MathTanhToVCIX>(ctx);
     patterns.add<MathCosToVCIX>(ctx);
     patterns.add<MathSinToVCIX>(ctx);
+    patterns.add<MathExp2ToVCIX>(ctx);
     ConversionTarget target(getContext());
     target.addIllegalOp<linalg::MatmulOp>();
     target.addIllegalOp<math::ExpOp>();
+    target.addIllegalOp<math::Exp2Op>();
     target.addIllegalOp<math::ErfOp>();
     target.addIllegalOp<math::TanhOp>();
     target.addIllegalOp<math::SinOp>();
