@@ -647,23 +647,6 @@ struct MathExpToVCIX: public OpRewritePattern<math::ExpOp> {
   }
 };
 
-struct MathExp2ToVCIX: public OpRewritePattern<math::Exp2Op> {
-  using OpRewritePattern::OpRewritePattern;
-
-  LogicalResult
-  matchAndRewrite(math::Exp2Op op, PatternRewriter &rewriter) const override {
-    const Type opType = op.getOperand().getType();
-    auto [n, legalType] = legalizeVectorType(opType);
-    if (!legalType)
-      return rewriter.notifyMatchFailure(op, "cannot legalize type for RVV");
-    Location loc = op.getLoc();
-    Value vec = op.getOperand();
-    uint64_t opcode = 0b000000;
-    Value res = make_sf_vc_v_sv(loc, rewriter, vec, opType, n, legalType, opcode);
-    rewriter.replaceOp(op, res);
-    return success();
-  }
-};
 
 struct MathErfToVCIX: public OpRewritePattern<math::ErfOp> {
   using OpRewritePattern::OpRewritePattern;
@@ -768,11 +751,9 @@ struct TestPyTorchSimToVCIX
     patterns.add<MathTanhToVCIX>(ctx);
     patterns.add<MathCosToVCIX>(ctx);
     patterns.add<MathSinToVCIX>(ctx);
-    patterns.add<MathExp2ToVCIX>(ctx);
     ConversionTarget target(getContext());
     target.addIllegalOp<linalg::MatmulOp>();
     target.addIllegalOp<math::ExpOp>();
-    target.addIllegalOp<math::Exp2Op>();
     target.addIllegalOp<math::ErfOp>();
     target.addIllegalOp<math::TanhOp>();
     target.addIllegalOp<math::SinOp>();
