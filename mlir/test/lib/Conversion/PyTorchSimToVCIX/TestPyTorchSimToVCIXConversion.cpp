@@ -647,6 +647,8 @@ struct MathExpToVCIX: public OpRewritePattern<math::ExpOp> {
   }
 };
 
+// Hands-on: Paste it right below
+
 
 struct MathErfToVCIX: public OpRewritePattern<math::ErfOp> {
   using OpRewritePattern::OpRewritePattern;
@@ -748,12 +750,14 @@ struct TestPyTorchSimToVCIX
     SYSTOLIC_SIZE = systolicSize;
     VLEN = vlen;
     patterns.add<MatmulOpLowering, MathExpToVCIX, MathErfToVCIX>(ctx);
+    // Hands-on: Register a target op (math.exp2)
     patterns.add<MathTanhToVCIX>(ctx);
     patterns.add<MathCosToVCIX>(ctx);
     patterns.add<MathSinToVCIX>(ctx);
     ConversionTarget target(getContext());
     target.addIllegalOp<linalg::MatmulOp>();
     target.addIllegalOp<math::ExpOp>();
+    // Hands-on: Register math.exp2 as an illegal op
     target.addIllegalOp<math::ErfOp>();
     target.addIllegalOp<math::TanhOp>();
     target.addIllegalOp<math::SinOp>();
