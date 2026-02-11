@@ -16,6 +16,7 @@
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Analysis/CustomDMAAttribute.h"
 
@@ -846,14 +847,21 @@ void TestLoopPadding::createWrapperFunction(mlir::ModuleOp module, mlir::OpBuild
     if (!padded_buffer[argIdx].has_value())
       continue;
     mlir::memref::AllocOp allocatedBuffer = padded_buffer[argIdx].value();
+    auto memref = allocatedBuffer.getMemref();
+    auto memrefType = memref.getType().cast<mlir::MemRefType>();
+    mlir::Value maxIndex = builder.create<arith::ConstantIndexOp>(builder.getUnknownLoc(), memrefType.getDimSize(0));
 
     for (size_t i=0; i<preInfo.getDimInfo().size(); i++) {
       auto& preDimInfo = preInfo.getDimInfo().at(i);
       auto& postDimInfo = postInfo.getDimInfo().at(i);
       mlir::Value preIndex, postIndex;
       std::tie(preIndex, postIndex) = preDimInfo.createLoops(builder, postDimInfo);
+      auto isWithinBounds = builder.create<arith::CmpIOp>(builder.getUnknownLoc(), arith::CmpIPredicate::slt, postIndex, maxIndex);
+      auto ifOp = builder.create<scf::IfOp>(builder.getUnknownLoc(), isWithinBounds, /*withElseRegion=*/false);
+      builder.setInsertionPointToStart(&ifOp.getThenRegion().front());
       auto loadedValue = builder.create<affine::AffineLoadOp>(builder.getUnknownLoc(), argValue, preIndex);
       builder.create<affine::AffineStoreOp>(builder.getUnknownLoc(), loadedValue, allocatedBuffer.getMemref(), postIndex);
+      builder.setInsertionPointAfter(ifOp);
     }
   }
 
@@ -890,14 +898,21 @@ void TestLoopPadding::createWrapperFunction(mlir::ModuleOp module, mlir::OpBuild
     if (!padded_buffer[argIdx].has_value())
       continue;
     mlir::memref::AllocOp allocatedBuffer = padded_buffer[argIdx].value();
+    auto memref = allocatedBuffer.getMemref();
+    auto memrefType = memref.getType().cast<mlir::MemRefType>();
+    mlir::Value maxIndex = builder.create<arith::ConstantIndexOp>(builder.getUnknownLoc(), memrefType.getDimSize(0));
 
     for (size_t i=0; i<preInfo.getDimInfo().size(); i++) {
       auto& preDimInfo = preInfo.getDimInfo().at(i);
       auto& postDimInfo = postInfo.getDimInfo().at(i);
       mlir::Value preIndex, postIndex;
       std::tie(preIndex, postIndex) = preDimInfo.createLoops(builder, postDimInfo);
+      auto isWithinBounds = builder.create<arith::CmpIOp>(builder.getUnknownLoc(), arith::CmpIPredicate::slt, postIndex, maxIndex);
+      auto ifOp = builder.create<scf::IfOp>(builder.getUnknownLoc(), isWithinBounds, /*withElseRegion=*/false);
+      builder.setInsertionPointToStart(&ifOp.getThenRegion().front());
       auto loadedValue = builder.create<affine::AffineLoadOp>(builder.getUnknownLoc(), allocatedBuffer.getMemref(), postIndex);
       builder.create<affine::AffineStoreOp>(builder.getUnknownLoc(), loadedValue, argValue, preIndex);
+      builder.setInsertionPointAfter(ifOp);
     }
   }
 
