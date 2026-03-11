@@ -19,6 +19,8 @@
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Analysis/CustomDMAAttribute.h"
+#include "llvm/ADT/APFloat.h"
+#include "llvm/ADT/APInt.h"
 
 using namespace mlir;
 
@@ -766,6 +768,34 @@ void TestLoopPadding::createWrapperFunction(mlir::ModuleOp module, mlir::OpBuild
   padded_buffer.resize(kernelFunc.getNumArguments());
   affine::AffineForOp last;
 
+  auto createPaddingInitValue = [&](Type elementType, int paddingType,
+                                    Location loc) -> Value {
+    if (paddingType == 0)
+      return builder.create<arith::ConstantOp>(loc, elementType,
+                                               builder.getZeroAttr(elementType));
+
+    if (paddingType != 1)
+      return Value();
+
+    if (auto floatType = llvm::dyn_cast<FloatType>(elementType)) {
+      llvm::APFloat negInf = llvm::APFloat::getInf(
+          floatType.getFloatSemantics(), /*Negative=*/true);
+      return builder.create<arith::ConstantOp>(
+          loc, elementType, builder.getFloatAttr(elementType, negInf));
+    }
+
+    if (auto intType = llvm::dyn_cast<IntegerType>(elementType)) {
+      llvm::APInt minValue =
+          intType.getWidth() == 1
+              ? llvm::APInt(/*numBits=*/1, /*val=*/0, /*isSigned=*/false)
+              : llvm::APInt::getSignedMinValue(intType.getWidth());
+      return builder.create<arith::ConstantOp>(
+          loc, elementType, builder.getIntegerAttr(intType, minValue));
+    }
+
+    return Value();
+  };
+
   // Create wrapper function
   builder.setInsertionPointToEnd(module.getBody());
   auto wrapperFunc = builder.create<func::FuncOp>(
@@ -790,40 +820,19 @@ void TestLoopPadding::createWrapperFunction(mlir::ModuleOp module, mlir::OpBuild
       std::string paddedBufName = std::string("_padding_buffer") + std::to_string(i);
       mlir::MemRefType paddedMemRefType = mlir::dyn_cast<mlir::MemRefType>(postMemRef.getType());
       Type elementType = paddedMemRefType.getElementType();
-      Value zeroValue;
       int padding_type = postInfo.getPaddingType();
-      float initial_value;
-      if (padding_type == 0) { // zero padding
-        initial_value = 0.0;
-      } else if (padding_type == 1) { // negative padding (-inf) for softmax reduction
-        if (elementType.isF32())
-          initial_value = -std::numeric_limits<float>::infinity();
-        else if (elementType.isInteger(64))
-          initial_value = std::numeric_limits<int64_t>::min();
-        else if (elementType.isInteger(32))
-          initial_value = std::numeric_limits<int32_t>::min();
-        else if (elementType.isInteger(16))
-          initial_value = std::numeric_limits<int16_t>::min();
-        else if (elementType.isInteger(8))
-          initial_value = std::numeric_limits<int8_t>::min();
-        else if (elementType.isInteger(1))
-          initial_value = 0;
-        else
-          wrapperFunc.emitError("Unsupported padding dtype");
-      } else {
-        wrapperFunc.emitError("Unsupported padding type");
-      }
-      if (elementType.isF32()) {
-        zeroValue = builder.create<arith::ConstantOp>(wrapperFunc.getLoc(), elementType, builder.getF32FloatAttr(initial_value));
-      } else if (elementType.isInteger(64) || elementType.isInteger(32) || elementType.isInteger(8) || elementType.isInteger(1)) {
-        zeroValue = builder.create<arith::ConstantOp>(wrapperFunc.getLoc(), elementType, builder.getIntegerAttr(elementType, 0));
-      } else {
-        wrapperFunc.emitError("Unsupported padding type");
+      Value initValue =
+          createPaddingInitValue(elementType, padding_type, wrapperFunc.getLoc());
+      if (!initValue) {
+        wrapperFunc.emitError("Unsupported padding dtype/type");
+        continue;
       }
       auto allocOp = builder.create<mlir::memref::AllocOp>(
         builder.getUnknownLoc(), paddedMemRefType);
       if (!timing_mode && padding_type)
-        builder.create<mlir::linalg::FillOp>(wrapperFunc.getLoc(), ValueRange{zeroValue}, ValueRange{allocOp});
+        builder.create<mlir::linalg::FillOp>(wrapperFunc.getLoc(),
+                                             ValueRange{initValue},
+                                             ValueRange{allocOp});
       padded_buffer[argIdx] = allocOp;
       usedMemRefs.insert(postMemRef.getAsOpaquePointer());
     }
