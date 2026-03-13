@@ -376,14 +376,25 @@ struct MatmulOpLowering : public OpRewritePattern<linalg::MatmulOp> {
 
     // Set Last outer loop
     affineForOp = outerLoops.back();
-    int subtileM, subtileN, subtileK;
+    int subtileM = M;
+    int subtileN = N;
+    int subtileK = K;
+    bool hasASubtileM = false;
+    bool hasASubtileK = false;
+    bool hasBSubtileN = false;
+    bool hasBSubtileK = false;
+    int aSubtileM = 0;
+    int aSubtileK = 0;
+    int bSubtileN = 0;
+    int bSubtileK = 0;
+    bool subtileError = false;
     
     llvm::SmallVector<int32_t, 3> idxMap = {0, 1, 2};
     
     if (auto idxMapAttr = op->getAttrOfType<mlir::DenseI32ArrayAttr>("idx_map"))
         idxMap.assign(idxMapAttr.asArrayRef().begin(), idxMapAttr.asArrayRef().end());
 
-    affineForOp->walk([&](mlir::Operation *nestedOp) {
+    auto walkResult = affineForOp->walk([&](mlir::Operation *nestedOp) {
       if (auto dmaStartOp = llvm::dyn_cast<memref::DmaStartOp>(nestedOp)) { // Replace DMAStartOp with actual `dma_start` op type
         auto result = getDramMemRef(dmaStartOp);
         auto sramRef = getSramMemRef(dmaStartOp);
@@ -396,28 +407,92 @@ struct MatmulOpLowering : public OpRewritePattern<linalg::MatmulOp> {
           }
         }
         /* Only DMA load */
-        if (result.second)
+        if (result.second) {
           return WalkResult::advance();
+        }
 
         /* Only wait operand dma */
-        if (!sramUsedInMatmul)
+        if (!sramUsedInMatmul) {
           return WalkResult::advance();
-        auto blockArg = mlir::cast<mlir::BlockArgument>(result.first);
-        if (!blockArg)
+        }
+        auto blockArg = mlir::dyn_cast<mlir::BlockArgument>(result.first);
+        if (!blockArg) {
           return WalkResult::advance();
+        }
         if (blockArg.getArgNumber() == idxMap[0]) {
           ADmaTag = dmaStartOp.getTagMemRef(); // Assuming `getTag()` retrieves the `tag` from `dma_start`.
           ADmaAsync = getAsyncValue(dmaStartOp);
           llvm::SmallVector<mlir::Attribute> dmaSubtile = getSubtileSize(dmaStartOp);
-          subtileM = llvm::dyn_cast<mlir::IntegerAttr>(dmaSubtile[dmaSubtile.size() - 2]).getInt();
-          subtileK = llvm::dyn_cast<mlir::IntegerAttr>(dmaSubtile[dmaSubtile.size() - 1]).getInt();
+          if (!dmaSubtile.empty()) {
+            if (dmaSubtile.size() < 2) {
+              op.emitError() << "Invalid 'subtile_size' for A: expected at least 2 values [M, K]";
+              subtileError = true;
+              return WalkResult::interrupt();
+            }
+            auto mAttr = llvm::dyn_cast<mlir::IntegerAttr>(dmaSubtile[dmaSubtile.size() - 2]);
+            auto kAttr = llvm::dyn_cast<mlir::IntegerAttr>(dmaSubtile[dmaSubtile.size() - 1]);
+            if (!mAttr || !kAttr) {
+              op.emitError() << "Invalid 'subtile_size' for A: expected integer values";
+              subtileError = true;
+              return WalkResult::interrupt();
+            }
+            int parsedM = mAttr.getInt();
+            int parsedK = kAttr.getInt();
+            if (parsedM <= 0 || parsedK <= 0) {
+              op.emitError() << "Invalid 'subtile_size' for A: values must be > 0";
+              subtileError = true;
+              return WalkResult::interrupt();
+            }
+            if ((hasASubtileM && aSubtileM != parsedM) ||
+                (hasASubtileK && aSubtileK != parsedK)) {
+              op.emitError() << "Inconsistent A 'subtile_size' across DMA ops";
+              subtileError = true;
+              return WalkResult::interrupt();
+            }
+            hasASubtileM = true;
+            hasASubtileK = true;
+            aSubtileM = parsedM;
+            aSubtileK = parsedK;
+            subtileM = parsedM;
+          }
 
           isAInitialized = true;
         } else if (blockArg.getArgNumber() == idxMap[1]) {
           BDmaTag = dmaStartOp.getTagMemRef(); // Assuming `getTag()` retrieves the `tag` from `dma_start`.
           BDmaAsync = getAsyncValue(dmaStartOp);
           llvm::SmallVector<mlir::Attribute> dmaSubtile = getSubtileSize(dmaStartOp);
-          subtileN = llvm::dyn_cast<mlir::IntegerAttr>(dmaSubtile[dmaSubtile.size() - 1]).getInt();
+          if (!dmaSubtile.empty()) {
+            if (dmaSubtile.size() < 2) {
+              op.emitError() << "Invalid 'subtile_size' for B: expected at least 2 values [K, N]";
+              subtileError = true;
+              return WalkResult::interrupt();
+            }
+            auto kAttr = llvm::dyn_cast<mlir::IntegerAttr>(dmaSubtile[dmaSubtile.size() - 2]);
+            auto nAttr = llvm::dyn_cast<mlir::IntegerAttr>(dmaSubtile[dmaSubtile.size() - 1]);
+            if (!kAttr || !nAttr) {
+              op.emitError() << "Invalid 'subtile_size' for B: expected integer values";
+              subtileError = true;
+              return WalkResult::interrupt();
+            }
+            int parsedK = kAttr.getInt();
+            int parsedN = nAttr.getInt();
+            if (parsedK <= 0 || parsedN <= 0) {
+              op.emitError() << "Invalid 'subtile_size' for B: values must be > 0";
+              subtileError = true;
+              return WalkResult::interrupt();
+            }
+            if ((hasBSubtileK && bSubtileK != parsedK) ||
+                (hasBSubtileN && bSubtileN != parsedN)) {
+              op.emitError() << "Inconsistent B 'subtile_size' across DMA ops";
+              subtileError = true;
+              return WalkResult::interrupt();
+            }
+            hasBSubtileK = true;
+            hasBSubtileN = true;
+            bSubtileK = parsedK;
+            bSubtileN = parsedN;
+            subtileN = parsedN;
+          }
 
           isBInitialized = true;
         } else if (blockArg.getArgNumber() == idxMap[2]) {
@@ -450,6 +525,35 @@ struct MatmulOpLowering : public OpRewritePattern<linalg::MatmulOp> {
 
       return WalkResult::advance();
     });
+    if (walkResult.wasInterrupted() || subtileError)
+      return failure();
+
+    if (hasASubtileK && hasBSubtileK) {
+      if (aSubtileK != bSubtileK) {
+        op.emitError() << "Mismatched subtile K between A and B: A(" << aSubtileK
+                       << ") != B(" << bSubtileK << ")";
+        return failure();
+      }
+      subtileK = aSubtileK;
+    } else if (hasASubtileK) {
+      subtileK = aSubtileK;
+      if (subtileK != K) {
+        op.emitError() << "B has no 'subtile_size', expected K fallback(" << K
+                       << ") to match A subtileK(" << subtileK << ")";
+        return failure();
+      }
+    } else if (hasBSubtileK) {
+      subtileK = bSubtileK;
+      if (subtileK != K) {
+        op.emitError() << "A has no 'subtile_size', expected K fallback(" << K
+                       << ") to match B subtileK(" << subtileK << ")";
+        return failure();
+      }
+    }
+    if (hasASubtileM)
+      subtileM = aSubtileM;
+    if (hasBSubtileN)
+      subtileN = bSubtileN;
 
     int KStep = subtileK;
     int push_length = subtileM > SYSTOLIC_SIZE ? SYSTOLIC_SIZE : subtileM;
