@@ -77,7 +77,7 @@ std::pair<Value, bool> getSramMemRef(mlir::memref::DmaStartOp dmaOp) {
 }
 
 static std::pair<unsigned, VectorType> legalizeVectorType(const Type &type) {
-  VectorType vt = cast<VectorType>(type);
+  VectorType vt = dyn_cast<VectorType>(type);
   // To simplify test pass, avoid multi-dimensional vectors.
   if (!vt || vt.getRank() != 1)
     return {0, nullptr};
@@ -110,20 +110,17 @@ static std::pair<unsigned, VectorType> legalizeVectorType(const Type &type) {
 }
 
 bool traverseMMOperands(Value op_val, Value input) {
-  bool found = false;
-  if (op_val == input) {
+  if (op_val == input)
     return true;
-  }
+
   auto operation = op_val.getDefiningOp();
   if (operation) {
     for (auto operand : operation->getOperands()) {
-      found = found | traverseMMOperands(operand, input);
-      if (operand == input) {
+      if (operand == input || traverseMMOperands(operand, input))
         return true;
-      }
     }
   }
-  return found;
+  return false;
 }
 
 Value make_sf_vc_v_sv(Location loc, PatternRewriter &rewriter, Value vec, const Type opType,
@@ -328,7 +325,6 @@ struct MatmulOpLowering : public OpRewritePattern<linalg::MatmulOp> {
     int BDmaAsync = 0;
     int BiasDmaAsync = 0;
     ValueRange BiasDMAIndices;
-    mlir::Value OuterKLoopVar;
     std::vector<affine::AffineForOp> accumulationLoops;
     std::vector<affine::AffineForOp> outerLoops;
     std::vector<affine::AffineForOp> innerLoops;
@@ -352,8 +348,16 @@ struct MatmulOpLowering : public OpRewritePattern<linalg::MatmulOp> {
     }
 
     bool is_conv2d = (innerLoops.size() == 4);
-    assert(accumulationLoops.size()>=1);
-    assert(outerLoops.size()>=2);
+    if (accumulationLoops.empty()) {
+      op.emitError()
+          << "Expected at least one loop with 'accumulation_loop' attribute";
+      return failure();
+    }
+    if (outerLoops.size() < 2) {
+      op.emitError()
+          << "Expected at least two loops with 'outer_loop' attribute";
+      return failure();
+    }
 
     affine::AffineForOp tile_k_w_loop, tile_o_h_loop, tile_o_w_loop;
 
@@ -394,6 +398,35 @@ struct MatmulOpLowering : public OpRewritePattern<linalg::MatmulOp> {
     if (auto idxMapAttr = op->getAttrOfType<mlir::DenseI32ArrayAttr>("idx_map"))
         idxMap.assign(idxMapAttr.asArrayRef().begin(), idxMapAttr.asArrayRef().end());
 
+    auto parseSubtilePair = [&](ArrayRef<mlir::Attribute> dmaSubtile,
+                                StringRef operandName,
+                                StringRef expectedOrder,
+                                int &firstDim,
+                                int &secondDim) -> LogicalResult {
+      if (dmaSubtile.size() < 2) {
+        op.emitError() << "Invalid 'subtile_size' for " << operandName
+                       << ": expected at least 2 values " << expectedOrder;
+        return failure();
+      }
+      auto firstAttr =
+          llvm::dyn_cast<mlir::IntegerAttr>(dmaSubtile[dmaSubtile.size() - 2]);
+      auto secondAttr =
+          llvm::dyn_cast<mlir::IntegerAttr>(dmaSubtile[dmaSubtile.size() - 1]);
+      if (!firstAttr || !secondAttr) {
+        op.emitError() << "Invalid 'subtile_size' for " << operandName
+                       << ": expected integer values";
+        return failure();
+      }
+      firstDim = firstAttr.getInt();
+      secondDim = secondAttr.getInt();
+      if (firstDim <= 0 || secondDim <= 0) {
+        op.emitError() << "Invalid 'subtile_size' for " << operandName
+                       << ": values must be > 0";
+        return failure();
+      }
+      return success();
+    };
+
     auto walkResult = affineForOp->walk([&](mlir::Operation *nestedOp) {
       if (auto dmaStartOp = llvm::dyn_cast<memref::DmaStartOp>(nestedOp)) { // Replace DMAStartOp with actual `dma_start` op type
         auto result = getDramMemRef(dmaStartOp);
@@ -424,22 +457,10 @@ struct MatmulOpLowering : public OpRewritePattern<linalg::MatmulOp> {
           ADmaAsync = getAsyncValue(dmaStartOp);
           llvm::SmallVector<mlir::Attribute> dmaSubtile = getSubtileSize(dmaStartOp);
           if (!dmaSubtile.empty()) {
-            if (dmaSubtile.size() < 2) {
-              op.emitError() << "Invalid 'subtile_size' for A: expected at least 2 values [M, K]";
-              subtileError = true;
-              return WalkResult::interrupt();
-            }
-            auto mAttr = llvm::dyn_cast<mlir::IntegerAttr>(dmaSubtile[dmaSubtile.size() - 2]);
-            auto kAttr = llvm::dyn_cast<mlir::IntegerAttr>(dmaSubtile[dmaSubtile.size() - 1]);
-            if (!mAttr || !kAttr) {
-              op.emitError() << "Invalid 'subtile_size' for A: expected integer values";
-              subtileError = true;
-              return WalkResult::interrupt();
-            }
-            int parsedM = mAttr.getInt();
-            int parsedK = kAttr.getInt();
-            if (parsedM <= 0 || parsedK <= 0) {
-              op.emitError() << "Invalid 'subtile_size' for A: values must be > 0";
+            int parsedM = 0;
+            int parsedK = 0;
+            if (failed(parseSubtilePair(dmaSubtile, "A", "[M, K]", parsedM,
+                                        parsedK))) {
               subtileError = true;
               return WalkResult::interrupt();
             }
@@ -462,22 +483,10 @@ struct MatmulOpLowering : public OpRewritePattern<linalg::MatmulOp> {
           BDmaAsync = getAsyncValue(dmaStartOp);
           llvm::SmallVector<mlir::Attribute> dmaSubtile = getSubtileSize(dmaStartOp);
           if (!dmaSubtile.empty()) {
-            if (dmaSubtile.size() < 2) {
-              op.emitError() << "Invalid 'subtile_size' for B: expected at least 2 values [K, N]";
-              subtileError = true;
-              return WalkResult::interrupt();
-            }
-            auto kAttr = llvm::dyn_cast<mlir::IntegerAttr>(dmaSubtile[dmaSubtile.size() - 2]);
-            auto nAttr = llvm::dyn_cast<mlir::IntegerAttr>(dmaSubtile[dmaSubtile.size() - 1]);
-            if (!kAttr || !nAttr) {
-              op.emitError() << "Invalid 'subtile_size' for B: expected integer values";
-              subtileError = true;
-              return WalkResult::interrupt();
-            }
-            int parsedK = kAttr.getInt();
-            int parsedN = nAttr.getInt();
-            if (parsedK <= 0 || parsedN <= 0) {
-              op.emitError() << "Invalid 'subtile_size' for B: values must be > 0";
+            int parsedK = 0;
+            int parsedN = 0;
+            if (failed(parseSubtilePair(dmaSubtile, "B", "[K, N]", parsedK,
+                                        parsedN))) {
               subtileError = true;
               return WalkResult::interrupt();
             }
@@ -587,8 +596,8 @@ struct MatmulOpLowering : public OpRewritePattern<linalg::MatmulOp> {
       k_idx = inner_loop.getInductionVar();
     } else {
       k_idx = c0;
-      SmallVector<mlir::Attribute> values(nr_element, rewriter.getFloatAttr(rewriter.getF32Type(), 0.0));
-      auto denseAttr = mlir::DenseElementsAttr::get(vectorType, values);
+      auto denseAttr = mlir::DenseElementsAttr::get(
+          vectorType, rewriter.getZeroAttr(elementTypeA));
       zero_vector = rewriter.create<arith::ConstantOp>(loc, denseAttr);
     }
 
@@ -770,7 +779,7 @@ struct MatmulOpLowering : public OpRewritePattern<linalg::MatmulOp> {
         auto output_vector = rewriter.create<arith::AddIOp>(loc, prev_output, vpop);
         rewriter.create<vector::TransferWriteOp>(output_vector.getLoc(), output_vector, C, ValueRange{x_idx, y_idx});
       }
-      else if (vt.getElementType().isIntOrFloat())  {
+      else if (isa<FloatType>(vt.getElementType()))  {
         auto output_vector = rewriter.create<arith::AddFOp>(loc, prev_output, vpop);
         rewriter.create<vector::TransferWriteOp>(output_vector.getLoc(), output_vector, C, ValueRange{x_idx, y_idx});
       } else {
