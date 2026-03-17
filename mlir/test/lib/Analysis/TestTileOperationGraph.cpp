@@ -27,6 +27,49 @@
 
 using namespace mlir;
 
+/// Strategy: opcode-based Preload vs Matmul Compute.
+/// - Preload (opcode=1): vcix.iv with opcode=1 + transfer_read - one node
+/// - Matmul Compute: vcix.iv opcode=0 (input push) + vcix.i + vcix.v.i (vpop)
+///   Split when input_count == vpop_count (matmul complete). After that -> new node.
+static int getVcixIvOpcode(Operation *op) {
+  if (op->getName().getStringRef() != "vcix.iv")
+    return -1;
+  auto attr = op->getAttrOfType<IntegerAttr>("opcode");
+  return attr ? static_cast<int>(attr.getInt()) : -1;
+}
+static int countInputPush(TOGComputeNode *node) {
+  int n = 0;
+  for (Operation *op : node->operations)
+    if (getVcixIvOpcode(op) == 0)
+      n++;
+  return n;
+}
+static int countVpop(TOGComputeNode *node) {
+  int n = 0;
+  for (Operation *op : node->operations)
+    if (op->getName().getStringRef() == "vcix.v.i")
+      n++;
+  return n;
+}
+static bool nodeMatmulComputeComplete(TOGComputeNode *node) {
+  bool hasVcixI = false;
+  for (Operation *op : node->operations)
+    if (op->getName().getStringRef() == "vcix.i") {
+      hasVcixI = true;
+      break;
+    }
+  return hasVcixI && (countVpop(node) == countInputPush(node));
+}
+static bool nodeIsPreload(TOGComputeNode *node) {
+  bool hasOp1 = false;
+  for (Operation *op : node->operations)
+    if (getVcixIvOpcode(op) == 1)
+      hasOp1 = true;
+    else if (getVcixIvOpcode(op) == 0)
+      return false;  // has input push -> not preload
+  return hasOp1;
+}
+
 int64_t VECTOR_LANE = 128;
 
 namespace {
@@ -183,7 +226,8 @@ std::vector<int> TestTileOperationGraph::collectDividersFromAffineExpr(mlir::Aff
 void TestTileOperationGraph::printOperation(Operation &op, TOGNode *node) {
   StringRef name = op.getName().getStringRef();
   if (name == "affine.yield" || name == "affine.apply" || name == "memref.get_global" || \
-      name == "memref.reinterpret_cast" || name == "arith.constant")
+      name == "memref.reinterpret_cast" || name == "arith.constant" || \
+      name == "llvm.inline_asm")
     return;
 
   if (name == "affine.for") {
@@ -279,10 +323,10 @@ void TestTileOperationGraph::printOperation(Operation &op, TOGNode *node) {
     /* Record used loop index names */
     processDramIndices(dram_indices.front(), loop_index_map, loop_var_name, indirect_mode);
     std::map<std::string, std::pair<int, int>> reorderd_loop_map;
-    for (int i=0; i<loop_index_map.size(); i ++) {
+    for (size_t i = 0; i < loop_index_map.size(); i++) {
       const std::string& key = loop_index_map[i].first;
       int stride = loop_index_map[i].second;
-      int dim_size = i < tile_size.size() ? tile_size.at(i) : -1;
+      int dim_size = (i < tile_size.size()) ? tile_size.at(i) : -1;
       reorderd_loop_map[key] = {stride, dim_size};
     }
 
@@ -431,18 +475,50 @@ void TestTileOperationGraph::printOperation(Operation &op, TOGNode *node) {
   if (node == NULL)
     return;
 
-  /* Combine compute node */
-  auto type = name == "vcix.i" ? TOGComputeNode::MatmulCompute : (name == "vcix.iv" ? TOGComputeNode::MatmulPreload : TOGComputeNode::VectorCompute);
+  /* Combine compute node. Opcode-based strategy:
+   * - Preload: vcix.iv opcode=1 (+ transfer_read). One node. Ends at vcix.iv opcode=0.
+   * - Matmul Compute: vcix.iv opcode=0 (input) + vcix.i + vcix.v.i (vpop). Input count == vpop count.
+   * - After matmul complete: new node (vector or next preload). */
+  int vcixIvOpcode = getVcixIvOpcode(&op);
+  TOGComputeNode::ComputeType type;
+  if (vcixIvOpcode == 1)
+    type = TOGComputeNode::MatmulPreload;
+  else if (vcixIvOpcode == 0 || name == "vcix.i" || name == "vcix.v.i")
+    type = TOGComputeNode::MatmulCompute;
+  else
+    type = TOGComputeNode::VectorCompute;
+
   if (node->getChildren().size()) {
     TOGComputeNode *last_compute_node = dyn_cast<TOGComputeNode>(node->getLastChild());
     if (last_compute_node) {
-      last_compute_node->operations.push_back(&op);
-      if (type == TOGComputeNode::MatmulCompute || type == TOGComputeNode::MatmulPreload)
-        last_compute_node->setComputeType(type);
-      return;
+      bool lastMatmulComplete = nodeMatmulComputeComplete(last_compute_node);
+      bool lastIsPreload = nodeIsPreload(last_compute_node);
+
+      bool shouldSplit = false;
+      if (vcixIvOpcode == 1) {
+        /* vcix.iv opcode=1 (preload): split if last was MatmulCompute complete, or if last wasn't Preload (start fresh Preload) */
+        shouldSplit = lastMatmulComplete || !lastIsPreload;
+      } else if (vcixIvOpcode == 0) {
+        /* vcix.iv opcode=0 (input push): split if last was Preload -> start Matmul Compute */
+        shouldSplit = lastIsPreload;
+      } else if (lastMatmulComplete) {
+        /* Non-vcix.iv op after complete matmul (vector, etc.): split */
+        shouldSplit = true;
+      }
+
+      if (!shouldSplit) {
+        last_compute_node->operations.push_back(&op);
+        if (type == TOGComputeNode::MatmulCompute || type == TOGComputeNode::MatmulPreload)
+          last_compute_node->setComputeType(type);
+        return;
+      }
+      /* Fall through to create new node */
     }
   }
   /* Create new compute node */
+  // llvm::errs() << "[TOG] CREATE new compute node for op=" << name
+  //              << " type=" << (type == TOGComputeNode::MatmulCompute ? "MatmulCompute" : (type == TOGComputeNode::MatmulPreload ? "MatmulPreload" : "VectorCompute"))
+  //              << " (total nodes now: " << (compute_nodes.size() + 1) << ")\n";
   TOGComputeNode *tog_compute = new TOGComputeNode("ComputeNode", 0, type);
   tog_compute->setOp(&op);
   tog_compute->operations.push_back(&op);
