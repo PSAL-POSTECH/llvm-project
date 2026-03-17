@@ -287,11 +287,14 @@ void TestTileOperationGraph::printOperation(Operation &op, TOGNode *node) {
     }
 
     tile_size.clear();
+    tile_stride.clear();
     for (const auto& pair : reorderd_loop_map) {
         loop_index_list.push_back(pair.first);
         loop_stride_list.push_back(pair.second.first);
-        if (pair.second.second != -1)
+        if (pair.second.second != -1) {
           tile_size.push_back(pair.second.second);
+          tile_stride.push_back(pair.second.first);
+        }
     }
 
     /* Get DRAM argument index */
