@@ -286,12 +286,9 @@ void TestTileOperationGraph::printOperation(Operation &op, TOGNode *node) {
       reorderd_loop_map[key] = {stride, dim_size};
     }
 
-    tile_size.clear();
     for (const auto& pair : reorderd_loop_map) {
         loop_index_list.push_back(pair.first);
         loop_stride_list.push_back(pair.second.first);
-        if (pair.second.second != -1)
-          tile_size.push_back(pair.second.second);
     }
 
     /* Get DRAM argument index */
