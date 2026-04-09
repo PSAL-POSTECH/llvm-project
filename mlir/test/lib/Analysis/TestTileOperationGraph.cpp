@@ -20,9 +20,13 @@
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
 #include "mlir/Dialect/LLVMIR/VCIXDialect.h"
 #include "mlir/Pass/Pass.h"
+#include "mlir/IR/BuiltinAttributes.h"
 #include <algorithm>
 #include <iomanip>
+#include <optional>
 #include <sstream>
+#include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/SmallVector.h"
 #include "mlir/Analysis/CustomDMAAttribute.h"
 
 using namespace mlir;
@@ -30,6 +34,66 @@ using namespace mlir;
 int64_t VECTOR_LANE = 128;
 
 namespace {
+
+static const char *togComputeTypeStr(TOGComputeNode::ComputeType t) {
+  switch (t) {
+  case TOGComputeNode::VectorCompute:
+    return "VectorCompute";
+  case TOGComputeNode::MatmulCompute:
+    return "MatmulCompute";
+  case TOGComputeNode::MatmulPreload:
+    return "MatmulPreload";
+  }
+  return "?";
+}
+
+static void togLogNewNode(llvm::StringRef kind, const TOGNode *n,
+                          const TOGNode *parent) {
+  //llvm::errs() << "[TOG] new node kind=" << kind << " id=" << n->getId()
+  //             << " parent=" << (const void *)parent << "\n";
+}
+
+static void togLogNewComputeNode(const TOGComputeNode *cn, const TOGNode *parent) {
+  //llvm::errs() << "[TOG] new node kind=TOGComputeNode id=" << cn->getId()
+  //             << " compute_type=" << togComputeTypeStr(cn->getComputeType())
+  //             << "\n";
+}
+
+static void togLogAddOp(llvm::StringRef ctx, const TOGNode *parent,
+                        const TOGComputeNode *cn, Operation *op) {
+  //llvm::errs() << "[TOG] add op [" << ctx
+  //             << togComputeTypeStr(cn->getComputeType()) << " op=" << op->getName() << "\n";
+}
+
+/// True if \p forOp's body contains no operations other than `affine.yield`.
+static bool isEmptyAffineForBody(affine::AffineForOp forOp) {
+  Block *body = forOp.getBody();
+  if (!body)
+    return false;
+  if (body->without_terminator().begin() != body->without_terminator().end())
+    return false;
+  return isa<affine::AffineYieldOp>(body->getTerminator());
+}
+
+/// Erase `affine.for` ops with empty bodies (e.g. placeholder `for %i = 0 to 1 {}`).
+/// Runs in a fixed-point loop so an outer `for` becomes empty after removing a
+/// nested empty `for`. Must run before TOG walks the kernel.
+static void eraseEmptyAffineForLoops(func::FuncOp fn) {
+  bool changed = true;
+  while (changed) {
+    changed = false;
+    SmallVector<affine::AffineForOp, 16> toErase;
+    fn.walk<WalkOrder::PostOrder>([&](affine::AffineForOp forOp) {
+      if (isEmptyAffineForBody(forOp))
+        toErase.push_back(forOp);
+    });
+    for (affine::AffineForOp forOp : toErase) {
+      forOp.erase();
+      changed = true;
+    }
+  }
+}
+
 /// A testing pass that applies the TileOperationGraph analysis on a region and prints
 /// the information it collected to llvm::errs().
 struct TestTileOperationGraph
@@ -38,7 +102,8 @@ struct TestTileOperationGraph
   std::vector<TOGComputeNode *> compute_nodes;
   StringRef getArgument() const final { return "test-tile-operation-graph"; }
   StringRef getDescription() const final {
-    return "Test tile operation graph analysis";
+    return "Test tile operation graph analysis; -sample-mode controls whether "
+           "tagged affine.for loops are rewritten to run one iteration each";
   }
 
   Option<int> vectorlane{
@@ -51,7 +116,8 @@ struct TestTileOperationGraph
 
   void runOnOperation() override;
   void printOperation(Operation &op, TOGNode *node);
-  void getAffineForBounds(affine::AffineForOp &op, int &start, int &end, int &step, bool update);
+  void getAffineForBounds(affine::AffineForOp &op, int &start, int &end, int &step,
+                          bool sampleSingleIteration);
   void getDependentDialects(DialectRegistry &registry) const override {
     registry.insert<arith::ArithDialect, func::FuncDialect, math::MathDialect,
                     vcix::VCIXDialect, vector::VectorDialect, affine::AffineDialect,
@@ -66,13 +132,186 @@ struct TestTileOperationGraph
   std::vector<int> collectDividersFromAffineExpr(mlir::AffineExpr expr);
   int nr_loop = 0;
   llvm::DenseMap<void*, std::string> loop_var_name;
-  Option<int> tls_mode{*this, "tls_mode",
-                  llvm::cl::desc("tls_mode"),
-                  llvm::cl::init(1)};
+  Option<bool> sample_mode{
+      *this, "sample-mode",
+      llvm::cl::desc(
+          "Rewrite each tagged affine.for step so the loop runs a single "
+          "iteration (full range in one step); disable to keep original steps"),
+      llvm::cl::init(true)};
+
+  /// VCIX matmul grouping: preload (vcix.iv opcode=1) -> matmul compute (vcix.iv
+  /// opcode=0 + matching vcix.v.i count).
+  enum class MatmulFsm {
+    Idle,
+    Preload,
+    MMPush,
+    MMVpop,
+    MMEpilogue,
+  };
+  MatmulFsm matmulFsm = MatmulFsm::Idle;
+  int mmIvOp0Count = 0;
+  int mmExpectedVpop = 0;
+  int mmVpopSeen = 0;
+  /// Total vector.transfer_write ops expected for this matmul block (set at first
+  /// vpop): one per vpop iteration plus one tail after the last vpop.
+  int mmExpectedTransferWrites = 0;
+  int mmTransferWritesSeen = 0;
+  TOGComputeNode *currentPreloadNode = nullptr;
+  TOGComputeNode *currentMatmulComputeNode = nullptr;
+
+  void resetMatmulFsm();
+  void appendToVectorCompute(TOGNode *parent, Operation *op);
+  void finishMatmulComputeBlock();
+  void enterMatmulEpilogueOrFinish();
+  /// Append to current MatmulCompute; count vector::TransferWriteOp until
+  /// mmTransferWritesSeen >= mmExpectedTransferWrites then finish the block.
+  void appendToMatmulComputeWithWriteCount(TOGNode *parent, Operation *op,
+                                           StringRef logCtx);
+  /// If the last child is a VectorCompute, remove the first vector.transfer_read
+  /// in that node (prepend to MatmulPreload). Deletes the VectorCompute if it
+  /// becomes empty; otherwise updates setOp to the new front.
+  void stealLeadingVectorTransferReadForPreload(TOGNode *parent,
+                                                llvm::SmallVectorImpl<Operation *> &prepend);
+
+  static bool isVcixIv(Operation *op);
+  static bool isVcixVi(Operation *op);
+  static std::optional<int64_t> getVcixIvOpcode(Operation *op);
+  static std::optional<int64_t> getVcixViOpcode(Operation *op);
 };
 } // namespace
 
-void TestTileOperationGraph::getAffineForBounds(affine::AffineForOp &op, int &start, int &end, int &step, bool update) {
+void TestTileOperationGraph::resetMatmulFsm() {
+  matmulFsm = MatmulFsm::Idle;
+  mmIvOp0Count = 0;
+  mmExpectedVpop = 0;
+  mmVpopSeen = 0;
+  mmExpectedTransferWrites = 0;
+  mmTransferWritesSeen = 0;
+  currentPreloadNode = nullptr;
+  currentMatmulComputeNode = nullptr;
+}
+
+void TestTileOperationGraph::finishMatmulComputeBlock() {
+  matmulFsm = MatmulFsm::Idle;
+  currentMatmulComputeNode = nullptr;
+  mmIvOp0Count = 0;
+  mmExpectedVpop = 0;
+  mmVpopSeen = 0;
+  mmExpectedTransferWrites = 0;
+  mmTransferWritesSeen = 0;
+}
+
+void TestTileOperationGraph::enterMatmulEpilogueOrFinish() {
+  if (mmExpectedTransferWrites == 0)
+    finishMatmulComputeBlock();
+  else
+    matmulFsm = MatmulFsm::MMEpilogue;
+}
+
+void TestTileOperationGraph::appendToMatmulComputeWithWriteCount(TOGNode *parent,
+                                                                 Operation *op,
+                                                                 StringRef logCtx) {
+  if (!currentMatmulComputeNode)
+    return;
+  currentMatmulComputeNode->operations.push_back(op);
+  togLogAddOp(logCtx, parent, currentMatmulComputeNode, op);
+  if (!isa<vector::TransferWriteOp>(op))
+    return;
+  if (mmExpectedTransferWrites == 0)
+    return;
+  ++mmTransferWritesSeen;
+  if (mmTransferWritesSeen >= mmExpectedTransferWrites)
+    finishMatmulComputeBlock();
+}
+
+void TestTileOperationGraph::stealLeadingVectorTransferReadForPreload(
+    TOGNode *parent, llvm::SmallVectorImpl<Operation *> &prepend) {
+  prepend.clear();
+  if (!parent)
+    return;
+  TOGNode *last = parent->getLastChild();
+  if (!last)
+    return;
+  auto *lastCn = dyn_cast<TOGComputeNode>(last);
+  if (!lastCn || lastCn->getComputeType() != TOGComputeNode::VectorCompute)
+    return;
+  auto &ops = lastCn->operations;
+  auto it = llvm::find_if(ops, [](Operation *o) {
+    return o->getName().getStringRef() == "vector.transfer_read";
+  });
+  if (it == ops.end())
+    return;
+  prepend.push_back(*it);
+  ops.erase(it);
+  if (ops.empty()) {
+    if (!parent->children.empty() && parent->children.back() == lastCn)
+      parent->children.pop_back();
+    else
+      parent->children.erase(std::remove(parent->children.begin(),
+                                         parent->children.end(), lastCn),
+                             parent->children.end());
+    auto cit = std::find(compute_nodes.begin(), compute_nodes.end(), lastCn);
+    if (cit != compute_nodes.end())
+      compute_nodes.erase(cit);
+    delete lastCn;
+    return;
+  }
+  lastCn->setOp(ops.front());
+}
+
+void TestTileOperationGraph::appendToVectorCompute(TOGNode *parent, Operation *op) {
+  if (!parent)
+    return;
+  // getLastChild() is null when the parent has no children yet (e.g. first op in
+  // the loop body that reaches here). llvm::dyn_cast does not accept null; use
+  // dyn_cast_if_present to avoid isa() dereferencing a null TOGNode*.
+  TOGComputeNode *last =
+      dyn_cast_if_present<TOGComputeNode>(parent->getLastChild());
+  if (last && last->getComputeType() == TOGComputeNode::VectorCompute) {
+    last->operations.push_back(op);
+    togLogAddOp("vector-merge", parent, last, op);
+    return;
+  }
+  auto *cn = new TOGComputeNode("ComputeNode", 0, TOGComputeNode::VectorCompute);
+  togLogNewComputeNode(cn, parent);
+  cn->setOp(op);
+  cn->operations.push_back(op);
+  togLogAddOp("vector-new", parent, cn, op);
+  parent->addChild(cn);
+  cn->addParent(parent);
+  compute_nodes.push_back(cn);
+  return;
+}
+
+bool TestTileOperationGraph::isVcixIv(Operation *op) {
+  return op->getName().getStringRef() == "vcix.iv";
+}
+
+bool TestTileOperationGraph::isVcixVi(Operation *op) {
+  return op->getName().getStringRef() == "vcix.v.i";
+}
+
+std::optional<int64_t> TestTileOperationGraph::getVcixIvOpcode(Operation *op) {
+  if (!isVcixIv(op))
+    return std::nullopt;
+  auto opcodeAttr = op->getAttrOfType<IntegerAttr>("opcode");
+  if (!opcodeAttr)
+    return std::nullopt;
+  return opcodeAttr.getInt();
+}
+
+std::optional<int64_t> TestTileOperationGraph::getVcixViOpcode(Operation *op) {
+  if (!isVcixVi(op))
+    return std::nullopt;
+  auto opcodeAttr = op->getAttrOfType<IntegerAttr>("opcode");
+  if (!opcodeAttr)
+    return std::nullopt;
+  return opcodeAttr.getInt();
+}
+
+void TestTileOperationGraph::getAffineForBounds(affine::AffineForOp &op, int &start,
+                                                int &end, int &step,
+                                                bool sampleSingleIteration) {
   // Get the step value, which is always an integer
   step = static_cast<int>(op.getStep().getSExtValue());
   auto lowerBoundMap = op.getLowerBoundMap();
@@ -94,8 +333,7 @@ void TestTileOperationGraph::getAffineForBounds(affine::AffineForOp &op, int &st
     end = static_cast<int>(constOp.value());
   }
 
-  // Modify step size
-  if (update)
+  if (sampleSingleIteration)
     op.setStep(end);
 }
 
@@ -183,7 +421,7 @@ std::vector<int> TestTileOperationGraph::collectDividersFromAffineExpr(mlir::Aff
 void TestTileOperationGraph::printOperation(Operation &op, TOGNode *node) {
   StringRef name = op.getName().getStringRef();
   if (name == "affine.yield" || name == "affine.apply" || name == "memref.get_global" || \
-      name == "memref.reinterpret_cast" || name == "arith.constant")
+      name == "arith.constant" || name == "memref.alloc" || name == "memref.reinterpret_cast")
     return;
 
   if (name == "affine.for") {
@@ -203,7 +441,7 @@ void TestTileOperationGraph::printOperation(Operation &op, TOGNode *node) {
     if ((outerLoopAttr && outerLoopAttr.getValue()) || (outerLoopAttr2 && outerLoopAttr2.getValue()) || (innerLoopAttr && innerLoopAttr.getValue())) {
       // Get loop information and create loop node
       int start, end, step;
-      getAffineForBounds(for_op, start, end, step, tls_mode);
+      getAffineForBounds(for_op, start, end, step, sample_mode);
       std::ostringstream oss;
       oss << "loop_arg" << std::setw(3) << std::setfill('0') << nr_loop++;
       std::string loop_index = oss.str();
@@ -425,28 +663,124 @@ void TestTileOperationGraph::printOperation(Operation &op, TOGNode *node) {
   if (node == NULL)
     return;
 
-  /* Combine compute node */
-  auto type = name == "vcix.i" ? TOGComputeNode::MatmulCompute : (name == "vcix.iv" ? TOGComputeNode::MatmulPreload : TOGComputeNode::VectorCompute);
-  if (node->getChildren().size()) {
-    TOGComputeNode *last_compute_node = dyn_cast<TOGComputeNode>(node->getLastChild());
-    if (last_compute_node) {
-      last_compute_node->operations.push_back(&op);
-      if (type == TOGComputeNode::MatmulCompute || type == TOGComputeNode::MatmulPreload)
-        last_compute_node->setComputeType(type);
+  // Extract compute node
+  // vcix.iv: opcode 1 = preload segment, opcode 0 = matmul input push / compute.
+  if (isVcixIv(&op)) {
+    if (matmulFsm == MatmulFsm::MMEpilogue && currentMatmulComputeNode)
+      finishMatmulComputeBlock();
+    if (auto opc = getVcixIvOpcode(&op)) {
+      if (*opc == 1) {
+        if (matmulFsm == MatmulFsm::Idle) {
+          llvm::SmallVector<Operation *, 2> prependTr;
+          stealLeadingVectorTransferReadForPreload(node, prependTr);
+          auto *cn = new TOGComputeNode("ComputeNode", 0, TOGComputeNode::MatmulPreload);
+          togLogNewComputeNode(cn, node);
+          for (Operation *o : prependTr)
+            cn->operations.push_back(o);
+          cn->operations.push_back(&op);
+          cn->setOp(cn->operations.front());
+          togLogAddOp("vcix.iv-preload-start", node, cn, &op);
+          node->addChild(cn);
+          cn->addParent(node);
+          compute_nodes.push_back(cn);
+          currentPreloadNode = cn;
+          matmulFsm = MatmulFsm::Preload;
+        } else if (matmulFsm == MatmulFsm::Preload && currentPreloadNode) {
+          currentPreloadNode->operations.push_back(&op);
+          togLogAddOp("vcix.iv-preload-cont", node, currentPreloadNode, &op);
+        } else {
+          op.emitOpError() << "vcix.iv with opcode=1 (preload) must start a matmul segment "
+                              "from Idle or continue within Preload; current state is invalid "
+                              "for this instruction";
+          signalPassFailure();
+        }
+        return;
+      }
+      if (*opc == 0) {
+        if (matmulFsm == MatmulFsm::Preload && currentPreloadNode) {
+          auto *cn = new TOGComputeNode("ComputeNode", 0, TOGComputeNode::MatmulCompute);
+          togLogNewComputeNode(cn, node);
+          cn->setOp(&op);
+          cn->operations.push_back(&op);
+          togLogAddOp("vcix.iv-matmul-start", node, cn, &op);
+          node->addChild(cn);
+          cn->addParent(node);
+          compute_nodes.push_back(cn);
+          currentPreloadNode = nullptr;
+          currentMatmulComputeNode = cn;
+          matmulFsm = MatmulFsm::MMPush;
+          mmIvOp0Count = 1;
+          return;
+        }
+        if (matmulFsm == MatmulFsm::MMPush && currentMatmulComputeNode) {
+          currentMatmulComputeNode->operations.push_back(&op);
+          togLogAddOp("vcix.iv-matmul-cont", node, currentMatmulComputeNode, &op);
+          ++mmIvOp0Count;
+          return;
+        }
+        op.emitOpError() << "vcix.iv with opcode=0 (matmul input push) must follow Preload "
+                            "(start matmul compute) or continue MMPush; current state is "
+                            "invalid for this instruction";
+        signalPassFailure();
+        return;
+      }
+    }
+    if (matmulFsm == MatmulFsm::MMEpilogue && currentMatmulComputeNode) {
+      appendToMatmulComputeWithWriteCount(node, &op, "matmul-epilogue");
       return;
     }
+    appendToVectorCompute(node, &op);
+    return;
   }
-  /* Create new compute node */
-  TOGComputeNode *tog_compute = new TOGComputeNode("ComputeNode", 0, type);
-  tog_compute->setOp(&op);
-  tog_compute->operations.push_back(&op);
-  /* Link child and parent */
-  node->addChild(tog_compute);
-  tog_compute->addParent(node);
 
-  /* Register compute node to vector */
-  compute_nodes.push_back(tog_compute);
-  return; // Compute node
+  // vcix.v.i: opcode=2 participates in matmul vpop FSM; other opcodes are vector ops.
+  if (isVcixVi(&op)) {
+    if (auto viOpc = getVcixViOpcode(&op); viOpc && *viOpc == 2) {
+      if (matmulFsm == MatmulFsm::MMPush && currentMatmulComputeNode) {
+        mmExpectedVpop = mmIvOp0Count;
+        // One vector.transfer_write per vpop iteration, plus one after the last vpop.
+        mmExpectedTransferWrites = mmExpectedVpop;
+        mmTransferWritesSeen = 0;
+        matmulFsm = MatmulFsm::MMVpop;
+        mmVpopSeen = 1;
+        currentMatmulComputeNode->operations.push_back(&op);
+        togLogAddOp("vcix.vi-vpop-start", node, currentMatmulComputeNode, &op);
+        if (mmVpopSeen >= mmExpectedVpop)
+          enterMatmulEpilogueOrFinish();
+        return;
+      }
+      if (matmulFsm == MatmulFsm::MMVpop && currentMatmulComputeNode) {
+        currentMatmulComputeNode->operations.push_back(&op);
+        togLogAddOp("vcix.vi-vpop-cont", node, currentMatmulComputeNode, &op);
+        ++mmVpopSeen;
+        if (mmVpopSeen >= mmExpectedVpop)
+          enterMatmulEpilogueOrFinish();
+        return;
+      }
+    }
+    if (matmulFsm == MatmulFsm::MMEpilogue && currentMatmulComputeNode) {
+      appendToMatmulComputeWithWriteCount(node, &op, "matmul-epilogue");
+      return;
+    }
+    appendToVectorCompute(node, &op);
+    return;
+  }
+
+  if (matmulFsm == MatmulFsm::Preload && currentPreloadNode) {
+    currentPreloadNode->operations.push_back(&op);
+    togLogAddOp("matmul-fsm-preload", node, currentPreloadNode, &op);
+    return;
+  }
+  if (matmulFsm == MatmulFsm::MMEpilogue && currentMatmulComputeNode) {
+    appendToMatmulComputeWithWriteCount(node, &op, "matmul-epilogue");
+    return;
+  }
+  if ((matmulFsm == MatmulFsm::MMPush || matmulFsm == MatmulFsm::MMVpop) &&
+      currentMatmulComputeNode) {
+    appendToMatmulComputeWithWriteCount(node, &op, "matmul-fsm-mm");
+    return;
+  }
+  appendToVectorCompute(node, &op);
 }
 
 void TestTileOperationGraph::runOnOperation() {
@@ -458,6 +792,8 @@ void TestTileOperationGraph::runOnOperation() {
   if (funcName.compare(llvm::StringRef("kernel"))) {
     return;
   }
+
+  eraseEmptyAffineForLoops(op);
 
   // Check kernel function has one region
   if (op->getNumRegions() != 1) {
@@ -477,6 +813,7 @@ void TestTileOperationGraph::runOnOperation() {
     if (name != "affine.for")
       continue;
     TOGNode *dummy = new TOGNode("root");
+    resetMatmulFsm();
     printOperation(op, dummy);
     dummy->bfs();
   }
@@ -487,12 +824,13 @@ void TestTileOperationGraph::runOnOperation() {
   auto asmDialectAttr =
     LLVM::AsmDialectAttr::get(builder.getContext(), LLVM::AsmDialect::AD_ATT);
   for (TOGComputeNode *compute_node : compute_nodes) {
+    if (compute_node->operations.empty())
+      continue;
     Location loc = compute_node->operations.front()->getLoc();
 
     // Insert the inline assembly before the first operation
     builder.setInsertionPoint(compute_node->operations.front());
-    OperationState asmBeforeState(loc, "inline_asm");
-    builder.create<LLVM::InlineAsmOp>(
+    auto beforeAsm = builder.create<LLVM::InlineAsmOp>(
       loc,
       /*resultTypes=*/TypeRange(),
       /*operands=*/ValueRange(),
@@ -501,12 +839,13 @@ void TestTileOperationGraph::runOnOperation() {
       /*has_side_effects=*/true,
       /*is_align_stack=*/false,
       /*asm_dialect=*/asmDialectAttr,
-      ArrayAttr()
-    );
+      ArrayAttr());
+    beforeAsm->setAttr("compute_type",
+                       builder.getStringAttr(
+                           togComputeTypeStr(compute_node->getComputeType())));
 
     // Insert the inline assembly after the last operation
     builder.setInsertionPointAfter(compute_node->operations.back());
-    OperationState asmAfterState(loc, "inline_asm");
     builder.create<LLVM::InlineAsmOp>(
       loc,
       /*resultTypes=*/TypeRange(),
