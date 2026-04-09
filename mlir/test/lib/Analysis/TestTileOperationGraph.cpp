@@ -304,9 +304,9 @@ void TestTileOperationGraph::printOperation(Operation &op, TOGNode *node) {
     /* Extract destination element type */
     mlir::Type element_type = tile_memref_type.getElementType();
     if (auto int_type = dyn_cast<mlir::IntegerType>(element_type)) {
-      element_size = int_type.getWidth() / 8; // Convert bits to bytes
+      element_size = int_type.getWidth();
     } else if (auto float_type = dyn_cast<mlir::FloatType>(element_type)) {
-      element_size = float_type.getWidth() / 8; // Convert bits to bytes
+      element_size = float_type.getWidth();
     } else {
       op.emitError() << tile_memref_type << "Unsupported element type\n";
       return;
