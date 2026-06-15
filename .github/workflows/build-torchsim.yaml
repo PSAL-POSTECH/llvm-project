@@ -26,18 +26,28 @@ jobs:
           ref: torchsim
           path: llvm-project
 
-      - name: Debug1
-        run: ls ${{ github.workspace }} -al && ls ${{ github.workspace }}/llvm-project -al
-
       - name: Build LLVM
+        # MLIR Python bindings are built into the artifact (python_packages/) so
+        # PyTorchSim can run Python-side MLIR passes. The bindings are a native
+        # extension and MUST be built against the SAME Python minor version as the
+        # runtime base image (3.11), or `import mlir` fails on ABI mismatch.
+        # The build container is non-root and ships 3.10, so we fetch a standalone
+        # CPython 3.11 with uv (no root / no apt needed) and build against it.
         run: |
           docker run --rm -v ${{ github.workspace }}:/workspace -w /workspace/llvm-project \
           -u $(id -u):$(id -g) \
           ghcr.io/gem5/ubuntu-22.04_all-dependencies:latest \
           bash -c "
+            export HOME=/tmp PATH=/tmp/.local/bin:\$PATH &&
+            python3 -m pip install --user uv &&
+            uv venv --python 3.11 /tmp/mlirvenv &&
+            PYBIN=/tmp/mlirvenv/bin/python &&
+            uv pip install --python \"\$PYBIN\" \"pybind11>=2.9.0,<=2.10.3\" numpy PyYAML &&
             mkdir -p build && cd build &&
-            cmake -DLLVM_ENABLE_PROJECTS=mlir -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/workspace/llvm-project/riscv-llvm -DLLVM_TARGETS_TO_BUILD=RISCV -G \"Unix Makefiles\" ../llvm &&
-            make -j && make install"
+            cmake -DLLVM_ENABLE_PROJECTS=mlir -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/workspace/llvm-project/riscv-llvm -DLLVM_TARGETS_TO_BUILD=RISCV -DMLIR_ENABLE_BINDINGS_PYTHON=ON -DPython3_EXECUTABLE=\"\$PYBIN\" -G \"Unix Makefiles\" ../llvm &&
+            make -j && make install &&
+            rm -rf /workspace/llvm-project/riscv-llvm/python_packages &&
+            cp -r tools/mlir/python_packages /workspace/llvm-project/riscv-llvm/python_packages"
 
       - name: Debug2
         run: ls ${{ github.workspace }} -al
