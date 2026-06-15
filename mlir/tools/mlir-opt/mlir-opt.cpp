@@ -316,6 +316,10 @@ int main(int argc, char **argv) {
   // implemented, see D157703 (and corresponding note on the declaration).
   registerAllGPUToLLVMIRTranslations(registry);
 
+  // Register the VCIX dialect so vcix ops round-trip through text (mlir-opt can
+  // parse them), enabling Python out-of-line passes that produce/consume vcix.
+  registerVCIXDialectTranslation(registry);
+
 #ifdef MLIR_INCLUDE_TESTS
   ::test::registerTestDialect(registry);
   ::test::registerTestTransformDialectExtension(registry);
