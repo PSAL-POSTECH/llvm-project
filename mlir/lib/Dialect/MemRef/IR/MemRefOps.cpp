@@ -1181,9 +1181,13 @@ void DmaStartOp::print(OpAsmPrinter &p) {
   if (isStrided())
     p << ", " << getStride() << ", " << getNumElementsPerStride();
 
-  p.printOptionalAttrDict((*this)->getAttrs());
   p << " : " << getSrcMemRef().getType() << ", " << getDstMemRef().getType()
     << ", " << getTagMemRef().getType();
+  // Print the attribute dictionary AFTER the type list to match DmaStartOp::parse
+  // (which calls parseOptionalAttrDict after parseColonTypeList). Otherwise the
+  // printed form `operands {attrs} : types` fails to re-parse when the op carries
+  // discardable attributes (e.g. PyTorchSim's dram_stride/sram_stride/padding).
+  p.printOptionalAttrDict((*this)->getAttrs());
 }
 
 // Parse DmaStartOp.
