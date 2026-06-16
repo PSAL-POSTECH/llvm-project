@@ -47,7 +47,7 @@ jobs:
             cmake -DLLVM_ENABLE_PROJECTS=mlir -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/workspace/llvm-project/riscv-llvm -DLLVM_TARGETS_TO_BUILD=RISCV -DMLIR_ENABLE_BINDINGS_PYTHON=ON -DPython3_EXECUTABLE=\"\$PYBIN\" -G \"Unix Makefiles\" ../llvm &&
             make -j && make install &&
             rm -rf /workspace/llvm-project/riscv-llvm/python_packages &&
-            cp -r tools/mlir/python_packages /workspace/llvm-project/riscv-llvm/python_packages"
+            cp -rL tools/mlir/python_packages /workspace/llvm-project/riscv-llvm/python_packages"
 
       - name: Debug2
         run: ls ${{ github.workspace }} -al
