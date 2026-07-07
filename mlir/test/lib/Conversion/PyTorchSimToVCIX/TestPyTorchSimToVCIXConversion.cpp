@@ -856,6 +856,26 @@ struct MathLogToVCIX: public OpRewritePattern<math::LogOp> {
   }
 };
 
+struct MathAtanToVCIX: public OpRewritePattern<math::AtanOp> {
+  using OpRewritePattern::OpRewritePattern;
+
+  LogicalResult
+  matchAndRewrite(math::AtanOp op, PatternRewriter &rewriter) const override {
+    const Type opType = op.getOperand().getType();
+    auto [n, legalType] = legalizeVectorType(opType);
+    if (!legalType)
+      return rewriter.notifyMatchFailure(op, "cannot legalize type for RVV");
+    Location loc = op.getLoc();
+    Value vec = op.getOperand();
+    // Reuse opcode 2 (sin=0, cos=1, log=2), atan=3 for a distinct slot.
+    uint64_t opcode = 0b000010;
+    uint64_t imm = 3;
+    Value res = make_sf_vc_v_iv(loc, rewriter, vec, opType, n, legalType, opcode, imm);
+    rewriter.replaceOp(op, res);
+    return success();
+  }
+};
+
 struct MathTanhToVCIX: public OpRewritePattern<math::TanhOp> {
   using OpRewritePattern::OpRewritePattern;
 
@@ -942,6 +962,7 @@ struct TestPyTorchSimToVCIX
     patterns.add<MathCosToVCIX>(ctx);
     patterns.add<MathSinToVCIX>(ctx);
     patterns.add<MathLogToVCIX>(ctx);
+    patterns.add<MathAtanToVCIX>(ctx);
     ConversionTarget target(getContext());
     target.addIllegalOp<linalg::MatmulOp>();
     target.addIllegalOp<math::ExpOp>();
@@ -951,6 +972,7 @@ struct TestPyTorchSimToVCIX
     target.addIllegalOp<math::SinOp>();
     target.addIllegalOp<math::CosOp>();
     target.addIllegalOp<math::LogOp>();
+    target.addIllegalOp<math::AtanOp>();
     target.markUnknownOpDynamicallyLegal([](Operation *) { return true; });
     if (failed(applyPartialConversion(getOperation(), target, std::move(patterns)))) {
       signalPassFailure();
