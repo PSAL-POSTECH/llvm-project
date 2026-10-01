@@ -5,6 +5,9 @@ name: build install
 # only, and it lives on the default branch so that the branch being built stays
 # LLVM source and nothing else -- a workflow commit there would move the SHA
 # the tag is named after.
+#
+# A release and not an actions artifact: the consumer is one anonymous curl in
+# setup/restore.sh, and an artifact needs a token and expires.
 
 on:
   workflow_dispatch:
@@ -13,6 +16,11 @@ on:
         description: branch or sha to build
         type: string
         default: torchsim-llvm23
+
+# Two builds of one revision would race for its tag.
+concurrency:
+  group: build-install-${{ inputs.ref }}
+  cancel-in-progress: true
 
 jobs:
   build:
@@ -47,7 +55,8 @@ jobs:
           /usr/bin/python3.11 -m pip install -q -r mlir/python/requirements.txt
 
       # Every target has a caller: RISCV is what this emits, AMDGPU and NVPTX
-      # are triton's backends, X86 is the host.
+      # are triton's backends, X86 is the host. Link jobs are capped because
+      # these link statically and the runner has 64 GB.
       - name: Build
         run: |
           set -euo pipefail
@@ -61,58 +70,38 @@ jobs:
             -DLLVM_ENABLE_ASSERTIONS=OFF \
             -DLLVM_INSTALL_UTILS=ON \
             -DLLVM_BUILD_EXAMPLES=OFF \
+            -DLLVM_INCLUDE_TESTS=OFF \
+            -DLLVM_INCLUDE_DOCS=OFF \
+            -DLLVM_INCLUDE_BENCHMARKS=OFF \
+            -DLLVM_OPTIMIZED_TABLEGEN=ON \
+            -DLLVM_PARALLEL_LINK_JOBS="$(( $(nproc) / 4 + 1 ))" \
             -DCMAKE_INSTALL_PREFIX="$PWD/install"
           /tmp/bt/bin/cmake --build build -j "$(nproc)"
           /tmp/bt/bin/cmake --build build --target install
           ./install/bin/llc --version | sed -n 2p
           test -d install/python_packages/mlir_core/mlir
 
+      # gzip and a top-level install/, because that is what restore.sh unpacks
+      # with. The SHA is the checked-out ref's, not this workflow's.
       - name: Pack
-        run: tar -I "gzip -1" -cf llvm-install.tar.gz install
-
-      # urllib and not gh, which this image does not carry.
-      - name: Publish
-        env:
-          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        id: pack
         run: |
           set -euo pipefail
-          SHA="$(git rev-parse HEAD)" /usr/bin/python3.11 - <<'PY'
-          import json, os, urllib.error, urllib.request
+          sha=$(git rev-parse HEAD)
+          tar -I "gzip -1" -cf llvm-install.tar.gz install
+          ls -lh llvm-install.tar.gz
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "tag=llvm23-${sha:0:12}" >> "$GITHUB_OUTPUT"
 
-          sha = os.environ["SHA"]
-          tag = f"llvm23-{sha[:12]}"
-          api = "https://api.github.com/repos/" + os.environ["GITHUB_REPOSITORY"]
-          hdr = {"Authorization": "Bearer " + os.environ["TOKEN"],
-                 "Accept": "application/vnd.github+json"}
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.pack.outputs.tag }}
+          target_commitish: ${{ steps.pack.outputs.sha }}
+          name: LLVM install @ ${{ steps.pack.outputs.tag }}
+          files: llvm-install.tar.gz
+          body: |
+            Built from ${{ steps.pack.outputs.sha }} by
+            .github/workflows/build-install.yml.
 
-          def call(url, method="GET", body=None, ctype=None):
-              h = dict(hdr) | ({"Content-Type": ctype} if ctype else {})
-              req = urllib.request.Request(url, data=body, headers=h, method=method)
-              try:
-                  with urllib.request.urlopen(req) as r:
-                      return json.loads(r.read() or b"null")
-              except urllib.error.HTTPError as e:
-                  if e.code == 404 and method == "GET":
-                      return None
-                  raise SystemExit(f"{method} {url} -> {e.code}\n{e.read().decode()}")
-
-          # Replaced rather than added to: one asset per revision, and a rerun
-          # of the same revision is a rebuild of the same thing.
-          old = call(f"{api}/releases/tags/{tag}")
-          if old:
-              call(f"{api}/releases/{old['id']}", "DELETE")
-              call(f"{api}/git/refs/tags/{tag}", "DELETE")
-
-          rel = call(f"{api}/releases", "POST", json.dumps({
-              "tag_name": tag, "target_commitish": sha,
-              "name": f"LLVM install @ {sha[:12]}",
-              "body": f"Built from {sha} by .github/workflows/build-install.yml. "
-                      "Unpacks to install/. Consumed by pytorchsim-triton-opt's "
-                      "setup/restore.sh, which derives this tag from LLVM_SHA.",
-          }).encode(), "application/json")
-
-          up = rel["upload_url"].split("{")[0] + "?name=llvm-install.tar.gz"
-          with open("llvm-install.tar.gz", "rb") as f:
-              asset = call(up, "POST", f.read(), "application/gzip")
-          print(tag, asset["name"], asset["size"], asset["state"])
-          PY
+            Unpacks to install/. Consumed by pytorchsim-triton-opt's
+            setup/restore.sh, which derives this tag from LLVM_SHA.
