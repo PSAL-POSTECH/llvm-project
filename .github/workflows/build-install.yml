@@ -16,7 +16,7 @@ on:
 
 jobs:
   build:
-    runs-on: [self-hosted, slurm, x86_64]
+    runs-on: [self-hosted, slurm, big, x86_64]
     permissions:
       contents: write
     # The image the asset is FOR. MLIR's python bindings are built against one
