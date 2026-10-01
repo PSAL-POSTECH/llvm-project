@@ -77,10 +77,13 @@ getOrCreateOperandsMatchingResultTypes(OpBuilder &b, Operation *op) {
     if (found)
       continue;
 
-    // Extract static / dynamic shape mix from the first operand.
+    // Extract static / dynamic shape mix from the first operand. The encoding
+    // comes with it: an init that drops it does not have the result's type, and
+    // the linalg op it feeds then states two types for one value.
     res.push_back(tensor::EmptyOp::create(
         b, loc, tensor::getMixedSizes(b, loc, operands.front()),
-        cast<RankedTensorType>(t).getElementType()));
+        cast<RankedTensorType>(t).getElementType(),
+        cast<RankedTensorType>(t).getEncoding()));
   }
   return res;
 }

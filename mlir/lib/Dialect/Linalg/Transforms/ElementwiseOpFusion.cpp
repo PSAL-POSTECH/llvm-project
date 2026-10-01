@@ -2376,8 +2376,13 @@ struct RemoveOutsDependency : public OpRewritePattern<GenericOp> {
         modifiedOutput = true;
         SmallVector<OpFoldResult> mixedSizes =
             tensor::getMixedSizes(rewriter, loc, operandVal);
+        // THE ENCODING COMES WITH THE SIZES. This init replaces `operandVal`
+        // and has to have its type, not merely its shape: the linalg op it
+        // feeds compares the two exactly, and an init that dropped the
+        // encoding makes that op state two types for one value.
         Value emptyTensor = tensor::EmptyOp::create(
-            rewriter, loc, mixedSizes, operandType.getElementType());
+            rewriter, loc, mixedSizes, operandType.getElementType(),
+            operandType.getEncoding());
         op->setOperand(opOperand.getOperandNumber(), emptyTensor);
       }
     }
