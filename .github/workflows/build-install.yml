@@ -24,6 +24,11 @@ jobs:
     # both are this python3.11.
     container:
       image: ghcr.io/psal-postech/torchsim_tnpu@sha256:a3279ff7549e6ff72897373e1aafff8a8d2349cdc2e21759382f7a4cf9acc80d
+    # Its /bin/sh is dash, which the runner picks by default and which has no
+    # pipefail.
+    defaults:
+      run:
+        shell: bash
 
     steps:
       - uses: actions/checkout@v4
@@ -31,6 +36,8 @@ jobs:
           ref: ${{ inputs.ref }}
           fetch-depth: 1
 
+      # Pinned over the image's 3.26.4: this is the cmake the install everyone
+      # runs today was built with.
       - name: Build tools
         run: |
           set -euo pipefail
@@ -60,19 +67,52 @@ jobs:
           ./install/bin/llc --version | sed -n 2p
           test -d install/python_packages/mlir_core/mlir
 
+      - name: Pack
+        run: tar -I "gzip -1" -cf llvm-install.tar.gz install
+
+      # urllib and not gh, which this image does not carry.
       - name: Publish
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          sha=$(git rev-parse HEAD)
-          tag="llvm23-${sha:0:12}"
-          tar -I "gzip -1" -cf llvm-install.tar.gz install
+          SHA="$(git rev-parse HEAD)" /usr/bin/python3.11 - <<'PY'
+          import json, os, urllib.error, urllib.request
+
+          sha = os.environ["SHA"]
+          tag = f"llvm23-{sha[:12]}"
+          api = "https://api.github.com/repos/" + os.environ["GITHUB_REPOSITORY"]
+          hdr = {"Authorization": "Bearer " + os.environ["TOKEN"],
+                 "Accept": "application/vnd.github+json"}
+
+          def call(url, method="GET", body=None, ctype=None):
+              h = dict(hdr) | ({"Content-Type": ctype} if ctype else {})
+              req = urllib.request.Request(url, data=body, headers=h, method=method)
+              try:
+                  with urllib.request.urlopen(req) as r:
+                      return json.loads(r.read() or b"null")
+              except urllib.error.HTTPError as e:
+                  if e.code == 404 and method == "GET":
+                      return None
+                  raise SystemExit(f"{method} {url} -> {e.code}\n{e.read().decode()}")
+
           # Replaced rather than added to: one asset per revision, and a rerun
           # of the same revision is a rebuild of the same thing.
-          gh release delete "$tag" -R "$GITHUB_REPOSITORY" -y 2>/dev/null || true
-          gh release create "$tag" -R "$GITHUB_REPOSITORY" \
-            --target "$sha" --title "LLVM install @ ${sha:0:12}" \
-            --notes "Built from $sha. Unpacks to install/. Consumed by pytorchsim-triton-opt's setup/restore.sh, which derives this tag from LLVM_SHA." \
-            llvm-install.tar.gz
-          echo "published $tag"
+          old = call(f"{api}/releases/tags/{tag}")
+          if old:
+              call(f"{api}/releases/{old['id']}", "DELETE")
+              call(f"{api}/git/refs/tags/{tag}", "DELETE")
+
+          rel = call(f"{api}/releases", "POST", json.dumps({
+              "tag_name": tag, "target_commitish": sha,
+              "name": f"LLVM install @ {sha[:12]}",
+              "body": f"Built from {sha} by .github/workflows/build-install.yml. "
+                      "Unpacks to install/. Consumed by pytorchsim-triton-opt's "
+                      "setup/restore.sh, which derives this tag from LLVM_SHA.",
+          }).encode(), "application/json")
+
+          up = rel["upload_url"].split("{")[0] + "?name=llvm-install.tar.gz"
+          with open("llvm-install.tar.gz", "rb") as f:
+              asset = call(up, "POST", f.read(), "application/gzip")
+          print(tag, asset["name"], asset["size"], asset["state"])
+          PY
