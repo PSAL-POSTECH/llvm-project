@@ -1,0 +1,78 @@
+name: build install
+
+# A built LLVM install for whatever ref is asked for, published as the release
+# tag that pytorchsim-triton-opt derives from its pinned LLVM_SHA. Dispatch
+# only, and it lives on the default branch so that the branch being built stays
+# LLVM source and nothing else -- a workflow commit there would move the SHA
+# the tag is named after.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: branch or sha to build
+        type: string
+        default: torchsim-llvm23
+
+jobs:
+  build:
+    runs-on: [self-hosted, slurm, x86_64]
+    permissions:
+      contents: write
+    # The image the asset is FOR. MLIR's python bindings are built against one
+    # interpreter and loaded by another, so they are only interchangeable if
+    # both are this python3.11.
+    container:
+      image: ghcr.io/psal-postech/torchsim_tnpu@sha256:a3279ff7549e6ff72897373e1aafff8a8d2349cdc2e21759382f7a4cf9acc80d
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+          fetch-depth: 1
+
+      - name: Build tools
+        run: |
+          set -euo pipefail
+          /usr/bin/python3.11 -m venv /tmp/bt
+          /tmp/bt/bin/pip install -q --upgrade pip
+          /tmp/bt/bin/pip install -q "cmake==3.31.6" ninja
+          /usr/bin/python3.11 -m pip install -q -r mlir/python/requirements.txt
+
+      # Every target has a caller: RISCV is what this emits, AMDGPU and NVPTX
+      # are triton's backends, X86 is the host.
+      - name: Build
+        run: |
+          set -euo pipefail
+          /tmp/bt/bin/cmake -G Ninja -S llvm -B build \
+            -DLLVM_ENABLE_PROJECTS="llvm;mlir;lld" \
+            -DLLVM_TARGETS_TO_BUILD="AMDGPU;NVPTX;X86;RISCV" \
+            -DMLIR_ENABLE_BINDINGS_PYTHON=ON \
+            -DPython3_EXECUTABLE=/usr/bin/python3.11 \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DLLVM_ENABLE_RTTI=ON \
+            -DLLVM_ENABLE_ASSERTIONS=OFF \
+            -DLLVM_INSTALL_UTILS=ON \
+            -DLLVM_BUILD_EXAMPLES=OFF \
+            -DCMAKE_INSTALL_PREFIX="$PWD/install"
+          /tmp/bt/bin/cmake --build build -j "$(nproc)"
+          /tmp/bt/bin/cmake --build build --target install
+          ./install/bin/llc --version | sed -n 2p
+          test -d install/python_packages/mlir_core/mlir
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          sha=$(git rev-parse HEAD)
+          tag="llvm23-${sha:0:12}"
+          tar -I "gzip -1" -cf llvm-install.tar.gz install
+          # Replaced rather than added to: one asset per revision, and a rerun
+          # of the same revision is a rebuild of the same thing.
+          gh release delete "$tag" -R "$GITHUB_REPOSITORY" -y 2>/dev/null || true
+          gh release create "$tag" -R "$GITHUB_REPOSITORY" \
+            --target "$sha" --title "LLVM install @ ${sha:0:12}" \
+            --notes "Built from $sha. Unpacks to install/. Consumed by pytorchsim-triton-opt's setup/restore.sh, which derives this tag from LLVM_SHA." \
+            llvm-install.tar.gz
+          echo "published $tag"
