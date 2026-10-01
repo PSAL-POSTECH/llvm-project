@@ -45,6 +45,7 @@
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/LLVMIR/NVVMDialect.h"
 #include "mlir/Dialect/LLVMIR/ROCDLDialect.h"
+#include "mlir/Dialect/LLVMIR/VCIXDialect.h"
 #include "mlir/Dialect/LLVMIR/Transforms/InlinerInterfaceImpl.h"
 #include "mlir/Dialect/LLVMIR/XeVMDialect.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
@@ -143,6 +144,7 @@ void mlir::registerAllDialects(DialectRegistry &registry) {
                   ptr::PtrDialect,
                   quant::QuantDialect,
                   ROCDL::ROCDLDialect,
+                  vcix::VCIXDialect,
                   scf::SCFDialect,
                   shape::ShapeDialect,
                   smt::SMTDialect,
