@@ -66,8 +66,9 @@ void BufferPlacementAllocs::build(Operation *op) {
           Value value = it.getValue();
           return isa<MemoryEffects::Allocate>(it.getEffect()) && value &&
                  isa<OpResult>(value) &&
-                 it.getResource() !=
-                     SideEffects::AutomaticAllocationScopeResource::get();
+                 it.getResource()->getResourceID() !=
+                     SideEffects::AutomaticAllocationScopeResource::
+                         getResourceID();
         });
     // If there is one result only, we will be able to move the allocation and
     // (possibly existing) deallocation ops.

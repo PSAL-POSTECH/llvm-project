@@ -1891,7 +1891,8 @@ void transform::getConsumedBlockArguments(
           dyn_cast_or_null<BlockArgument>(effect.getValue());
       if (!argument || argument.getOwner() != &block ||
           !isa<MemoryEffects::Free>(effect.getEffect()) ||
-          effect.getResource() != transform::TransformMappingResource::get()) {
+          effect.getResource()->getResourceID() !=
+              transform::TransformMappingResource::getResourceID()) {
         continue;
       }
       consumedArguments.insert(argument.getArgNumber());
