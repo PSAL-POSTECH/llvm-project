@@ -126,3 +126,27 @@ TEST(SideEffectResourceTest, DisjointnessAndGetParent) {
   EXPECT_FALSE(
       TestRootResource::get()->isSubresourceOf(TestChildResource::get()));
 }
+
+TEST(SideEffectResourceTest, IdentityIsTheTypeNotTheInstance) {
+  // Base::get() is a function-local static in an inline function, so each
+  // shared library that instantiates it can hold its own copy. A second
+  // instance of the same type stands in for another library's copy.
+  DefaultResource otherDefault;
+  ASSERT_NE(&otherDefault, DefaultResource::get());
+  EXPECT_FALSE(otherDefault.isDisjointFrom(DefaultResource::get()));
+  EXPECT_FALSE(DefaultResource::get()->isDisjointFrom(&otherDefault));
+  EXPECT_TRUE(otherDefault.isSubresourceOf(DefaultResource::get()));
+  EXPECT_TRUE(
+      AutomaticAllocationScopeResource::get()->isSubresourceOf(&otherDefault));
+  EXPECT_TRUE(isa<DefaultResource>(&otherDefault));
+
+  TestRootResource otherRoot;
+  EXPECT_FALSE(otherRoot.isDisjointFrom(TestRootResource::get()));
+  EXPECT_TRUE(TestGrandchildResource::get()->isSubresourceOf(&otherRoot));
+  EXPECT_TRUE(isa<TestRootResource>(&otherRoot));
+  EXPECT_FALSE(isa<TestChildResource>(&otherRoot));
+
+  // Distinct types stay disjoint.
+  EXPECT_TRUE(TestChildResource::get()->isDisjointFrom(
+      AutomaticAllocationScopeResource::get()));
+}

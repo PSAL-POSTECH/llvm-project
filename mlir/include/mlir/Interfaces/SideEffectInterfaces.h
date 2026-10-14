@@ -135,12 +135,15 @@ public:
   virtual bool isAddressable() const { return true; }
 
   /// Returns true if this resource is a subresource of (or equal to) another.
+  /// Resources are compared by TypeID, not by address: Base::get() is a
+  /// function-local static in an inline function, so a process that links
+  /// MLIR into several shared libraries can hold one instance per library.
   bool isSubresourceOf(const Resource *other) const {
     for (const Resource *r = this; r != nullptr; r = r->getParent()) {
 #ifdef EXPENSIVE_CHECKS
       r->verifyImmediateParentAddressability();
 #endif // EXPENSIVE_CHECKS
-      if (r == other)
+      if (r->getResourceID() == other->getResourceID())
         return true;
     }
     return false;
