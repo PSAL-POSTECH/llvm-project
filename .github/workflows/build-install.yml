@@ -8,6 +8,10 @@ name: build install
 #
 # A release and not an actions artifact: the consumer is one anonymous curl in
 # setup/restore.sh, and an artifact needs a token and expires.
+#
+# Built for both host architectures, one asset each in the same release:
+# llvm-install-linux-x64.tar.gz and llvm-install-linux-arm64.tar.gz. The
+# consumer picks the one matching the machine it runs llc on.
 
 on:
   workflow_dispatch:
@@ -24,14 +28,29 @@ concurrency:
 
 jobs:
   build:
-    runs-on: [self-hosted, slurm, big, x86_64]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The image the x64 asset is FOR. MLIR's python bindings are built
+          # against one interpreter and loaded by another, so they are only
+          # interchangeable if both are this python3.11.
+          - arch: x64
+            runner: x86_64
+            host_target: X86
+            container: ghcr.io/psal-postech/torchsim_tnpu@sha256:a3279ff7549e6ff72897373e1aafff8a8d2349cdc2e21759382f7a4cf9acc80d
+          # That image is x86 only. The arm64 build gets the same distribution
+          # (ubuntu 22.04, gcc 11) and the same python3.11 (deadsnakes) from
+          # the step below.
+          - arch: arm64
+            runner: aarch64
+            host_target: AArch64
+            container: ubuntu:22.04
+    runs-on: [self-hosted, slurm, big, "${{ matrix.runner }}"]
     permissions:
       contents: write
-    # The image the asset is FOR. MLIR's python bindings are built against one
-    # interpreter and loaded by another, so they are only interchangeable if
-    # both are this python3.11.
     container:
-      image: ghcr.io/psal-postech/torchsim_tnpu@sha256:a3279ff7549e6ff72897373e1aafff8a8d2349cdc2e21759382f7a4cf9acc80d
+      image: ${{ matrix.container }}
     # Its /bin/sh is dash, which the runner picks by default and which has no
     # pipefail.
     defaults:
@@ -39,6 +58,23 @@ jobs:
         shell: bash
 
     steps:
+      # Before checkout: without git there it downloads a tarball, and Pack
+      # reads the SHA from the repository. The runner's containers map one
+      # uid, so apt cannot switch to its sandbox user.
+      - name: Distribution packages
+        if: matrix.arch == 'arm64'
+        run: |
+          set -euo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          echo 'APT::Sandbox::User "root";' > /etc/apt/apt.conf.d/99-no-sandbox
+          apt-get update
+          apt-get install -y --no-install-recommends software-properties-common ca-certificates gnupg curl
+          add-apt-repository -y ppa:deadsnakes/ppa
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            build-essential git python3.11 python3.11-dev python3.11-venv zlib1g-dev
+          /usr/bin/python3.11 -m ensurepip --upgrade
+
       - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.ref }}
@@ -55,14 +91,14 @@ jobs:
           /usr/bin/python3.11 -m pip install -q -r mlir/python/requirements.txt
 
       # Every target has a caller: RISCV is what this emits, AMDGPU and NVPTX
-      # are triton's backends, X86 is the host. Link jobs are capped because
-      # these link statically and the runner has 64 GB.
+      # are triton's backends, the host target is the host. Link jobs are
+      # capped because these link statically and the runner has 64 GB.
       - name: Build
         run: |
           set -euo pipefail
           /tmp/bt/bin/cmake -G Ninja -S llvm -B build \
             -DLLVM_ENABLE_PROJECTS="llvm;mlir;lld" \
-            -DLLVM_TARGETS_TO_BUILD="AMDGPU;NVPTX;X86;RISCV" \
+            -DLLVM_TARGETS_TO_BUILD="AMDGPU;NVPTX;${{ matrix.host_target }};RISCV" \
             -DMLIR_ENABLE_BINDINGS_PYTHON=ON \
             -DPython3_EXECUTABLE=/usr/bin/python3.11 \
             -DCMAKE_BUILD_TYPE=Release \
@@ -88,20 +124,26 @@ jobs:
         run: |
           set -euo pipefail
           sha=$(git rev-parse HEAD)
-          tar -I "gzip -1" -cf llvm-install.tar.gz install
-          ls -lh llvm-install.tar.gz
+          asset="llvm-install-linux-${{ matrix.arch }}.tar.gz"
+          tar -I "gzip -1" -cf "$asset" install
+          ls -lh "$asset"
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
           echo "tag=llvm23-${sha:0:12}" >> "$GITHUB_OUTPUT"
+          echo "asset=$asset" >> "$GITHUB_OUTPUT"
 
+      # The action upserts: whichever architecture arrives first creates the
+      # release, the other adds its asset to it.
       - uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.pack.outputs.tag }}
           target_commitish: ${{ steps.pack.outputs.sha }}
           name: LLVM install @ ${{ steps.pack.outputs.tag }}
-          files: llvm-install.tar.gz
+          files: ${{ steps.pack.outputs.asset }}
           body: |
             Built from ${{ steps.pack.outputs.sha }} by
             .github/workflows/build-install.yml.
 
-            Unpacks to install/. Consumed by pytorchsim-triton-opt's
-            setup/restore.sh, which derives this tag from LLVM_SHA.
+            llvm-install-linux-<x64|arm64>.tar.gz, one per host
+            architecture; each unpacks to install/. Consumed by
+            pytorchsim-triton-opt's setup/restore.sh, which derives this tag
+            from LLVM_SHA.
