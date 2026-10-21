@@ -2751,6 +2751,7 @@ void RAGreedy::RAGreedyStats::report(MachineOptimizationRemarkMissed &R) {
   if (Spills) {
     R << NV("NumSpills", Spills) << " spills ";
     R << NV("TotalSpillsCost", SpillsCost) << " total spills cost ";
+    R << NV("SpilledRegisterUnits", SpilledUnits) << " register units spilled ";
   }
   if (FoldedSpills) {
     R << NV("NumFoldedSpills", FoldedSpills) << " folded spills ";
@@ -2827,6 +2828,19 @@ RAGreedy::computeStats(MachineBasicBlock &MBB, MachineBasicBlock::iterator Begin
     }
     if (TII->isStoreToStackSlot(MI, FI) && MFI.isSpillSlotObjectIndex(FI)) {
       ++Stats.Spills;
+      // The register units the spilled value took: what the code needed past what it had.
+      if (MI.getNumOperands() && MI.getOperand(0).isReg()) {
+        Register R = MI.getOperand(0).getReg();
+        MCRegister Unit = R.isPhysical() ? R.asMCReg()
+                          : R.isVirtual() && MRI->getRegClass(R)->getNumRegs()
+                              ? MCRegister(*MRI->getRegClass(R)->begin())
+                              : MCRegister();
+        if (Unit)
+          for (MCRegUnit U : TRI->regunits(Unit)) {
+            (void)U;
+            ++Stats.SpilledUnits;
+          }
+      }
       continue;
     }
     if (TII->hasLoadFromStackSlot(MI, Accesses) &&

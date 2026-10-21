@@ -405,6 +405,7 @@ private:
     unsigned Spills = 0;
     unsigned FoldedSpills = 0;
     unsigned Copies = 0;
+    unsigned SpilledUnits = 0;
     float ReloadsCost = 0.0f;
     float FoldedReloadsCost = 0.0f;
     float SpillsCost = 0.0f;
@@ -421,6 +422,7 @@ private:
       FoldedReloads += other.FoldedReloads;
       ZeroCostFoldedReloads += other.ZeroCostFoldedReloads;
       Spills += other.Spills;
+      SpilledUnits += other.SpilledUnits;
       FoldedSpills += other.FoldedSpills;
       Copies += other.Copies;
       ReloadsCost += other.ReloadsCost;
