@@ -435,6 +435,10 @@ private:
 
   /// Compute statistic for a basic block.
   RAGreedyStats computeStats(MachineBasicBlock &MBB);
+  RAGreedyStats computeStats(MachineBasicBlock &MBB,
+                             MachineBasicBlock::iterator Begin,
+                             MachineBasicBlock::iterator End);
+  void reportBlockStats(MachineBasicBlock &MBB);
 
   /// Compute and report statistic through a remark.
   RAGreedyStats reportStats(MachineLoop *L);

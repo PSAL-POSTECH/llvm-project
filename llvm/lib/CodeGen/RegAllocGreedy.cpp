@@ -2776,6 +2776,12 @@ void RAGreedy::RAGreedyStats::report(MachineOptimizationRemarkMissed &R) {
 }
 
 RAGreedy::RAGreedyStats RAGreedy::computeStats(MachineBasicBlock &MBB) {
+  return computeStats(MBB, MBB.begin(), MBB.end());
+}
+
+RAGreedy::RAGreedyStats
+RAGreedy::computeStats(MachineBasicBlock &MBB, MachineBasicBlock::iterator Begin,
+                       MachineBasicBlock::iterator End) {
   RAGreedyStats Stats;
   const MachineFrameInfo &MFI = MF->getFrameInfo();
   int FI;
@@ -2789,7 +2795,7 @@ RAGreedy::RAGreedyStats RAGreedy::computeStats(MachineBasicBlock &MBB) {
            MI.getOpcode() == TargetOpcode::STACKMAP ||
            MI.getOpcode() == TargetOpcode::STATEPOINT;
   };
-  for (MachineInstr &MI : MBB) {
+  for (MachineInstr &MI : make_range(Begin, End)) {
     auto DestSrc = TII->isCopyInstr(MI);
     if (DestSrc) {
       const MachineOperand &Dest = *DestSrc->Destination;
@@ -2893,6 +2899,43 @@ RAGreedy::RAGreedyStats RAGreedy::reportStats(MachineLoop *L) {
   return Stats;
 }
 
+// A block cut into runs of instructions that share a source line (an instruction without a
+// location runs with the one before it): the spills and reloads of each run, under that line, so
+// a remark names the code a spill is in by where it came from, inside a loop as well as out.
+void RAGreedy::reportBlockStats(MachineBasicBlock &MBB) {
+  auto key = [](const DebugLoc &DL) {
+    return DL ? std::make_pair(DL->getFilename(), DL->getLine())
+              : std::make_pair(StringRef(), 0u);
+  };
+  MachineBasicBlock::iterator Begin = MBB.begin();
+  DebugLoc Loc;
+  auto flush = [&](MachineBasicBlock::iterator End) {
+    if (Begin == End)
+      return;
+    RAGreedyStats Run = computeStats(MBB, Begin, End);
+    if (!Run.isEmpty()) {
+      ORE->emit([&]() {
+        MachineOptimizationRemarkMissed R(DEBUG_TYPE, "BlockSpillReloadCopies",
+                                          Loc, &MBB);
+        Run.report(R);
+        R << "generated in this line's code";
+        return R;
+      });
+    }
+  };
+  for (MachineBasicBlock::iterator I = MBB.begin(), E = MBB.end(); I != E; ++I) {
+    const DebugLoc &DL = I->getDebugLoc();
+    if (!DL)
+      continue;
+    if (Loc && key(DL) == key(Loc))
+      continue;
+    flush(I);
+    Begin = I;
+    Loc = DL;
+  }
+  flush(MBB.end());
+}
+
 void RAGreedy::reportStats() {
   if (!ORE->allowExtraAnalysis(DEBUG_TYPE))
     return;
@@ -2900,9 +2943,11 @@ void RAGreedy::reportStats() {
   for (MachineLoop *L : *Loops)
     Stats.add(reportStats(L));
   // Process non-loop blocks.
-  for (MachineBasicBlock &MBB : *MF)
+  for (MachineBasicBlock &MBB : *MF) {
     if (!Loops->getLoopFor(&MBB))
       Stats.add(computeStats(MBB));
+    reportBlockStats(MBB);
+  }
   if (!Stats.isEmpty()) {
     using namespace ore;
 
