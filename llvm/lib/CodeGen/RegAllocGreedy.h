@@ -441,6 +441,7 @@ private:
                              MachineBasicBlock::iterator Begin,
                              MachineBasicBlock::iterator End);
   void reportBlockStats(MachineBasicBlock &MBB);
+  unsigned spilledUnits(Register R) const;
 
   /// Compute and report statistic through a remark.
   RAGreedyStats reportStats(MachineLoop *L);
