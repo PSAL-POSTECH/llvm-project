@@ -19,6 +19,7 @@
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/BitVector.h"
 #include "llvm/ADT/IndexedMap.h"
+#include "llvm/ADT/MapVector.h"
 #include "llvm/ADT/SmallSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/Statistic.h"
@@ -2780,6 +2781,22 @@ RAGreedy::RAGreedyStats RAGreedy::computeStats(MachineBasicBlock &MBB) {
   return computeStats(MBB, MBB.begin(), MBB.end());
 }
 
+/// The register units a spilled value takes: by its assigned register, or by the
+/// first register of its class when it has none. An LMUL 8 vector group is 8.
+unsigned RAGreedy::spilledUnits(Register R) const {
+  MCRegister P;
+  if (R.isPhysical())
+    P = R.asMCReg();
+  else if (R.isVirtual() && VRM->hasPhys(R))
+    P = VRM->getPhys(R);
+  else if (R.isVirtual() && MRI->getRegClass(R)->getNumRegs())
+    P = *MRI->getRegClass(R)->begin();
+  if (!P)
+    return 0;
+  auto Units = TRI->regunits(P);
+  return std::distance(Units.begin(), Units.end());
+}
+
 RAGreedy::RAGreedyStats
 RAGreedy::computeStats(MachineBasicBlock &MBB, MachineBasicBlock::iterator Begin,
                        MachineBasicBlock::iterator End) {
@@ -2826,21 +2843,10 @@ RAGreedy::computeStats(MachineBasicBlock &MBB, MachineBasicBlock::iterator Begin
       ++Stats.Reloads;
       continue;
     }
-    if (TII->isStoreToStackSlot(MI, FI) && MFI.isSpillSlotObjectIndex(FI)) {
+    if (Register R = TII->isStoreToStackSlot(MI, FI);
+        R && MFI.isSpillSlotObjectIndex(FI)) {
       ++Stats.Spills;
-      // The register units the spilled value took: what the code needed past what it had.
-      if (MI.getNumOperands() && MI.getOperand(0).isReg()) {
-        Register R = MI.getOperand(0).getReg();
-        MCRegister Unit = R.isPhysical() ? R.asMCReg()
-                          : R.isVirtual() && MRI->getRegClass(R)->getNumRegs()
-                              ? MCRegister(*MRI->getRegClass(R)->begin())
-                              : MCRegister();
-        if (Unit)
-          for (MCRegUnit U : TRI->regunits(Unit)) {
-            (void)U;
-            ++Stats.SpilledUnits;
-          }
-      }
+      Stats.SpilledUnits += spilledUnits(R);
       continue;
     }
     if (TII->hasLoadFromStackSlot(MI, Accesses) &&
@@ -2913,41 +2919,56 @@ RAGreedy::RAGreedyStats RAGreedy::reportStats(MachineLoop *L) {
   return Stats;
 }
 
-// A block cut into runs of instructions that share a source line (an instruction without a
-// location runs with the one before it): the spills and reloads of each run, under that line, so
-// a remark names the code a spill is in by where it came from, inside a loop as well as out.
+// Each instruction of a block is counted under a source line, one remark per line: its own,
+// or, for one the allocator made without a location, the line it serves. A spill follows the
+// def it stores, so it takes the line before it; a reload or copy precedes its use, the line after.
 void RAGreedy::reportBlockStats(MachineBasicBlock &MBB) {
-  auto key = [](const DebugLoc &DL) {
-    return DL ? std::make_pair(DL->getFilename(), DL->getLine())
-              : std::make_pair(StringRef(), 0u);
-  };
-  MachineBasicBlock::iterator Begin = MBB.begin();
-  DebugLoc Loc;
-  auto flush = [&](MachineBasicBlock::iterator End) {
-    if (Begin == End)
-      return;
-    RAGreedyStats Run = computeStats(MBB, Begin, End);
-    if (!Run.isEmpty()) {
-      ORE->emit([&]() {
-        MachineOptimizationRemarkMissed R(DEBUG_TYPE, "BlockSpillReloadCopies",
-                                          Loc, &MBB);
-        Run.report(R);
-        R << "generated in this line's code";
-        return R;
-      });
+  SmallVector<MachineBasicBlock::iterator> Instrs;
+  for (MachineBasicBlock::iterator I = MBB.begin(), E = MBB.end(); I != E; ++I)
+    Instrs.push_back(I);
+  SmallVector<DebugLoc> After(Instrs.size() + 1);
+  for (unsigned Idx = Instrs.size(); Idx--;)
+    After[Idx] = Instrs[Idx]->getDebugLoc() ? Instrs[Idx]->getDebugLoc()
+                                            : After[Idx + 1];
+
+  MapVector<std::pair<StringRef, unsigned>, std::pair<DebugLoc, RAGreedyStats>>
+      Lines;
+  RAGreedyStats Unplaced;
+  DebugLoc Before;
+  for (auto [Idx, I] : enumerate(Instrs)) {
+    RAGreedyStats One = computeStats(MBB, I, std::next(I));
+    DebugLoc At = I->getDebugLoc();
+    if (At)
+      Before = At;
+    else if ((One.Spills || One.FoldedSpills) && Before)
+      At = Before;
+    else
+      At = After[Idx] ? After[Idx] : Before;
+    if (One.isEmpty())
+      continue;
+    if (!At) {
+      Unplaced.add(One);
+      continue;
     }
-  };
-  for (MachineBasicBlock::iterator I = MBB.begin(), E = MBB.end(); I != E; ++I) {
-    const DebugLoc &DL = I->getDebugLoc();
-    if (!DL)
-      continue;
-    if (Loc && key(DL) == key(Loc))
-      continue;
-    flush(I);
-    Begin = I;
-    Loc = DL;
+    auto &Line = Lines[{At->getFilename(), At->getLine()}];
+    if (!Line.first)
+      Line.first = At;
+    Line.second.add(One);
   }
-  flush(MBB.end());
+
+  auto emit = [&](const DebugLoc &Loc, RAGreedyStats &Stats) {
+    ORE->emit([&]() {
+      MachineOptimizationRemarkMissed R(DEBUG_TYPE, "BlockSpillReloadCopies",
+                                        Loc, &MBB);
+      Stats.report(R);
+      R << "generated in this line's code";
+      return R;
+    });
+  };
+  for (auto &Line : Lines)
+    emit(Line.second.first, Line.second.second);
+  if (!Unplaced.isEmpty())
+    emit(DebugLoc(), Unplaced);
 }
 
 void RAGreedy::reportStats() {
