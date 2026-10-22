@@ -41,10 +41,9 @@
 ; SPAD:         vle32.v v8, (a0)
 ; SPAD:         vse32.v v8, (a1)
 ; SPILL-LABEL: spad_copy_across_a_spill:
-; SPILL:         auipc [[A:a[0-9]+]], %got_pcrel_hi(spad_copy_across_a_spill.vspill)
+; SPILL:         auipc [[A:[a-z0-9]+]], %got_pcrel_hi(spad_copy_across_a_spill.vspill)
 ; SPILL:         vs2r.v v8, ([[A]])
-; SPILL:         auipc [[B:a[0-9]+]], %got_pcrel_hi(spad_copy_across_a_spill.vspill)
-; SPILL:         vl2r.v v8, ([[B]])
+; SPILL:         vl2r.v v8, ([[A]])
 
 ; DRAM-LOAD: error: {{.*}} in function dram_load {{.*}}: spad-vector-memory: vector memory instruction PseudoVLE32_V_M2 reaches address space 0, not the scratchpad (address space 1)
 ; DRAM-STORE: error: {{.*}} in function dram_store {{.*}}: spad-vector-memory: vector memory instruction PseudoVSE32_V_M2 reaches address space 0, not the scratchpad (address space 1)

@@ -560,9 +560,9 @@ void RISCVRegisterInfo::lowerSegmentSpillReload(MachineBasicBlock::iterator II,
   II->eraseFromParent();
 }
 
-// A vector spill slot in the function's scratchpad area: its address is the
-// area's .spad global, read from the GOT like any address space 1 global, plus
-// the slot's offset; the access then reaches address space 1.
+// A vector spill slot in the function's scratchpad area: the area's address,
+// held in the function's base register (copied for a segment group, whose
+// lowering kills its base) or else read from the GOT, plus the slot's offset.
 bool RISCVRegisterInfo::eliminateSpadSpillSlot(MachineBasicBlock::iterator II,
                                                unsigned FIOperandNum) const {
   MachineInstr &MI = *II;
@@ -577,24 +577,35 @@ bool RISCVRegisterInfo::eliminateSpadSpillSlot(MachineBasicBlock::iterator II,
   int64_t Offset =
       MF.getFrameInfo().getObjectOffset(MI.getOperand(FIOperandNum).getIndex());
 
-  Register Hi = MRI.createVirtualRegister(&RISCV::GPRRegClass);
-  Register Base = MRI.createVirtualRegister(&RISCV::GPRRegClass);
-  MCSymbol *HiSym = MF.getContext().createNamedTempSymbol("pcrel_hi");
-  BuildMI(MBB, II, DL, TII->get(RISCV::AUIPC), Hi)
-      .addGlobalAddress(Area, 0, RISCVII::MO_GOT_HI)
-      ->setPreInstrSymbol(MF, HiSym);
-  BuildMI(MBB, II, DL, TII->get(ST.is64Bit() ? RISCV::LD : RISCV::LW), Base)
-      .addReg(Hi, RegState::Kill)
-      .addSym(HiSym, RISCVII::MO_PCREL_LO);
+  Register Base =
+      MF.getInfo<RISCVMachineFunctionInfo>()->getSpadSpillBase();
+  bool Hoisted = Base.isValid();
+  if (!Hoisted) {
+    Register Hi = MRI.createVirtualRegister(&RISCV::GPRRegClass);
+    Base = MRI.createVirtualRegister(&RISCV::GPRRegClass);
+    MCSymbol *HiSym = MF.getContext().createNamedTempSymbol("pcrel_hi");
+    BuildMI(MBB, II, DL, TII->get(RISCV::AUIPC), Hi)
+        .addGlobalAddress(Area, 0, RISCVII::MO_GOT_HI)
+        ->setPreInstrSymbol(MF, HiSym);
+    BuildMI(MBB, II, DL, TII->get(ST.is64Bit() ? RISCV::LD : RISCV::LW), Base)
+        .addReg(Hi, RegState::Kill)
+        .addSym(HiSym, RISCVII::MO_PCREL_LO);
+  }
   if (Offset) {
     Register Slot = MRI.createVirtualRegister(&RISCV::GPRRegClass);
     adjustReg(MBB, II, DL, Slot, Base, StackOffset::getFixed(Offset),
               MachineInstr::NoFlags, std::nullopt);
     Base = Slot;
+    Hoisted = false;
+  } else if (Hoisted && RISCV::isRVVSpillForZvlsseg(MI.getOpcode())) {
+    Register Copy = MRI.createVirtualRegister(&RISCV::GPRRegClass);
+    BuildMI(MBB, II, DL, TII->get(RISCV::ADDI), Copy).addReg(Base).addImm(0);
+    Base = Copy;
+    Hoisted = false;
   }
   MI.getOperand(FIOperandNum)
       .ChangeToRegister(Base, /*IsDef=*/false, /*IsImp=*/false,
-                        /*IsKill=*/true);
+                        /*IsKill=*/!Hoisted);
 
   SmallVector<MachineMemOperand *, 1> MMOs;
   for (MachineMemOperand *MMO : MI.memoperands())
