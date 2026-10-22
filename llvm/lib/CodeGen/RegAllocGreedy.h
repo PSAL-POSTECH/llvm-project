@@ -406,6 +406,11 @@ private:
     unsigned FoldedSpills = 0;
     unsigned Copies = 0;
     unsigned SpilledUnits = 0;
+    // The Reloads and Spills whose register is of a class with a vector type,
+    // and the register units those spills take.
+    unsigned VectorReloads = 0;
+    unsigned VectorSpills = 0;
+    unsigned VectorSpilledUnits = 0;
     float ReloadsCost = 0.0f;
     float FoldedReloadsCost = 0.0f;
     float SpillsCost = 0.0f;
@@ -425,6 +430,9 @@ private:
       SpilledUnits += other.SpilledUnits;
       FoldedSpills += other.FoldedSpills;
       Copies += other.Copies;
+      VectorReloads += other.VectorReloads;
+      VectorSpills += other.VectorSpills;
+      VectorSpilledUnits += other.VectorSpilledUnits;
       ReloadsCost += other.ReloadsCost;
       FoldedReloadsCost += other.FoldedReloadsCost;
       SpillsCost += other.SpillsCost;
