@@ -17,31 +17,29 @@
 define double @f64(<vscale x 1 x double> %v, i1 %c) {
 ; SPAD-LABEL: f64:
 ; SPAD:       # %bb.0:
-; SPAD-NEXT:    addi sp, sp, -16
-; SPAD-NEXT:    .cfi_def_cfa_offset 16
-; SPAD-NEXT:    .cfi_remember_state
+; SPAD-NEXT:    addi sp, sp, -32
+; SPAD-NEXT:    .cfi_def_cfa_offset 32
+; SPAD-NEXT:    sd s11, 24(sp) # 8-byte Folded Spill
+; SPAD-NEXT:    .cfi_offset s11, -8
 ; SPAD-NEXT:  .Lpcrel_hi0:
-; SPAD-NEXT:    auipc a1, %got_pcrel_hi(f64.vspill)
-; SPAD-NEXT:    ld a1, %pcrel_lo(.Lpcrel_hi0)(a1)
-; SPAD-NEXT:    vs1r.v v8, (a1)
+; SPAD-NEXT:    auipc s11, %got_pcrel_hi(f64.vspill)
+; SPAD-NEXT:    ld s11, %pcrel_lo(.Lpcrel_hi0)(s11)
+; SPAD-NEXT:    vs1r.v v8, (s11)
 ; SPAD-NEXT:    andi a0, a0, 1
 ; SPAD-NEXT:    #APP
 ; SPAD-NEXT:    #NO_APP
 ; SPAD-NEXT:    beqz a0, .LBB0_2
 ; SPAD-NEXT:  # %bb.1: # %truebb
-; SPAD-NEXT:  .Lpcrel_hi1:
-; SPAD-NEXT:    auipc a0, %got_pcrel_hi(f64.vspill)
-; SPAD-NEXT:    ld a0, %pcrel_lo(.Lpcrel_hi1)(a0)
-; SPAD-NEXT:    vl1r.v v8, (a0)
+; SPAD-NEXT:    vl1r.v v8, (s11)
 ; SPAD-NEXT:    vsetivli zero, 1, e64, m1, ta, ma
 ; SPAD-NEXT:    vfmv.f.s fa0, v8
-; SPAD-NEXT:    addi sp, sp, 16
-; SPAD-NEXT:    .cfi_def_cfa_offset 0
-; SPAD-NEXT:    ret
+; SPAD-NEXT:    j .LBB0_3
 ; SPAD-NEXT:  .LBB0_2: # %falsebb
-; SPAD-NEXT:    .cfi_restore_state
 ; SPAD-NEXT:    fmv.d.x fa0, zero
-; SPAD-NEXT:    addi sp, sp, 16
+; SPAD-NEXT:  .LBB0_3: # %falsebb
+; SPAD-NEXT:    ld s11, 24(sp) # 8-byte Folded Reload
+; SPAD-NEXT:    .cfi_restore s11
+; SPAD-NEXT:    addi sp, sp, 32
 ; SPAD-NEXT:    .cfi_def_cfa_offset 0
 ; SPAD-NEXT:    ret
 ;
@@ -82,31 +80,29 @@ falsebb:
 define float @f32(<vscale x 2 x float> %v, i1 %c) {
 ; SPAD-LABEL: f32:
 ; SPAD:       # %bb.0:
-; SPAD-NEXT:    addi sp, sp, -16
-; SPAD-NEXT:    .cfi_def_cfa_offset 16
-; SPAD-NEXT:    .cfi_remember_state
-; SPAD-NEXT:  .Lpcrel_hi2:
-; SPAD-NEXT:    auipc a1, %got_pcrel_hi(f32.vspill)
-; SPAD-NEXT:    ld a1, %pcrel_lo(.Lpcrel_hi2)(a1)
-; SPAD-NEXT:    vs1r.v v8, (a1)
+; SPAD-NEXT:    addi sp, sp, -32
+; SPAD-NEXT:    .cfi_def_cfa_offset 32
+; SPAD-NEXT:    sd s11, 24(sp) # 8-byte Folded Spill
+; SPAD-NEXT:    .cfi_offset s11, -8
+; SPAD-NEXT:  .Lpcrel_hi1:
+; SPAD-NEXT:    auipc s11, %got_pcrel_hi(f32.vspill)
+; SPAD-NEXT:    ld s11, %pcrel_lo(.Lpcrel_hi1)(s11)
+; SPAD-NEXT:    vs1r.v v8, (s11)
 ; SPAD-NEXT:    andi a0, a0, 1
 ; SPAD-NEXT:    #APP
 ; SPAD-NEXT:    #NO_APP
 ; SPAD-NEXT:    beqz a0, .LBB1_2
 ; SPAD-NEXT:  # %bb.1: # %truebb
-; SPAD-NEXT:  .Lpcrel_hi3:
-; SPAD-NEXT:    auipc a0, %got_pcrel_hi(f32.vspill)
-; SPAD-NEXT:    ld a0, %pcrel_lo(.Lpcrel_hi3)(a0)
-; SPAD-NEXT:    vl1r.v v8, (a0)
+; SPAD-NEXT:    vl1r.v v8, (s11)
 ; SPAD-NEXT:    vsetivli zero, 1, e32, m1, ta, ma
 ; SPAD-NEXT:    vfmv.f.s fa0, v8
-; SPAD-NEXT:    addi sp, sp, 16
-; SPAD-NEXT:    .cfi_def_cfa_offset 0
-; SPAD-NEXT:    ret
+; SPAD-NEXT:    j .LBB1_3
 ; SPAD-NEXT:  .LBB1_2: # %falsebb
-; SPAD-NEXT:    .cfi_restore_state
 ; SPAD-NEXT:    fmv.w.x fa0, zero
-; SPAD-NEXT:    addi sp, sp, 16
+; SPAD-NEXT:  .LBB1_3: # %falsebb
+; SPAD-NEXT:    ld s11, 24(sp) # 8-byte Folded Reload
+; SPAD-NEXT:    .cfi_restore s11
+; SPAD-NEXT:    addi sp, sp, 32
 ; SPAD-NEXT:    .cfi_def_cfa_offset 0
 ; SPAD-NEXT:    ret
 ;

@@ -69,6 +69,9 @@ private:
   /// Under spad-vector-memory, the scratchpad global that holds this
   /// function's vector spill slots, or null when it spills no vector.
   GlobalVariable *SpadSpillArea = nullptr;
+  /// The callee-saved register that holds SpadSpillArea's address through the
+  /// function, or none when every slot access reads it from the GOT.
+  Register SpadSpillBase;
   /// Size of stack frame to save callee saved registers
   unsigned CalleeSavedStackSize = 0;
 
@@ -152,6 +155,8 @@ public:
 
   GlobalVariable *getSpadSpillArea() const { return SpadSpillArea; }
   void setSpadSpillArea(GlobalVariable *GV) { SpadSpillArea = GV; }
+  Register getSpadSpillBase() const { return SpadSpillBase; }
+  void setSpadSpillBase(Register Reg) { SpadSpillBase = Reg; }
 
   Align getRVVStackAlign() const { return RVVStackAlign; }
   void setRVVStackAlign(Align StackAlign) { RVVStackAlign = StackAlign; }

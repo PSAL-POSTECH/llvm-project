@@ -15,6 +15,7 @@
 #include "RISCV.h"
 #include "RISCVMachineFunctionInfo.h"
 #include "RISCVSubtarget.h"
+#include "llvm/ADT/DepthFirstIterator.h"
 #include "llvm/BinaryFormat/Dwarf.h"
 #include "llvm/CodeGen/CFIInstBuilder.h"
 #include "llvm/CodeGen/LivePhysRegs.h"
@@ -26,6 +27,7 @@
 #include "llvm/IR/DiagnosticInfo.h"
 #include "llvm/IR/GlobalVariable.h"
 #include "llvm/IR/Module.h"
+#include "llvm/MC/MCContext.h"
 #include "llvm/MC/MCDwarf.h"
 #include "llvm/Support/LEB128.h"
 
@@ -1646,6 +1648,8 @@ void RISCVFrameLowering::determineCalleeSaves(MachineFunction &MF,
                                               BitVector &SavedRegs,
                                               RegScavenger *RS) const {
   TargetFrameLowering::determineCalleeSaves(MF, SavedRegs, RS);
+  if (STI.hasSpadVectorMemory())
+    assignSpadSpillSlots(MF, SavedRegs);
 
   // In TargetFrameLowering::determineCalleeSaves, any vector register is marked
   // as saved if any of its subregister is clobbered, this is not correct in
@@ -1926,11 +1930,18 @@ static unsigned estimateFunctionSizeInBytes(const MachineFunction &MF,
   return FnSize;
 }
 
-// Under spad-vector-memory a vector spill slot is no stack object: every lane
-// keeps its copy in the function's area of the scratchpad, a .spad global in
-// address space 1, at the slot's offset (bytes of one lane's share).
-void RISCVFrameLowering::assignSpadSpillSlots(MachineFunction &MF) const {
+// Under spad-vector-memory a vector spill slot lives at an offset in the
+// function's .spad area (address space 1), not on the stack. A callee-saved
+// register the function leaves unused, if any, holds the area's address.
+void RISCVFrameLowering::assignSpadSpillSlots(MachineFunction &MF,
+                                              BitVector &SavedRegs) const {
   MachineFrameInfo &MFI = MF.getFrameInfo();
+  auto *RVFI = MF.getInfo<RISCVMachineFunctionInfo>();
+  if (RVFI->getSpadSpillArea()) {
+    if (RVFI->getSpadSpillBase())
+      SavedRegs.set(RVFI->getSpadSpillBase());
+    return;
+  }
   SmallSet<int, 8> CalleeSaved;
   for (const CalleeSavedInfo &CS : MFI.getCalleeSavedInfo())
     CalleeSaved.insert(CS.getFrameIdx());
@@ -1973,7 +1984,18 @@ void RISCVFrameLowering::assignSpadSpillSlots(MachineFunction &MF) const {
       GlobalValue::NotThreadLocal, RISCVAS::SPAD);
   Area->setSection(".spad");
   Area->setAlignment(RegAlign);
-  MF.getInfo<RISCVMachineFunctionInfo>()->setSpadSpillArea(Area);
+  RVFI->setSpadSpillArea(Area);
+
+  const MachineRegisterInfo &MRI = MF.getRegInfo();
+  for (MCPhysReg Reg : {RISCV::X27, RISCV::X26, RISCV::X25, RISCV::X24,
+                        RISCV::X23, RISCV::X22, RISCV::X21, RISCV::X20,
+                        RISCV::X19, RISCV::X18}) {
+    if (MRI.isPhysRegUsed(Reg) || SavedRegs.test(Reg))
+      continue;
+    SavedRegs.set(Reg);
+    RVFI->setSpadSpillBase(Reg);
+    break;
+  }
 }
 
 void RISCVFrameLowering::processFunctionBeforeFrameFinalized(
@@ -1984,9 +2006,6 @@ void RISCVFrameLowering::processFunctionBeforeFrameFinalized(
   MachineFrameInfo &MFI = MF.getFrameInfo();
   const TargetRegisterClass *RC = &RISCV::GPRRegClass;
   auto *RVFI = MF.getInfo<RISCVMachineFunctionInfo>();
-
-  if (MF.getSubtarget<RISCVSubtarget>().hasSpadVectorMemory())
-    assignSpadSpillSlots(MF);
 
   int64_t RVVStackSize;
   Align RVVStackAlign;
@@ -2377,6 +2396,21 @@ bool RISCVFrameLowering::spillCalleeSavedRegisters(
   storeRegsToStackSlots(UnmanagedCSI);
   storeRegsToStackSlots(RVVCSI);
 
+  if (Register Base = RVFI->getSpadSpillBase()) {
+    MCSymbol *HiSym = MF->getContext().createNamedTempSymbol("pcrel_hi");
+    BuildMI(MBB, MI, DL, TII.get(RISCV::AUIPC), Base)
+        .addGlobalAddress(RVFI->getSpadSpillArea(), 0, RISCVII::MO_GOT_HI)
+        ->setPreInstrSymbol(*MF, HiSym);
+    BuildMI(MBB, MI, DL, TII.get(STI.is64Bit() ? RISCV::LD : RISCV::LW), Base)
+        .addReg(Base)
+        .addSym(HiSym, RISCVII::MO_PCREL_LO);
+    for (MachineBasicBlock *Succ : depth_first(&MBB)) {
+      if (Succ == &MBB || Succ->isLiveIn(Base))
+        continue;
+      Succ->addLiveIn(Base);
+      Succ->sortUniqueLiveIns();
+    }
+  }
   return true;
 }
 

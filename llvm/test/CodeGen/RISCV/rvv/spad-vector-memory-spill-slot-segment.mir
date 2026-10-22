@@ -1,24 +1,26 @@
 # A segment register group spilled under spad-vector-memory is split into
 # whole-register stores and loads at the group's offsets inside the function's
-# scratchpad area, as it is on the stack without the feature.
+# scratchpad area, from a copy of the base register, which stays live.
 # RUN: llc -mtriple=riscv64 -mattr=+v,+zvl256b,+spad-vector-memory \
-# RUN:   -riscv-v-vector-bits-max=256 -start-before=greedy \
+# RUN:   -riscv-v-vector-bits-max=256 -verify-machineinstrs -start-before=greedy \
 # RUN:   -stop-after=prologepilog %s -o - | FileCheck %s
 
 # CHECK: @segment_spill.vspill = internal addrspace(1) global [96 x i8] zeroinitializer, section ".spad", align 32
 # CHECK-LABEL: name: segment_spill
-# CHECK:      $x11 = AUIPC target-flags(riscv-got-hi) @segment_spill.vspill
-# CHECK-NEXT: $x11 = LD killed $x11, target-flags(riscv-pcrel-lo)
+# CHECK:      frame-setup SD killed $x27, $x2, 24
+# CHECK:      $x27 = AUIPC target-flags(riscv-got-hi) @segment_spill.vspill
+# CHECK-NEXT: $x27 = LD $x27, target-flags(riscv-pcrel-lo)
+# CHECK:      $x11 = ADDI $x27, 0
 # CHECK-NEXT: VS2R_V $v0m2, $x11, implicit $v0_v1_v2 :: (store {{.*}} into @segment_spill.vspill, {{.*}}addrspace 1)
 # CHECK-NEXT: $x12 = ADDI $x0, 64
 # CHECK-NEXT: $x11 = ADD killed $x11, killed $x12
 # CHECK-NEXT: VS1R_V $v2, killed $x11, implicit $v0_v1_v2 :: (store {{.*}} into @segment_spill.vspill, addrspace 1)
-# CHECK:      $x11 = AUIPC target-flags(riscv-got-hi) @segment_spill.vspill
-# CHECK-NEXT: $x11 = LD killed $x11, target-flags(riscv-pcrel-lo)
+# CHECK-NEXT: $x11 = ADDI $x27, 0
 # CHECK-NEXT: $v7 = VL1RE8_V $x11 :: (load {{.*}} from @segment_spill.vspill, addrspace 1)
 # CHECK-NEXT: $x12 = ADDI $x0, 32
 # CHECK-NEXT: $x11 = ADD killed $x11, killed $x12
 # CHECK-NEXT: $v8m2 = VL2RE8_V killed $x11 :: (load {{.*}} from @segment_spill.vspill, {{.*}}addrspace 1)
+# CHECK:      $x27 = frame-destroy LD $x2, 24
 
 --- |
   define void @segment_spill(ptr addrspace(1) %base, i64 %vl) {
