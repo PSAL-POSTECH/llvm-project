@@ -21,9 +21,8 @@ define double @f64(<vscale x 1 x double> %v, i1 %c) {
 ; SPAD-NEXT:    .cfi_def_cfa_offset 32
 ; SPAD-NEXT:    sd s11, 24(sp) # 8-byte Folded Spill
 ; SPAD-NEXT:    .cfi_offset s11, -8
-; SPAD-NEXT:  .Lpcrel_hi0:
-; SPAD-NEXT:    auipc s11, %got_pcrel_hi(f64.vspill)
-; SPAD-NEXT:    ld s11, %pcrel_lo(.Lpcrel_hi0)(s11)
+; SPAD-NEXT:    lui s11, %hi(f64.vspill)
+; SPAD-NEXT:    addi s11, s11, %lo(f64.vspill)
 ; SPAD-NEXT:    vs1r.v v8, (s11)
 ; SPAD-NEXT:    andi a0, a0, 1
 ; SPAD-NEXT:    #APP
@@ -84,9 +83,8 @@ define float @f32(<vscale x 2 x float> %v, i1 %c) {
 ; SPAD-NEXT:    .cfi_def_cfa_offset 32
 ; SPAD-NEXT:    sd s11, 24(sp) # 8-byte Folded Spill
 ; SPAD-NEXT:    .cfi_offset s11, -8
-; SPAD-NEXT:  .Lpcrel_hi1:
-; SPAD-NEXT:    auipc s11, %got_pcrel_hi(f32.vspill)
-; SPAD-NEXT:    ld s11, %pcrel_lo(.Lpcrel_hi1)(s11)
+; SPAD-NEXT:    lui s11, %hi(f32.vspill)
+; SPAD-NEXT:    addi s11, s11, %lo(f32.vspill)
 ; SPAD-NEXT:    vs1r.v v8, (s11)
 ; SPAD-NEXT:    andi a0, a0, 1
 ; SPAD-NEXT:    #APP

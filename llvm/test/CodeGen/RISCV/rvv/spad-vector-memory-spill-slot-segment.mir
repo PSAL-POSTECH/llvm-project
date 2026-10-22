@@ -8,8 +8,8 @@
 # CHECK: @segment_spill.vspill = internal addrspace(1) global [96 x i8] zeroinitializer, section ".spad", align 32
 # CHECK-LABEL: name: segment_spill
 # CHECK:      frame-setup SD killed $x27, $x2, 24
-# CHECK:      $x27 = AUIPC target-flags(riscv-got-hi) @segment_spill.vspill
-# CHECK-NEXT: $x27 = LD $x27, target-flags(riscv-pcrel-lo)
+# CHECK:      $x27 = LUI target-flags(riscv-hi) @segment_spill.vspill
+# CHECK-NEXT: $x27 = ADDI $x27, target-flags(riscv-lo) @segment_spill.vspill
 # CHECK:      $x11 = ADDI $x27, 0
 # CHECK-NEXT: VS2R_V $v0m2, $x11, implicit $v0_v1_v2 :: (store {{.*}} into @segment_spill.vspill, {{.*}}addrspace 1)
 # CHECK-NEXT: $x12 = ADDI $x0, 64

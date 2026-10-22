@@ -27,7 +27,6 @@
 #include "llvm/IR/DiagnosticInfo.h"
 #include "llvm/IR/GlobalVariable.h"
 #include "llvm/IR/Module.h"
-#include "llvm/MC/MCContext.h"
 #include "llvm/MC/MCDwarf.h"
 #include "llvm/Support/LEB128.h"
 
@@ -2397,13 +2396,7 @@ bool RISCVFrameLowering::spillCalleeSavedRegisters(
   storeRegsToStackSlots(RVVCSI);
 
   if (Register Base = RVFI->getSpadSpillBase()) {
-    MCSymbol *HiSym = MF->getContext().createNamedTempSymbol("pcrel_hi");
-    BuildMI(MBB, MI, DL, TII.get(RISCV::AUIPC), Base)
-        .addGlobalAddress(RVFI->getSpadSpillArea(), 0, RISCVII::MO_GOT_HI)
-        ->setPreInstrSymbol(*MF, HiSym);
-    BuildMI(MBB, MI, DL, TII.get(STI.is64Bit() ? RISCV::LD : RISCV::LW), Base)
-        .addReg(Base)
-        .addSym(HiSym, RISCVII::MO_PCREL_LO);
+    STI.getRegisterInfo()->buildSpadSpillAreaAddress(MBB, MI, DL, Base, 0);
     for (MachineBasicBlock *Succ : depth_first(&MBB)) {
       if (Succ == &MBB || Succ->isLiveIn(Base))
         continue;

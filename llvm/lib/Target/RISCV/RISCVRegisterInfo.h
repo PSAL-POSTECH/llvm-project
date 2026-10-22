@@ -123,6 +123,11 @@ struct RISCVRegisterInfo : public RISCVGenRegisterInfo {
   bool eliminateSpadSpillSlot(MachineBasicBlock::iterator II,
                               unsigned FIOperandNum) const;
 
+  bool buildSpadSpillAreaAddress(MachineBasicBlock &MBB,
+                                 MachineBasicBlock::iterator II,
+                                 const DebugLoc &DL, Register Dst,
+                                 int64_t Offset) const;
+
   void lowerSegmentSpillReload(MachineBasicBlock::iterator II,
                                bool IsSpill) const;
 

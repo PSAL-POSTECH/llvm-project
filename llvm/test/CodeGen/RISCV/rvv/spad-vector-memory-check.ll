@@ -41,7 +41,8 @@
 ; SPAD:         vle32.v v8, (a0)
 ; SPAD:         vse32.v v8, (a1)
 ; SPILL-LABEL: spad_copy_across_a_spill:
-; SPILL:         auipc [[A:[a-z0-9]+]], %got_pcrel_hi(spad_copy_across_a_spill.vspill)
+; SPILL:         lui [[A:[a-z0-9]+]], %hi(spad_copy_across_a_spill.vspill)
+; SPILL-NEXT:    addi [[A]], [[A]], %lo(spad_copy_across_a_spill.vspill)
 ; SPILL:         vs2r.v v8, ([[A]])
 ; SPILL:         vl2r.v v8, ([[A]])
 
