@@ -278,7 +278,8 @@ public:
     return TLI->isLegalElementTypeForRVV(TLI->getValueType(DL, Ty));
   }
 
-  bool isLegalMaskedLoadStore(Type *DataType, Align Alignment) const {
+  bool isLegalMaskedLoadStore(Type *DataType, Align Alignment,
+                              unsigned AddressSpace = 0) const {
     if (!ST->hasVInstructions())
       return false;
 
@@ -288,22 +289,26 @@ public:
     if (DataTypeVT.isFixedLengthVector() && !ST->useRVVForFixedLengthVectors())
       return false;
 
+    // Under spad-vector-memory a masked scratchpad access is never scalarized,
+    // whatever its alignment: scalar accesses reach lane 0's bank only.
+    bool SpadAccess =
+        ST->hasSpadVectorMemory() && AddressSpace == RISCVAS::SPAD;
     EVT ElemType = DataTypeVT.getScalarType();
-    if (!ST->enableUnalignedVectorMem() && Alignment < ElemType.getStoreSize())
+    if (!SpadAccess && !ST->enableUnalignedVectorMem() &&
+        Alignment < ElemType.getStoreSize())
       return false;
 
     return TLI->isLegalElementTypeForRVV(ElemType);
   }
 
-  bool isLegalMaskedLoad(Type *DataType, Align Alignment,
-                         unsigned /*AddressSpace*/,
+  bool isLegalMaskedLoad(Type *DataType, Align Alignment, unsigned AddressSpace,
                          TTI::MaskKind /*MaskKind*/) const override {
-    return isLegalMaskedLoadStore(DataType, Alignment);
+    return isLegalMaskedLoadStore(DataType, Alignment, AddressSpace);
   }
   bool isLegalMaskedStore(Type *DataType, Align Alignment,
-                          unsigned /*AddressSpace*/,
+                          unsigned AddressSpace,
                           TTI::MaskKind /*MaskKind*/) const override {
-    return isLegalMaskedLoadStore(DataType, Alignment);
+    return isLegalMaskedLoadStore(DataType, Alignment, AddressSpace);
   }
 
   bool isLegalMaskedGatherScatter(Type *DataType, Align Alignment) const {

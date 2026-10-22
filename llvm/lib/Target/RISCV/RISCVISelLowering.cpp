@@ -3140,6 +3140,27 @@ bool RISCVTargetLowering::isStoreBitCastBeneficial(
   return TargetLowering::isStoreBitCastBeneficial(StoreVT, BitcastVT, DAG, MMO);
 }
 
+// Under spad-vector-memory a narrowed load keeps the kind of the original.
+bool RISCVTargetLowering::shouldReduceLoadWidth(
+    SDNode *Load, ISD::LoadExtType ExtTy, EVT NewVT,
+    std::optional<unsigned> ByteOffset) const {
+  if (Subtarget.hasSpadVectorMemory() &&
+      cast<LoadSDNode>(Load)->getMemoryVT().isVector() != NewVT.isVector())
+    return false;
+  return TargetLowering::shouldReduceLoadWidth(Load, ExtTy, NewVT, ByteOffset);
+}
+
+// A bitcast of a load keeps the loaded type: under spad-vector-memory a scalar
+// load and a vector load of the same bits reach different banks.
+bool RISCVTargetLowering::isLoadBitCastBeneficial(
+    EVT LoadVT, EVT BitcastVT, const SelectionDAG &DAG,
+    const MachineMemOperand &MMO) const {
+  if (Subtarget.hasSpadVectorMemory() &&
+      LoadVT.isVector() != BitcastVT.isVector())
+    return false;
+  return TargetLowering::isLoadBitCastBeneficial(LoadVT, BitcastVT, DAG, MMO);
+}
+
 bool RISCVTargetLowering::isLegalElementTypeForRVV(EVT ScalarTy) const {
   if (!ScalarTy.isSimple())
     return false;
@@ -6362,8 +6383,11 @@ SDValue RISCVTargetLowering::lowerVECTOR_SHUFFLE(SDValue Op,
         Offset %= OpElements;
       }
 
-      // We need to ensure the load isn't atomic or volatile.
-      if (ISD::isNormalLoad(V.getNode()) && cast<LoadSDNode>(V)->isSimple()) {
+      // We need to ensure the load isn't atomic or volatile. Under
+      // spad-vector-memory a vector load stays a vector load and the splat is
+      // a vrgather.
+      if (ISD::isNormalLoad(V.getNode()) && cast<LoadSDNode>(V)->isSimple() &&
+          !Subtarget.hasSpadVectorMemory()) {
         auto *Ld = cast<LoadSDNode>(V);
         Offset *= SVT.getStoreSize();
         SDValue NewAddr = DAG.getMemBasePlusOffset(

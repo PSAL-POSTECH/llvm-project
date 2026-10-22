@@ -387,6 +387,11 @@ bool RISCVCodeGenPrepare::expandVPStrideLoad(IntrinsicInst &II) {
                       m_Value(BasePtr), m_Zero(), m_AllOnes(), m_Value(VL))))
     return false;
 
+  // Under spad-vector-memory a vector load stays a vector load: a scalar load
+  // reaches lane 0's bank only.
+  if (ST->hasSpadVectorMemory())
+    return false;
+
   // If SEW>XLEN then a splat will get lowered as a zero strided load anyway, so
   // avoid expanding here.
   if (II.getType()->getScalarSizeInBits() > ST->getXLen())
