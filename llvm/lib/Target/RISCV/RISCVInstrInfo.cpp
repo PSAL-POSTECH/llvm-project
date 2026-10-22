@@ -869,6 +869,12 @@ std::optional<unsigned> getFoldedOpcode(MachineFunction &MF, MachineInstr &MI,
     return RISCV::LHU;
   }
 
+  // Under spad-vector-memory a vector spill slot lives in the stack frame's
+  // per-lane bank remapping, which a scalar load does not see: the reload of a
+  // vmv.x.s/vfmv.f.s source stays a vector reload.
+  if (ST.hasSpadVectorMemory())
+    return std::nullopt;
+
   switch (RISCV::getRVVMCOpcode(MI.getOpcode())) {
   default:
     return std::nullopt;
