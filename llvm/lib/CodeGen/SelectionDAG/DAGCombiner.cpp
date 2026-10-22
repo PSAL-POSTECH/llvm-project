@@ -23871,6 +23871,7 @@ SDValue DAGCombiner::replaceStoreOfInsertLoad(StoreSDNode *ST) {
       ST->getMemoryVT() != Ld->getMemoryVT() || !ST->isSimple() ||
       !ISD::isNormalStore(ST) ||
       Ld->getAddressSpace() != ST->getAddressSpace() ||
+      !TLI.canChangeMemAccessKind(ST->getAddressSpace()) ||
       !Chain.reachesChainWithoutSideEffects(SDValue(Ld, 1)))
     return SDValue();
 
@@ -24654,7 +24655,8 @@ SDValue DAGCombiner::combineInsertEltToLoad(SDNode *N, unsigned InsIndex) {
   if (EltSize == 0 || EltSize % 8 != 0 || !ScalarLoad->isSimple() ||
       !VecLoad->isSimple() || VecLoad->getExtensionType() != ISD::NON_EXTLOAD ||
       ScalarLoad->getExtensionType() != ISD::NON_EXTLOAD ||
-      ScalarLoad->getAddressSpace() != VecLoad->getAddressSpace())
+      ScalarLoad->getAddressSpace() != VecLoad->getAddressSpace() ||
+      !TLI.canChangeMemAccessKind(ScalarLoad->getAddressSpace()))
     return SDValue();
 
   // Check that the offset between the pointers to produce a single continuous
