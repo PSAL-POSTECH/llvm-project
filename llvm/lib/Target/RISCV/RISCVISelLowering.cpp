@@ -3121,6 +3121,25 @@ bool RISCVTargetLowering::mergeStoresAfterLegalization(EVT VT) const {
          VT.isFixedLengthVectorOf(MVT::i1);
 }
 
+bool RISCVTargetLowering::canMergeStoresTo(unsigned AS, EVT MemVT,
+                                           const MachineFunction &MF) const {
+  if (Subtarget.hasSpadVectorMemory() &&
+      (AS == RISCVAS::SPAD || MemVT.isVector()))
+    return false;
+  return true;
+}
+
+// A store of a bitcast keeps the stored type: under spad-vector-memory a
+// scalar store and a vector store of the same bits reach different banks.
+bool RISCVTargetLowering::isStoreBitCastBeneficial(
+    EVT StoreVT, EVT BitcastVT, const SelectionDAG &DAG,
+    const MachineMemOperand &MMO) const {
+  if (Subtarget.hasSpadVectorMemory() &&
+      StoreVT.isVector() != BitcastVT.isVector())
+    return false;
+  return TargetLowering::isStoreBitCastBeneficial(StoreVT, BitcastVT, DAG, MMO);
+}
+
 bool RISCVTargetLowering::isLegalElementTypeForRVV(EVT ScalarTy) const {
   if (!ScalarTy.isSimple())
     return false;
@@ -22327,8 +22346,11 @@ SDValue RISCVTargetLowering::PerformDAGCombine(SDNode *N,
     SDValue Val = Store->getValue();
     SDLoc DL(N);
 
+    // Under spad-vector-memory a vector store stays a vector store: a scalar
+    // store reaches lane 0's bank only.
     bool IsScalarizable =
-        MemVT.isFixedLengthVector() && ISD::isNormalStore(Store) &&
+        !Subtarget.hasSpadVectorMemory() && MemVT.isFixedLengthVector() &&
+        ISD::isNormalStore(Store) &&
         Store->isSimple() &&
         MemVT.getVectorElementType().bitsLE(Subtarget.getXLenVT()) &&
         isPowerOf2_64(MemVT.getSizeInBits()) &&
@@ -22401,8 +22423,9 @@ SDValue RISCVTargetLowering::PerformDAGCombine(SDNode *N,
       SDValue Src = Val.getOperand(0);
       EVT VecVT = Src.getValueType();
       // VecVT should be scalable and memory VT should match the element type.
-      if (!Store->isIndexed() && Store->isSimple() &&
-          VecVT.isScalableVectorOf(MemVT)) {
+      // Under spad-vector-memory a scalar store stays a scalar store.
+      if (!Subtarget.hasSpadVectorMemory() && !Store->isIndexed() &&
+          Store->isSimple() && VecVT.isScalableVectorOf(MemVT)) {
         SDLoc DL(N);
         MVT MaskVT = getMaskTypeFor(VecVT.getSimpleVT());
         // Create a vector memory VT so allowsMisalignedMemoryAccesses will

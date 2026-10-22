@@ -606,6 +606,16 @@ private:
   /// this override can be removed.
   bool mergeStoresAfterLegalization(EVT VT) const override;
 
+  /// Under spad-vector-memory no store merge may change an access's kind: a
+  /// merge into a vector store reaches a bank per lane, and a merge of
+  /// scratchpad stores of either kind changes which banks are written.
+  bool canMergeStoresTo(unsigned AS, EVT MemVT,
+                        const MachineFunction &MF) const override;
+
+  bool isStoreBitCastBeneficial(EVT StoreVT, EVT BitcastVT,
+                                const SelectionDAG &DAG,
+                                const MachineMemOperand &MMO) const override;
+
   /// Disable normalizing
   /// select(N0&N1, X, Y) => select(N0, select(N1, X, Y), Y) and
   /// select(N0|N1, X, Y) => select(N0, select(N1, X, Y, Y))
