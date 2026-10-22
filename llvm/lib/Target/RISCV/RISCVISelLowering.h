@@ -616,6 +616,13 @@ private:
                                 const SelectionDAG &DAG,
                                 const MachineMemOperand &MMO) const override;
 
+  bool shouldReduceLoadWidth(SDNode *Load, ISD::LoadExtType ExtTy, EVT NewVT,
+                             std::optional<unsigned> ByteOffset) const override;
+
+  bool isLoadBitCastBeneficial(EVT LoadVT, EVT BitcastVT,
+                               const SelectionDAG &DAG,
+                               const MachineMemOperand &MMO) const override;
+
   /// Disable normalizing
   /// select(N0&N1, X, Y) => select(N0, select(N1, X, Y), Y) and
   /// select(N0|N1, X, Y) => select(N0, select(N1, X, Y, Y))
