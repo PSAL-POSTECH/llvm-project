@@ -628,8 +628,15 @@ mlir::AffineExpr TestLoopPadding::updateAffineExprWithBounds(mlir::AffineExpr ex
     }
 
     int64_t value = intAttr.getInt();
-    if (value > targetCoefficient)
-      dram_stride[i] = mlir::IntegerAttr::get(intAttr.getType(), (value  * paddedUpperBound) / upperBound);
+    // For the current BMM, dram_stride entries follow the affine-map
+    // dimension order. Unit-sized dimensions may have equal strides.
+    // Scale equal strides only for outer dimensions, leaving the
+    // stride of the padded dimension unchanged.
+    bool isOuterEqualStride = (value == targetCoefficient) && (static_cast<int64_t>(i) < updated_position_index);
+
+    if (value > targetCoefficient || isOuterEqualStride) {
+      dram_stride[i] = mlir::IntegerAttr::get(intAttr.getType(), (value * paddedUpperBound) / upperBound);
+    }
   }
 
   // Updated coeff
@@ -829,7 +836,8 @@ void TestLoopPadding::createWrapperFunction(mlir::ModuleOp module, mlir::OpBuild
       }
       auto allocOp = builder.create<mlir::memref::AllocOp>(
         builder.getUnknownLoc(), paddedMemRefType);
-      if (!timing_mode && padding_type)
+      // Initialize padded buffers in functional mode, including zero padding.
+      if (!timing_mode)
         builder.create<mlir::linalg::FillOp>(wrapperFunc.getLoc(),
                                              ValueRange{initValue},
                                              ValueRange{allocOp});
