@@ -2763,6 +2763,13 @@ void RAGreedy::RAGreedyStats::report(MachineOptimizationRemarkMissed &R) {
     R << NV("NumReloads", Reloads) << " reloads ";
     R << NV("TotalReloadsCost", ReloadsCost) << " total reloads cost ";
   }
+  if (VectorSpills)
+    R << NV("NumVectorSpills", VectorSpills) << " vector spills ";
+  if (VectorSpilledUnits)
+    R << NV("VectorSpilledRegisterUnits", VectorSpilledUnits)
+      << " vector register units spilled ";
+  if (VectorReloads)
+    R << NV("NumVectorReloads", VectorReloads) << " vector reloads ";
   if (FoldedReloads) {
     R << NV("NumFoldedReloads", FoldedReloads) << " folded reloads ";
     R << NV("TotalFoldedReloadsCost", FoldedReloadsCost)
@@ -2808,6 +2815,24 @@ RAGreedy::computeStats(MachineBasicBlock &MBB, MachineBasicBlock::iterator Begin
     return MFI.isSpillSlotObjectIndex(cast<FixedStackPseudoSourceValue>(
         A->getPseudoValue())->getFrameIndex());
   };
+  // Whether Reg, as the allocator assigned it, is in a class whose every legal
+  // type is a vector: a spill or reload of it moves a vector register. (A
+  // scalar class may also hold packed vectors, so one vector type is not
+  // enough.)
+  auto isVectorReg = [this](Register Reg) {
+    if (Reg.isVirtual())
+      Reg = VRM->hasPhys(Reg) ? Register(VRM->getPhys(Reg)) : Register();
+    if (!Reg.isPhysical())
+      return false;
+    const TargetRegisterClass *RC = TRI->getMinimalPhysRegClass(Reg);
+    auto I = TRI->legalclasstypes_begin(*RC);
+    if (*I == MVT::Other)
+      return false;
+    for (; *I != MVT::Other; ++I)
+      if (!MVT(*I).isVector())
+        return false;
+    return true;
+  };
   auto isPatchpointInstr = [](const MachineInstr &MI) {
     return MI.getOpcode() == TargetOpcode::PATCHPOINT ||
            MI.getOpcode() == TargetOpcode::STACKMAP ||
@@ -2839,14 +2864,20 @@ RAGreedy::computeStats(MachineBasicBlock &MBB, MachineBasicBlock::iterator Begin
     }
 
     SmallVector<const MachineMemOperand *, 2> Accesses;
-    if (TII->isLoadFromStackSlot(MI, FI) && MFI.isSpillSlotObjectIndex(FI)) {
+    if (Register R = TII->isLoadFromStackSlot(MI, FI);
+        R && MFI.isSpillSlotObjectIndex(FI)) {
       ++Stats.Reloads;
+      Stats.VectorReloads += isVectorReg(R);
       continue;
     }
     if (Register R = TII->isStoreToStackSlot(MI, FI);
         R && MFI.isSpillSlotObjectIndex(FI)) {
       ++Stats.Spills;
       Stats.SpilledUnits += spilledUnits(R);
+      if (isVectorReg(R)) {
+        ++Stats.VectorSpills;
+        Stats.VectorSpilledUnits += spilledUnits(R);
+      }
       continue;
     }
     if (TII->hasLoadFromStackSlot(MI, Accesses) &&
