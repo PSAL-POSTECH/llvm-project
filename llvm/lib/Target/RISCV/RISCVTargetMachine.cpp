@@ -152,6 +152,7 @@ extern "C" LLVM_ABI LLVM_EXTERNAL_VISIBILITY void LLVMInitializeRISCVTarget() {
   initializeRISCVRedundantCopyEliminationPass(*PR);
   initializeRISCVAsmPrinterPass(*PR);
   initializeRISCVPromoteConstantPass(*PR);
+  initializeRISCVSpadVectorMemoryCheckPass(*PR);
 }
 
 static Reloc::Model getEffectiveRelocModel(const Triple &TT,
@@ -662,6 +663,9 @@ void RISCVPassConfig::addPostRegAlloc() {
   if (TM->getOptLevel() != CodeGenOptLevel::None &&
       EnableRedundantCopyElimination)
     addPass(createRISCVRedundantCopyEliminationPass());
+  // After register allocation every spill and folded reload is visible, and
+  // before frame lowering every stack access still names its frame index.
+  addPass(createRISCVSpadVectorMemoryCheckPass());
 }
 
 bool RISCVPassConfig::addILPOpts() {

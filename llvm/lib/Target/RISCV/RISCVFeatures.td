@@ -1922,6 +1922,16 @@ def FeatureTaggedGlobals : SubtargetFeature<"tagged-globals",
     "true", "Use an instruction sequence for taking the address of a global "
     "that allows a memory tag in the upper address bits">;
 
+// A torchsim machine whose vector unit reaches a lane-banked scratchpad. This
+// is a legality fact about which memory each kind of access may reach, not an
+// extension (it adds no instruction) and not a tuning choice.
+def FeatureSpadVectorMemory
+    : SubtargetFeature<"spad-vector-memory", "HasSpadVectorMemory", "true",
+          "Vector memory instructions add a per-lane bank offset to a lane-0 "
+          "address: they may address only address space 1 or a spill slot of "
+          "the function's own frame. Scalar memory instructions take no lane "
+          "offset. Codegen keeps every IR access scalar or vector as written">;
+
 //===----------------------------------------------------------------------===//
 // Tuning features
 //===----------------------------------------------------------------------===//

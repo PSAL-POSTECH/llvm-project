@@ -180,6 +180,20 @@ def isFaultOnlyFirstLoad
                        !instances<Pseudo>(
                           "^PseudoVL(SEG[2-8])?E(8|16|32|64)FF_V.*")>>>;
 
+// Returns true if this is an indexed (vector-addressed) vector load or store:
+// the RVV pseudos that the VLX/VSX and VLXSEG/VSXSEG tables describe, and the
+// MC instructions of the RVInstVLX/RVInstVSX formats.
+def isIndexedVectorMemory
+    : TIIPredicate<"isIndexedVectorMemory",
+                   MCReturnStatement<
+                     CheckOpcode<!listflatten([
+                       !foreach(I, !instances<RISCVVLX_VSX>(), I.Pseudo),
+                       !foreach(I, !instances<RISCVVLXSEG>(), I.Pseudo),
+                       !foreach(I, !instances<RISCVVSXSEG>(), I.Pseudo),
+                       !foreach(I, !instances<RVInstVLX>(), !cast<Instruction>(I)),
+                       !foreach(I, !instances<RVInstVSX>(), !cast<Instruction>(I))
+                     ])>>>;
+
 def isLoadImmediate
     : TIIPredicate<"isLoadImmediate",
                    MCReturnStatement<CheckAll<[

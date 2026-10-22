@@ -161,6 +161,7 @@
 ; CHECK-NEXT:   smnpm                            - 'Smnpm' (Machine-level Pointer Masking for next lower privilege mode).
 ; CHECK-NEXT:   smrnmi                           - 'Smrnmi' (Resumable Non-Maskable Interrupts).
 ; CHECK-NEXT:   smstateen                        - 'Smstateen' (Machine-mode view of the state-enable extension).
+; CHECK-NEXT:   spad-vector-memory               - Vector memory instructions add a per-lane bank offset to a lane-0 address: they may address only address space 1 or a spill slot of the function's own frame. Scalar memory instructions take no lane offset. Codegen keeps every IR access scalar or vector as written.
 ; CHECK-NEXT:   ssaia                            - 'Ssaia' (Advanced Interrupt Architecture Supervisor Level).
 ; CHECK-NEXT:   ssccfg                           - 'Ssccfg' (Counter Configuration Supervisor Level).
 ; CHECK-NEXT:   ssccptr                          - 'Ssccptr' (Main memory supports page table reads).

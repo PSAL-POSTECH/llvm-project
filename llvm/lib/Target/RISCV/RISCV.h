@@ -18,6 +18,15 @@
 #include "llvm/Target/TargetMachine.h"
 
 namespace llvm {
+// Address spaces with a meaning on a torchsim spad-vector-memory machine.
+namespace RISCVAS {
+enum : unsigned {
+  // The lane-banked scratchpad: the only memory, besides the function's own
+  // spill slots, that a vector memory instruction may address.
+  SPAD = 1,
+};
+} // namespace RISCVAS
+
 class FunctionPass;
 class InstructionSelector;
 class ModulePass;
@@ -132,6 +141,9 @@ void initializeRISCVVLOptimizerPass(PassRegistry &);
 
 FunctionPass *createRISCVVMV0EliminationPass();
 void initializeRISCVVMV0EliminationPass(PassRegistry &);
+
+FunctionPass *createRISCVSpadVectorMemoryCheckPass();
+void initializeRISCVSpadVectorMemoryCheckPass(PassRegistry &);
 
 void initializeRISCVAsmPrinterPass(PassRegistry &);
 } // namespace llvm
