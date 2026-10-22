@@ -3167,6 +3167,11 @@ void RISCVDAGToDAGISel::Select(SDNode *Node) {
     // output is used so that load update node can't be removed.
     if (!Ld || Ld->isIndexed())
       break;
+    // On a spad-vector-memory machine a vector load adds a per-lane bank
+    // offset to its address, so a scalar load stays a scalar load and is
+    // splatted from a register instead.
+    if (Subtarget->hasSpadVectorMemory())
+      break;
     EVT MemVT = Ld->getMemoryVT();
     // The memory VT should be the same size as the element type.
     if (MemVT.getStoreSize() != VT.getVectorElementType().getStoreSize())
