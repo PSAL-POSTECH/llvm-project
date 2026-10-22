@@ -612,6 +612,10 @@ private:
   bool canMergeStoresTo(unsigned AS, EVT MemVT,
                         const MachineFunction &MF) const override;
 
+  /// Under spad-vector-memory a scalar and a vector access to the same
+  /// address reach different banks, in every address space.
+  bool canChangeMemAccessKind(unsigned AS) const override;
+
   bool isStoreBitCastBeneficial(EVT StoreVT, EVT BitcastVT,
                                 const SelectionDAG &DAG,
                                 const MachineMemOperand &MMO) const override;

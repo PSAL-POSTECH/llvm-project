@@ -3129,6 +3129,10 @@ bool RISCVTargetLowering::canMergeStoresTo(unsigned AS, EVT MemVT,
   return true;
 }
 
+bool RISCVTargetLowering::canChangeMemAccessKind(unsigned AS) const {
+  return !Subtarget.hasSpadVectorMemory();
+}
+
 // A store of a bitcast keeps the stored type: under spad-vector-memory a
 // scalar store and a vector store of the same bits reach different banks.
 bool RISCVTargetLowering::isStoreBitCastBeneficial(

@@ -715,6 +715,12 @@ public:
     return true;
   }
 
+  /// Return true if a combine may replace a scalar access to address space
+  /// \p AS by a vector access, or a vector access by a scalar one, when both
+  /// read or write the same bytes. A target returns false when the two kinds
+  /// of access do not reach the same memory for the same address.
+  virtual bool canChangeMemAccessKind(unsigned AS) const { return true; }
+
   /// Return true if it is cheap to speculate a call to intrinsic cttz.
   virtual bool isCheapToSpeculateCttz(Type *Ty) const {
     return false;
