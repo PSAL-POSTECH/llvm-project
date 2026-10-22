@@ -120,6 +120,9 @@ struct RISCVRegisterInfo : public RISCVGenRegisterInfo {
   int64_t getFrameIndexInstrOffset(const MachineInstr *MI,
                                    int Idx) const override;
 
+  bool eliminateSpadSpillSlot(MachineBasicBlock::iterator II,
+                              unsigned FIOperandNum) const;
+
   void lowerSegmentSpillReload(MachineBasicBlock::iterator II,
                                bool IsSpill) const;
 
