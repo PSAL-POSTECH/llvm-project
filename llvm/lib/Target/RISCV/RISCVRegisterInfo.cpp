@@ -560,9 +560,48 @@ void RISCVRegisterInfo::lowerSegmentSpillReload(MachineBasicBlock::iterator II,
   II->eraseFromParent();
 }
 
+// The spill area's address plus Offset into Dst, as getAddr reaches a local
+// global: PC-relative or absolute where the relocation or code model guarantees
+// reach (the linker refuses a layout that breaks it), else from the GOT.
+bool RISCVRegisterInfo::buildSpadSpillAreaAddress(
+    MachineBasicBlock &MBB, MachineBasicBlock::iterator II, const DebugLoc &DL,
+    Register Dst, int64_t Offset) const {
+  MachineFunction &MF = *MBB.getParent();
+  const RISCVSubtarget &ST = MF.getSubtarget<RISCVSubtarget>();
+  const TargetInstrInfo *TII = ST.getInstrInfo();
+  const TargetMachine &TM = MF.getTarget();
+  GlobalVariable *Area =
+      MF.getInfo<RISCVMachineFunctionInfo>()->getSpadSpillArea();
+  Register Hi = Dst.isVirtual()
+                    ? MF.getRegInfo().createVirtualRegister(&RISCV::GPRRegClass)
+                    : Dst;
+  CodeModel::Model CM = TM.getCodeModel();
+  bool PCRel = TM.isPositionIndependent() || CM == CodeModel::Medium;
+  bool Absolute = !TM.isPositionIndependent() && CM == CodeModel::Small;
+  bool Direct = !ST.allowTaggedGlobals() && (PCRel || Absolute);
+  if (Direct && Absolute) {
+    BuildMI(MBB, II, DL, TII->get(RISCV::LUI), Hi)
+        .addGlobalAddress(Area, Offset, RISCVII::MO_HI);
+    BuildMI(MBB, II, DL, TII->get(RISCV::ADDI), Dst)
+        .addReg(Hi, getKillRegState(Hi != Dst))
+        .addGlobalAddress(Area, Offset, RISCVII::MO_LO);
+    return true;
+  }
+  MCSymbol *HiSym = MF.getContext().createNamedTempSymbol("pcrel_hi");
+  BuildMI(MBB, II, DL, TII->get(RISCV::AUIPC), Hi)
+      .addGlobalAddress(Area, Direct ? Offset : 0,
+                        Direct ? RISCVII::MO_PCREL_HI : RISCVII::MO_GOT_HI)
+      ->setPreInstrSymbol(MF, HiSym);
+  unsigned Lo = Direct ? RISCV::ADDI : ST.is64Bit() ? RISCV::LD : RISCV::LW;
+  BuildMI(MBB, II, DL, TII->get(Lo), Dst)
+      .addReg(Hi, getKillRegState(Hi != Dst))
+      .addSym(HiSym, RISCVII::MO_PCREL_LO);
+  return Direct;
+}
+
 // A vector spill slot in the function's scratchpad area: the area's address,
 // held in the function's base register (copied for a segment group, whose
-// lowering kills its base) or else read from the GOT, plus the slot's offset.
+// lowering kills its base) or else built here, plus the slot's offset.
 bool RISCVRegisterInfo::eliminateSpadSpillSlot(MachineBasicBlock::iterator II,
                                                unsigned FIOperandNum) const {
   MachineInstr &MI = *II;
@@ -580,20 +619,15 @@ bool RISCVRegisterInfo::eliminateSpadSpillSlot(MachineBasicBlock::iterator II,
   Register Base =
       MF.getInfo<RISCVMachineFunctionInfo>()->getSpadSpillBase();
   bool Hoisted = Base.isValid();
+  int64_t Rest = Offset;
   if (!Hoisted) {
-    Register Hi = MRI.createVirtualRegister(&RISCV::GPRRegClass);
     Base = MRI.createVirtualRegister(&RISCV::GPRRegClass);
-    MCSymbol *HiSym = MF.getContext().createNamedTempSymbol("pcrel_hi");
-    BuildMI(MBB, II, DL, TII->get(RISCV::AUIPC), Hi)
-        .addGlobalAddress(Area, 0, RISCVII::MO_GOT_HI)
-        ->setPreInstrSymbol(MF, HiSym);
-    BuildMI(MBB, II, DL, TII->get(ST.is64Bit() ? RISCV::LD : RISCV::LW), Base)
-        .addReg(Hi, RegState::Kill)
-        .addSym(HiSym, RISCVII::MO_PCREL_LO);
+    if (buildSpadSpillAreaAddress(MBB, II, DL, Base, Offset))
+      Rest = 0;
   }
-  if (Offset) {
+  if (Rest) {
     Register Slot = MRI.createVirtualRegister(&RISCV::GPRRegClass);
-    adjustReg(MBB, II, DL, Slot, Base, StackOffset::getFixed(Offset),
+    adjustReg(MBB, II, DL, Slot, Base, StackOffset::getFixed(Rest),
               MachineInstr::NoFlags, std::nullopt);
     Base = Slot;
     Hoisted = false;
