@@ -26404,6 +26404,12 @@ EVT RISCVTargetLowering::getOptimalMemOpType(
   if (FuncAttributes.hasFnAttr(Attribute::NoImplicitFloat))
     return MVT::Other;
 
+  // Under spad-vector-memory a memory intrinsic expands to scalar accesses:
+  // the vector unit may not address DRAM, and the intrinsic's bytes have no
+  // per-lane meaning in the scratchpad.
+  if (Subtarget.hasSpadVectorMemory())
+    return MVT::Other;
+
   // We use LMUL1 memory operations here for a non-obvious reason.  Our caller
   // has an expansion threshold, and we want the number of hardware memory
   // operations to correspond roughly to that threshold.  LMUL>1 operations
