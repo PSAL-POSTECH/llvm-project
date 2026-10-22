@@ -12,6 +12,7 @@
 
 #include "RISCVFrameLowering.h"
 #include "MCTargetDesc/RISCVBaseInfo.h"
+#include "RISCV.h"
 #include "RISCVMachineFunctionInfo.h"
 #include "RISCVSubtarget.h"
 #include "llvm/BinaryFormat/Dwarf.h"
@@ -23,6 +24,8 @@
 #include "llvm/CodeGen/MachineRegisterInfo.h"
 #include "llvm/CodeGen/RegisterScavenging.h"
 #include "llvm/IR/DiagnosticInfo.h"
+#include "llvm/IR/GlobalVariable.h"
+#include "llvm/IR/Module.h"
 #include "llvm/MC/MCDwarf.h"
 #include "llvm/Support/LEB128.h"
 
@@ -1923,6 +1926,56 @@ static unsigned estimateFunctionSizeInBytes(const MachineFunction &MF,
   return FnSize;
 }
 
+// Under spad-vector-memory a vector spill slot is no stack object: every lane
+// keeps its copy in the function's area of the scratchpad, a .spad global in
+// address space 1, at the slot's offset (bytes of one lane's share).
+void RISCVFrameLowering::assignSpadSpillSlots(MachineFunction &MF) const {
+  MachineFrameInfo &MFI = MF.getFrameInfo();
+  SmallSet<int, 8> CalleeSaved;
+  for (const CalleeSavedInfo &CS : MFI.getCalleeSavedInfo())
+    CalleeSaved.insert(CS.getFrameIdx());
+  SmallVector<int, 8> Slots;
+  for (int FI = 0, E = MFI.getObjectIndexEnd(); FI != E; ++FI)
+    if (MFI.getStackID(FI) == TargetStackID::ScalableVector &&
+        MFI.isSpillSlotObjectIndex(FI) && !MFI.isDeadObjectIndex(FI) &&
+        !CalleeSaved.count(FI))
+      Slots.push_back(FI);
+  if (Slots.empty())
+    return;
+
+  Function &F = MF.getFunction();
+  std::optional<unsigned> VLen = MF.getSubtarget<RISCVSubtarget>().getRealVLen();
+  if (!VLen) {
+    F.getContext().diagnose(DiagnosticInfoUnsupported(
+        F, "spad-vector-memory: a vector spill slot is sized in the "
+           "scratchpad, which needs the exact VLEN (zvl<N>b and "
+           "-riscv-v-vector-bits-max=<N>)"));
+    return;
+  }
+  const uint64_t VScale = *VLen / RISCV::RVVBitsPerBlock;
+  const Align RegAlign(*VLen / 8);
+  uint64_t Offset = 0;
+  for (int FI : Slots) {
+    uint64_t Size =
+        std::max<uint64_t>(MFI.getObjectSize(FI), RISCV::RVVBytesPerBlock) *
+        VScale;
+    Offset = alignTo(Offset, RegAlign);
+    MFI.setStackID(FI, TargetStackID::NoAlloc);
+    MFI.setObjectOffset(FI, Offset);
+    Offset += Size;
+  }
+
+  Module &M = *F.getParent();
+  auto *Ty = ArrayType::get(Type::getInt8Ty(M.getContext()), Offset);
+  auto *Area = new GlobalVariable(
+      M, Ty, /*isConstant=*/false, GlobalValue::InternalLinkage,
+      Constant::getNullValue(Ty), F.getName() + ".vspill", nullptr,
+      GlobalValue::NotThreadLocal, RISCVAS::SPAD);
+  Area->setSection(".spad");
+  Area->setAlignment(RegAlign);
+  MF.getInfo<RISCVMachineFunctionInfo>()->setSpadSpillArea(Area);
+}
+
 void RISCVFrameLowering::processFunctionBeforeFrameFinalized(
     MachineFunction &MF, RegScavenger *RS) const {
   const RISCVRegisterInfo *RegInfo =
@@ -1931,6 +1984,9 @@ void RISCVFrameLowering::processFunctionBeforeFrameFinalized(
   MachineFrameInfo &MFI = MF.getFrameInfo();
   const TargetRegisterClass *RC = &RISCV::GPRRegClass;
   auto *RVFI = MF.getInfo<RISCVMachineFunctionInfo>();
+
+  if (MF.getSubtarget<RISCVSubtarget>().hasSpadVectorMemory())
+    assignSpadSpillSlots(MF);
 
   int64_t RVVStackSize;
   Align RVVStackAlign;
@@ -1963,6 +2019,9 @@ void RISCVFrameLowering::processFunctionBeforeFrameFinalized(
   // so we must always reserve an emergency spill slot if the MachineFunction
   // contains any RVV spills.
   ScavSlotsNum = std::max(ScavSlotsNum, getScavSlotsNumForRVV(MF));
+
+  if (RVFI->getSpadSpillArea())
+    ScavSlotsNum = std::max(ScavSlotsNum, 2u);
 
   for (unsigned I = 0; I < ScavSlotsNum; I++) {
     int FI = MFI.CreateSpillStackObject(RegInfo->getSpillSize(*RC),

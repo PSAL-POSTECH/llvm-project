@@ -12,6 +12,7 @@
 
 #include "RISCVRegisterInfo.h"
 #include "RISCV.h"
+#include "RISCVMachineFunctionInfo.h"
 #include "RISCVSubtarget.h"
 #include "llvm/ADT/SmallSet.h"
 #include "llvm/BinaryFormat/Dwarf.h"
@@ -22,6 +23,8 @@
 #include "llvm/CodeGen/TargetFrameLowering.h"
 #include "llvm/CodeGen/TargetInstrInfo.h"
 #include "llvm/IR/DebugInfoMetadata.h"
+#include "llvm/IR/GlobalVariable.h"
+#include "llvm/MC/MCContext.h"
 #include "llvm/Support/ErrorHandling.h"
 
 #define GET_REGINFO_TARGET_DESC
@@ -557,6 +560,55 @@ void RISCVRegisterInfo::lowerSegmentSpillReload(MachineBasicBlock::iterator II,
   II->eraseFromParent();
 }
 
+// A vector spill slot in the function's scratchpad area: its address is the
+// area's .spad global, read from the GOT like any address space 1 global, plus
+// the slot's offset; the access then reaches address space 1.
+bool RISCVRegisterInfo::eliminateSpadSpillSlot(MachineBasicBlock::iterator II,
+                                               unsigned FIOperandNum) const {
+  MachineInstr &MI = *II;
+  MachineBasicBlock &MBB = *MI.getParent();
+  MachineFunction &MF = *MBB.getParent();
+  MachineRegisterInfo &MRI = MF.getRegInfo();
+  const RISCVSubtarget &ST = MF.getSubtarget<RISCVSubtarget>();
+  const TargetInstrInfo *TII = ST.getInstrInfo();
+  DebugLoc DL = MI.getDebugLoc();
+  GlobalVariable *Area =
+      MF.getInfo<RISCVMachineFunctionInfo>()->getSpadSpillArea();
+  int64_t Offset =
+      MF.getFrameInfo().getObjectOffset(MI.getOperand(FIOperandNum).getIndex());
+
+  Register Hi = MRI.createVirtualRegister(&RISCV::GPRRegClass);
+  Register Base = MRI.createVirtualRegister(&RISCV::GPRRegClass);
+  MCSymbol *HiSym = MF.getContext().createNamedTempSymbol("pcrel_hi");
+  BuildMI(MBB, II, DL, TII->get(RISCV::AUIPC), Hi)
+      .addGlobalAddress(Area, 0, RISCVII::MO_GOT_HI)
+      ->setPreInstrSymbol(MF, HiSym);
+  BuildMI(MBB, II, DL, TII->get(ST.is64Bit() ? RISCV::LD : RISCV::LW), Base)
+      .addReg(Hi, RegState::Kill)
+      .addSym(HiSym, RISCVII::MO_PCREL_LO);
+  if (Offset) {
+    Register Slot = MRI.createVirtualRegister(&RISCV::GPRRegClass);
+    adjustReg(MBB, II, DL, Slot, Base, StackOffset::getFixed(Offset),
+              MachineInstr::NoFlags, std::nullopt);
+    Base = Slot;
+  }
+  MI.getOperand(FIOperandNum)
+      .ChangeToRegister(Base, /*IsDef=*/false, /*IsImp=*/false,
+                        /*IsKill=*/true);
+
+  SmallVector<MachineMemOperand *, 1> MMOs;
+  for (MachineMemOperand *MMO : MI.memoperands())
+    MMOs.push_back(MF.getMachineMemOperand(
+        MMO, MachinePointerInfo(Area, Offset), MMO->getSize()));
+  MI.setMemRefs(MF, MMOs);
+
+  if (RISCV::isRVVSpillForZvlsseg(MI.getOpcode())) {
+    lowerSegmentSpillReload(II, /*IsSpill=*/MI.mayStore());
+    return true;
+  }
+  return false;
+}
+
 bool RISCVRegisterInfo::eliminateFrameIndex(MachineBasicBlock::iterator II,
                                             int SPAdj, unsigned FIOperandNum,
                                             RegScavenger *RS) const {
@@ -568,6 +620,10 @@ bool RISCVRegisterInfo::eliminateFrameIndex(MachineBasicBlock::iterator II,
   DebugLoc DL = MI.getDebugLoc();
 
   int FrameIndex = MI.getOperand(FIOperandNum).getIndex();
+  if (MF.getFrameInfo().getStackID(FrameIndex) == TargetStackID::NoAlloc &&
+      MF.getInfo<RISCVMachineFunctionInfo>()->getSpadSpillArea())
+    return eliminateSpadSpillSlot(II, FIOperandNum);
+
   Register FrameReg;
   StackOffset Offset =
       getFrameLowering(MF)->getFrameIndexReference(MF, FrameIndex, FrameReg);

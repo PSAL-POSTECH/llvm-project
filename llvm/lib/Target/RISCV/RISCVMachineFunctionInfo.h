@@ -21,6 +21,8 @@
 
 namespace llvm {
 
+class GlobalVariable;
+
 class RISCVMachineFunctionInfo;
 
 namespace yaml {
@@ -64,6 +66,9 @@ private:
   Align RVVStackAlign;
   /// Padding required to keep RVV stack aligned within the main stack.
   uint64_t RVVPadding = 0;
+  /// Under spad-vector-memory, the scratchpad global that holds this
+  /// function's vector spill slots, or null when it spills no vector.
+  GlobalVariable *SpadSpillArea = nullptr;
   /// Size of stack frame to save callee saved registers
   unsigned CalleeSavedStackSize = 0;
 
@@ -144,6 +149,9 @@ public:
 
   uint64_t getRVVStackSize() const { return RVVStackSize; }
   void setRVVStackSize(uint64_t Size) { RVVStackSize = Size; }
+
+  GlobalVariable *getSpadSpillArea() const { return SpadSpillArea; }
+  void setSpadSpillArea(GlobalVariable *GV) { SpadSpillArea = GV; }
 
   Align getRVVStackAlign() const { return RVVStackAlign; }
   void setRVVStackAlign(Align StackAlign) { RVVStackAlign = StackAlign; }

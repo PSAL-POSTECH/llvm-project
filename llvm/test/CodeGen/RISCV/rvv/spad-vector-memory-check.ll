@@ -7,6 +7,9 @@
 ; Scratchpad vector accesses and vector spills are accepted.
 ; RUN: llc -mtriple=riscv64 -mattr=+v,+spad-vector-memory -verify-machineinstrs \
 ; RUN:   < %t/spad.ll | FileCheck %s --check-prefix=SPAD
+; A vector spill slot is sized in the scratchpad, so it needs the exact VLEN.
+; RUN: llc -mtriple=riscv64 -mattr=+v,+spad-vector-memory -verify-machineinstrs \
+; RUN:   -riscv-v-vector-bits-max=128 < %t/spill.ll | FileCheck %s --check-prefix=SPILL
 ;
 ; Vector accesses to address space 0 are refused, at -O3 and at -O0.
 ; RUN: not llc -mtriple=riscv64 -mattr=+v,+spad-vector-memory \
@@ -37,11 +40,11 @@
 ; SPAD-LABEL: spad_copy:
 ; SPAD:         vle32.v v8, (a0)
 ; SPAD:         vse32.v v8, (a1)
-; SPAD-LABEL: spad_copy_across_a_spill:
-; SPAD:         vle32.v v8, (a0)
-; SPAD:         vs2r.v v8, (a0) # vscale x 16-byte Folded Spill
-; SPAD:         vl2r.v v8, (a0) # vscale x 16-byte Folded Reload
-; SPAD:         vse32.v v8, (a1)
+; SPILL-LABEL: spad_copy_across_a_spill:
+; SPILL:         auipc [[A:a[0-9]+]], %got_pcrel_hi(spad_copy_across_a_spill.vspill)
+; SPILL:         vs2r.v v8, ([[A]])
+; SPILL:         auipc [[B:a[0-9]+]], %got_pcrel_hi(spad_copy_across_a_spill.vspill)
+; SPILL:         vl2r.v v8, ([[B]])
 
 ; DRAM-LOAD: error: {{.*}} in function dram_load {{.*}}: spad-vector-memory: vector memory instruction PseudoVLE32_V_M2 reaches address space 0, not the scratchpad (address space 1)
 ; DRAM-STORE: error: {{.*}} in function dram_store {{.*}}: spad-vector-memory: vector memory instruction PseudoVSE32_V_M2 reaches address space 0, not the scratchpad (address space 1)
@@ -64,6 +67,7 @@ define void @spad_copy(ptr addrspace(1) %src, ptr addrspace(1) %dst) {
   ret void
 }
 
+;--- spill.ll
 define void @spad_copy_across_a_spill(ptr addrspace(1) %src, ptr addrspace(1) %dst) {
   %v = load <8 x float>, ptr addrspace(1) %src, align 32
   call void asm sideeffect "",
